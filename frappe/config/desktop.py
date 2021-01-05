@@ -1,211 +1,133 @@
-# coding=utf-8
-
 from __future__ import unicode_literals
+import frappe
 from frappe import _
 
 def get_data():
 	return [
-		# Modules
+		# Administration
 		{
-			"module_name": "Getting Started",
-			"category": "Modules",
-			"label": _("Getting Started"),
-			"color": "#1abc9c",
-			"icon": "icon start-blue",
-			"type": "module",
-			"disable_after_onboard": 1,
-			"description": "Dive into the basics for your organisation's needs.",
-			"onboard_present": 1
-		},
-		{
-			"module_name": "Accounts",
-			"category": "Modules",
-			"label": _("Accounting"),
-			"color": "#3498db",
-			"icon": "icon accounting-blue",
-			"type": "module",
-			"description": "Accounts, billing, payments, cost center and budgeting."
-		},
-		{
-			"module_name": "Selling",
-			"category": "Modules",
-			"label": _("Selling"),
-			"color": "#1abc9c",
-			"icon": "icon selling-blue",
-			"type": "module",
-			"description": "Sales orders, quotations, customers and items."
-		},
-		{
-			"module_name": "Buying",
-			"category": "Modules",
-			"label": _("Buying"),
-			"color": "#c0392b",
-			"icon": "icon buying-blue",
-			"type": "module",
-			"description": "Purchasing, suppliers, material requests, and items."
-		},
-		{
-			"module_name": "Stock",
-			"category": "Modules",
-			"label": _("Stock"),
-			"color": "#f39c12",
-			"icon": "icon stock-blue",
-			"type": "module",
-			"description": "Stock transactions, reports, serial numbers and batches."
-		},
-		{
-			"module_name": "Assets",
-			"category": "Modules",
-			"label": _("Assets"),
-			"color": "#4286f4",
-			"icon": "icon assets-blue",
-			"type": "module",
-			"description": "Asset movement, maintainance and tools."
-		},
-		{
-			"module_name": "Projects",
-			"category": "Modules",
-			"label": _("Projects"),
-			"color": "#8e44ad",
-			"icon": "icon projects-blue",
-			"type": "module",
-			"description": "Updates, Timesheets and Activities."
-		},
-		{
-			"module_name": "CRM",
-			"category": "Modules",
-			"label": _("CRM"),
-			"color": "#EF4DB6",
-			"icon": "icon crm-blue",
-			"type": "module",
-			"description": "Sales pipeline, leads, opportunities and customers."
-		},
-		{
-			"module_name": "Support",
-			"category": "Modules",
-			"label": _("Support"),
-			"color": "#1abc9c",
-			"icon": "icon support-blue",
-			"type": "module",
-			"description": "User interactions, support issues and knowledge base."
-		},
-		{
-			"module_name": "HR",
-			"category": "Modules",
-			"label": _("Human Resources"),
-			"color": "#2ecc71",
-			"icon": "icon hr-blue",
-			"type": "module",
-			"description": "Employees, attendance, payroll, leaves and shifts."
-		},
-		{
-			"module_name": "Quality Management",
-			"category": "Modules",
-			"label": _("Quality"),
-			"color": "#1abc9c",
-			"icon": "icon quality-blue",
-			"type": "module",
-			"description": "Quality goals, procedures, reviews and action."
-		},
-
-
-		# Category: "Domains"
-		{
-			"module_name": "Manufacturing",
-			"category": "Domains",
-			"label": _("Manufacturing"),
-			"color": "#7f8c8d",
-			"icon": "icon manufacture-blue",
-			"type": "module",
-			"description": "BOMS, work orders, operations, and timesheets."
-		},
-		{
-			"module_name": "Retail",
-			"category": "Domains",
-			"label": _("Retail"),
-			"color": "#7f8c8d",
-			"icon": "icon retail-blue",
-			"type": "module",
-			"description": "Point of Sale and cashier closing."
-		},
-		{
-			"module_name": "Education",
-			"category": "Domains",
-			"label": _("Education"),
-			"color": "#428B46",
-			"icon": "icon education-blue",
-			"type": "module",
-			"description": "Student admissions, fees, courses and scores."
-		},
-
-		{
-			"module_name": "Healthcare",
-			"category": "Domains",
-			"label": _("Healthcare"),
-			"color": "#FF888B",
-			"icon": "icon healthcare-blue",
-			"type": "module",
-			"description": "Patient appointments, procedures and tests."
-		},
-		{
-			"module_name": "Agriculture",
-			"category": "Domains",
-			"label": _("Agriculture"),
-			"color": "#8BC34A",
-			"icon": "icon agriculture-blue",
-			"type": "module",
-			"description": "Crop cycles, land areas, soil and plant analysis."
-		},
-		{
-			"module_name": "Hotels",
-			"category": "Domains",
-			"label": _("Hotels"),
-			"color": "#EA81E8",
-			"icon": "icon hotel-blue",
-			"type": "module",
-			"description": "Hotel rooms, pricing, reservation and amenities."
-		},
-
-		{
-			"module_name": "Non Profit",
-			"category": "Domains",
-			"label": _("Non Profit"),
-			"color": "#DE2B37",
-			"icon": "icon non-profit-blue",
-			"type": "module",
-			"description": "Volunteers, memberships, grants and chapters."
-		},
-		{
-			"module_name": "Restaurant",
-			"category": "Domains",
-			"label": _("Restaurant"),
-			"color": "#EA81E8",
-			"icon": "icon restaurant-blue",
-			"_doctype": "Restaurant",
-			"type": "module",
-			"link": "List/Restaurant",
-			"description": "Menu, Orders and Table Reservations."
-		},
-
-		{
-			"module_name": "Help",
+			"module_name": "Desk",
 			"category": "Administration",
-			"label": _("Learn"),
-			"color": "#FF888B",
-			"icon": "icon learn-blue",
+			"label": _("Tools"),
+			"color": "#FFF5A7",
+			"reverse": 1,
+			"icon": "icon tools-blue",
 			"type": "module",
-			"is_help": True,
-			"description": "Explore Help Articles and Videos."
+			"description": "Todos, notes, calendar and newsletter."
 		},
 		{
-			"module_name": 'Marketplace',
+			"module_name": "Settings",
+			"category": "Administration",
+			"label": _("Settings"),
+			"color": "#bdc3c7",
+			"reverse": 1,
+			"icon": "icon settings-blue",
+			"type": "module",
+			"description": "Data import, printing, email and workflows."
+		},
+		{
+			"module_name": "Automation",
+			"category": "Administration",
+			"label": _("Automation"),
+			"color": "#bdc3c7",
+			"reverse": 1,
+			"icon": "octicon octicon-gist",
+			"type": "module",
+			"description": "Auto Repeat, Assignment Rule, Milestone Tracking and Event Streaming."
+		},		
+		{
+			"module_name": "Users and Permissions",
+			"category": "Administration",
+			"label": _("Users and Permissions"),
+			"color": "#bdc3c7",
+			"reverse": 1,
+			"icon": "icon users-blue",
+			"type": "module",
+			"description": "Setup roles and permissions for users on documents."
+		},
+		{
+			"module_name": "Customization",
+			"category": "Administration",
+			"label": _("Customization"),
+			"color": "#bdc3c7",
+			"reverse": 1,
+			"icon": "icon customize-blue",
+			"type": "module",
+			"description": "Customize forms, custom fields, scripts and translations."
+		},
+		{
+			"module_name": "Integrations",
+			"category": "Administration",
+			"label": _("Integrations"),
+			"color": "#16a085",
+			"icon": "icon integrate-blue",
+			"type": "module",
+			"description": "DropBox, Woocomerce, AWS, Shopify and GoCardless."
+		},
+		{
+			"module_name": 'Contacts',
+			"category": "Administration",
+			"label": _("Contacts"),
+			"type": 'module',
+			"icon": "icon contacts-blue",
+			"color": '#ffaedb',
+			"description": "People Contacts and Address Book."
+		},
+		{
+			"module_name": "Core",
+			"category": "Administration",
+			"_label": _("Developer"),
+			"label": "Developer",
+			"color": "#589494",
+			"icon": "icon developer-blue",
+			"type": "module",
+			"system_manager": 1,
+			"condition": getattr(frappe.local.conf, 'developer_mode', 0),
+			"description": "Doctypes, dev tools and logs."
+		},
+
+		# Places
+		{
+			"module_name": "Website",
 			"category": "Places",
-			"label": _('Marketplace'),
-			"icon": "icon marketplace-blue",
+			"label": _("Website"),
+			"_label": _("Website"),
+			"color": "#16a085",
+			"icon": "icon website-blue",
+			"type": "module",
+			"description": "Webpages, webforms, blogs and website theme."
+		},
+		{
+			"module_name": 'Social',
+			"category": "Places",
+			"label": _('Social'),
+			"icon": "icon social-blue",
 			"type": 'link',
-			"link": '#marketplace/home',
+			"link": '#social/home',
 			"color": '#FF4136',
 			'standard': 1,
-			"description": "Publish items to other users."
+			'idx': 15,
+			"description": "Build your profile and share posts with other users."
+		},
+		{
+			"module_name": 'Leaderboard',
+			"category": "Places",
+			"label": _('Leaderboard'),
+			"icon": "icon leaderboard-blue",
+			"type": 'link',
+			"link": '#social/users',
+			"color": '#FF4136',
+			'standard': 1,
+		},
+		{
+			"module_name": 'dashboard',
+			"category": "Places",
+			"label": _('Dashboard'),
+			"icon": "icon dashboard-blue",
+			"type": "link",
+			"link": "#dashboard",
+			"color": '#FF4136',
+			'standard': 1,
+			'idx': 10
 		},
 	]
