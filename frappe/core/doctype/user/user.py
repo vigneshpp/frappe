@@ -6,9 +6,9 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils import cint, flt, has_gravatar, escape_html, format_datetime, now_datetime, get_formatted_email, today
 from frappe import throw, msgprint, _
-from frappe.utils.password import update_password as _update_password
+from frappe.utils.password import update_password as _update_password, check_password
 from frappe.desk.notifications import clear_notifications
-from frappe.desk.doctype.notification_settings.notification_settings import create_notification_settings
+from frappe.desk.doctype.notification_settings.notification_settings import create_notification_settings, toggle_notifications
 from frappe.utils.user import get_system_managers
 from bs4 import BeautifulSoup
 import frappe.permissions
@@ -124,6 +124,9 @@ class User(Document):
 		# clear sessions if disabled
 		if not cint(self.enabled) and getattr(frappe.local, "login_manager", None):
 			frappe.local.login_manager.logout(user=self.name)
+
+		# toggle notifications based on the user's status
+		toggle_notifications(self.name, enable=cint(self.enabled))
 
 	def add_system_manager_role(self):
 		# if adding system manager, do nothing
@@ -334,6 +337,9 @@ class User(Document):
 			set `user`=null
 			where `user`=%s""", (self.name))
 
+		# delete notification settings
+		frappe.delete_doc("Notification Settings", self.name, ignore_permissions=True)
+
 
 	def before_rename(self, old_name, new_name, merge=False):
 		self.check_demo()
@@ -502,6 +508,39 @@ class User(Document):
 			return
 
 		return [i.strip() for i in self.restrict_ip.split(",")]
+
+	@classmethod
+	def find_by_credentials(cls, user_name, password, validate_password=True):
+		"""Find the user by credentials.
+
+		This is a login utility that needs to check login related system settings while finding the user.
+		1. Find user by email ID by default
+		2. If allow_login_using_mobile_number is set, you can use mobile number while finding the user.
+		3. If allow_login_using_user_name is set, you can use username while finding the user.
+		"""
+
+		login_with_mobile = cint(frappe.db.get_value("System Settings", "System Settings", "allow_login_using_mobile_number"))
+		login_with_username = cint(frappe.db.get_value("System Settings", "System Settings", "allow_login_using_user_name"))
+
+		or_filters = [{"name": user_name}]
+		if login_with_mobile:
+			or_filters.append({"mobile_no": user_name})
+		if login_with_username:
+			or_filters.append({"username": user_name})
+
+		users = frappe.db.get_all('User', fields=['name', 'enabled'], or_filters=or_filters, limit=1)
+		if not users:
+			return
+
+		user = users[0]
+		user['is_authenticated'] = True
+		if validate_password:
+			try:
+				check_password(user['name'], password)
+			except frappe.AuthenticationError:
+				user['is_authenticated'] = False
+
+		return user
 
 @frappe.whitelist()
 def get_timezones():
