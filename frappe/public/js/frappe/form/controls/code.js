@@ -10,7 +10,7 @@ frappe.ui.form.ControlCode = frappe.ui.form.ControlText.extend({
 			.appendTo(this.input_area);
 
 		this.expanded = false;
-		this.$expand_button = $(`<button class="btn btn-xs btn-default">${__('Expand')}</button>`).click(() => {
+		this.$expand_button = $(`<button class="btn btn-xs btn-default">${this.get_button_label()}</button>`).click(() => {
 			this.expanded = !this.expanded;
 			this.refresh_height();
 			this.toggle_label();
@@ -23,6 +23,7 @@ frappe.ui.form.ControlCode = frappe.ui.form.ControlText.extend({
 		const ace = window.ace;
 		this.editor = ace.edit(this.ace_editor_target.get(0));
 		this.editor.setTheme('ace/theme/tomorrow');
+		this.editor.setOption("showPrintMargin", false);
 		this.set_language();
 
 		// events
@@ -30,6 +31,57 @@ frappe.ui.form.ControlCode = frappe.ui.form.ControlText.extend({
 			const input_value = this.get_input_value();
 			this.parse_validate_and_set_in_model(input_value);
 		}, 300));
+
+		// setup autocompletion when it is set the first time
+		Object.defineProperty(this.df, 'autocompletions', {
+			get() {
+				return this._autocompletions || [];
+			},
+			set: (value) => {
+				this.setup_autocompletion();
+				this.df._autocompletions = value;
+			}
+		});
+	},
+
+	setup_autocompletion() {
+		if (this._autocompletion_setup) return;
+
+		const ace = window.ace;
+		const get_autocompletions = () => this.df.autocompletions;
+
+		ace.config.loadModule("ace/ext/language_tools", langTools => {
+			this.editor.setOptions({
+				enableBasicAutocompletion: true,
+				enableLiveAutocompletion: true
+			});
+
+			langTools.addCompleter({
+				getCompletions: function(editor, session, pos, prefix, callback) {
+					if (prefix.length === 0) {
+						callback(null, []);
+						return;
+					}
+					let autocompletions = get_autocompletions();
+					if (autocompletions.length) {
+						callback(
+							null,
+							autocompletions.map(a => {
+								if (typeof a === 'string') {
+									a = { value: a };
+								}
+								return {
+									name: 'frappe',
+									value: a.value,
+									score: a.score
+								};
+							})
+						);
+					}
+				}
+			});
+		});
+		this._autocompletion_setup = true;
 	},
 
 	refresh_height() {
@@ -38,8 +90,11 @@ frappe.ui.form.ControlCode = frappe.ui.form.ControlText.extend({
 	},
 
 	toggle_label() {
-		const button_label = this.expanded ? __('Collapse') : __('Expand');
-		this.$expand_button && this.$expand_button.text(button_label);
+		this.$expand_button && this.$expand_button.text(this.get_button_label());
+	},
+
+	get_button_label() {
+		return this.expanded ? __('Collapse', null, 'Shrink code field.') : __('Expand', null, 'Enlarge code field.');
 	},
 
 	set_language() {

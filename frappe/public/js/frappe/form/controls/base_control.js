@@ -74,7 +74,7 @@ frappe.ui.form.Control = Class.extend({
 			frappe.model.get_doc(this.doctype, this.docname), this.perm || (this.frm && this.frm.perm), explain);
 
 		// Match parent grid controls read only status
-		if (status === 'Write' && (this.grid || (this.layout && this.layout.grid))) {
+		if (status === 'Write' && (this.grid || (this.layout && this.layout.grid) && !cint(this.df.allow_on_submit))) {
 			var grid = this.grid || this.layout.grid;
 			if (grid.display_status == 'Read') {
 				status = 'Read';
@@ -159,9 +159,13 @@ frappe.ui.form.Control = Class.extend({
 	},
 	validate_and_set_in_model: function(value, e) {
 		var me = this;
-		if(this.inside_change_event) {
+		let force_value_set = (this.doc && this.doc.__run_link_triggers);
+		let is_value_same = (this.get_model_value() === value);
+
+		if (this.inside_change_event || (!force_value_set && is_value_same)) {
 			return Promise.resolve();
 		}
+
 		this.inside_change_event = true;
 		var set = function(value) {
 			me.inside_change_event = false;
