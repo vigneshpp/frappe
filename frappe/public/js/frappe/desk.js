@@ -474,14 +474,19 @@ frappe.Application = Class.extend({
 		$('<link rel="icon" href="' + link + '" type="image/x-icon">').appendTo("head");
 	},
 	trigger_primary_action: function() {
-		if(window.cur_dialog && cur_dialog.display) {
-			// trigger primary
-			cur_dialog.get_primary_btn().trigger("click");
-		} else if(cur_frm && cur_frm.page.btn_primary.is(':visible')) {
-			cur_frm.page.btn_primary.trigger('click');
-		} else if(frappe.container.page.save_action) {
-			frappe.container.page.save_action();
-		}
+		// to trigger change event on active input before triggering primary action
+		$(document.activeElement).blur();
+		// wait for possible JS validations triggered after blur (it might change primary button)
+		setTimeout(() => {
+			if (window.cur_dialog && cur_dialog.display) {
+				// trigger primary
+				cur_dialog.get_primary_btn().trigger("click");
+			} else if (cur_frm && cur_frm.page.btn_primary.is(':visible')) {
+				cur_frm.page.btn_primary.trigger('click');
+			} else if (frappe.container.page.save_action) {
+				frappe.container.page.save_action();
+			}
+		}, 100);
 	},
 
 	set_rtl: function() {
@@ -600,8 +605,7 @@ frappe.Application = Class.extend({
 	setup_copy_doc_listener() {
 		$('body').on('paste', (e) => {
 			try {
-				let clipboard_data = e.clipboardData || window.clipboardData || e.originalEvent.clipboardData;
-				let pasted_data = clipboard_data.getData('Text');
+				let pasted_data = frappe.utils.get_clipboard_data(e);
 				let doc = JSON.parse(pasted_data);
 				if (doc.doctype) {
 					e.preventDefault();
@@ -616,6 +620,7 @@ frappe.Application = Class.extend({
 						let res = frappe.model.with_doctype(doc.doctype, () => {
 							let newdoc = frappe.model.copy_doc(doc);
 							newdoc.__newname = doc.name;
+							delete doc.name;
 							newdoc.idx = null;
 							newdoc.__run_link_triggers = false;
 							frappe.set_route('Form', newdoc.doctype, newdoc.name);
