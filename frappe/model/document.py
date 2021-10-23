@@ -385,6 +385,11 @@ class Document(BaseDocument):
 	def get_doc_before_save(self):
 		return getattr(self, '_doc_before_save', None)
 
+	def has_value_changed(self, fieldname):
+		'''Returns true if value is changed before and after saving'''
+		previous = self.get_doc_before_save()
+		return previous.get(fieldname)!=self.get(fieldname) if previous else True
+
 	def set_new_name(self, force=False):
 		"""Calls `frappe.naming.set_new_name` for parent and child docs."""
 		if self.flags.name_set and not force:
@@ -996,7 +1001,10 @@ class Document(BaseDocument):
 			self.set("modified", now())
 			self.set("modified_by", frappe.session.user)
 
-		self.load_doc_before_save()
+		# load but do not reload doc_before_save because before_change or on_change might expect it
+		if not self.get_doc_before_save():
+			self.load_doc_before_save()
+
 		# to trigger notification on value change
 		self.run_method('before_change')
 
