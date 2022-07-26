@@ -10,20 +10,13 @@ be used to build database driven apps.
 
 Read the documentation: https://frappeframework.com/docs
 """
-import os
-import warnings
-
-_dev_server = os.environ.get("DEV_SERVER", False)
-
-if _dev_server:
-	warnings.simplefilter("always", DeprecationWarning)
-	warnings.simplefilter("always", PendingDeprecationWarning)
-
 import importlib
 import inspect
 import json
+import os
 import sys
 import typing
+import warnings
 
 import click
 from past.builtins import cmp
@@ -31,6 +24,7 @@ from six import binary_type, iteritems, string_types, text_type
 from werkzeug.local import Local, release_local
 
 from frappe.query_builder import get_query_builder, patch_query_execute
+from frappe.utils.data import sbool
 
 # Local application imports
 from .exceptions import *
@@ -46,12 +40,19 @@ from .utils.lazy_loader import lazy_import
 # Lazy imports
 faker = lazy_import("faker")
 
-__version__ = "13.27.0"
+__version__ = "13.36.2"
 
 __title__ = "Frappe Framework"
 
-local = Local()
 controllers = {}
+local = Local()
+STANDARD_USERS = ("Guest", "Administrator")
+
+_dev_server = int(sbool(os.environ.get("DEV_SERVER", False)))
+
+if _dev_server:
+	warnings.simplefilter("always", DeprecationWarning)
+	warnings.simplefilter("always", PendingDeprecationWarning)
 
 
 class _dict(dict):
@@ -82,7 +83,7 @@ class _dict(dict):
 		return _dict(dict(self).copy())
 
 
-def _(msg, lang=None, context=None):
+def _(msg, lang=None, context=None) -> str:
 	"""Returns translated string in current lang, if exists.
 	Usage:
 	        _('Change')
@@ -441,7 +442,7 @@ def msgprint(
 	if as_table and type(msg) in (list, tuple):
 		out.as_table = 1
 
-	if as_list and type(msg) in (list, tuple) and len(msg) > 1:
+	if as_list and type(msg) in (list, tuple):
 		out.as_list = 1
 
 	if flags.print_messages and out.message:
@@ -897,9 +898,9 @@ def has_permission(doctype=None, ptype="read", doc=None, user=None, verbose=Fals
 	)
 	if throw and not out:
 		if doc:
-			frappe.throw(_("No permission for {0}").format(doc.doctype + " " + doc.name))
+			frappe.throw(_("No permission for {0}").format(_(doc.doctype) + " " + doc.name))
 		else:
-			frappe.throw(_("No permission for {0}").format(doctype))
+			frappe.throw(_("No permission for {0}").format(_(doctype)))
 
 	return out
 
@@ -1018,6 +1019,12 @@ def get_cached_doc(*args, **kwargs):
 	# database
 	doc = get_doc(*args, **kwargs)
 
+	# Set in cache
+	key = get_document_cache_key(doc.doctype, doc.name)
+
+	local.document_cache[key] = doc
+	cache().hset("document_cache", key, doc.as_dict())
+
 	return doc
 
 
@@ -1066,11 +1073,14 @@ def get_doc(*args, **kwargs):
 
 	doc = frappe.model.document.get_doc(*args, **kwargs)
 
-	# set in cache
+	# Update if exists in cache
 	if args and len(args) > 1:
 		key = get_document_cache_key(args[0], args[1])
-		local.document_cache[key] = doc
-		cache().hset("document_cache", key, doc.as_dict())
+		if key in local.document_cache:
+			local.document_cache[key] = doc
+
+		if cache().hexists("document_cache", key):
+			cache().hset("document_cache", key, doc.as_dict())
 
 	return doc
 
@@ -1746,15 +1756,18 @@ def get_value(*args, **kwargs):
 	return db.get_value(*args, **kwargs)
 
 
-def as_json(obj, indent=1):
+def as_json(obj, indent=1, separators=None) -> str:
 	from frappe.utils.response import json_handler
+
+	if separators is None:
+		separators = (",", ": ")
 
 	try:
 		return json.dumps(
-			obj, indent=indent, sort_keys=True, default=json_handler, separators=(",", ": ")
+			obj, indent=indent, sort_keys=True, default=json_handler, separators=separators
 		)
 	except TypeError:
-		return json.dumps(obj, indent=indent, default=json_handler, separators=(",", ": "))
+		return json.dumps(obj, indent=indent, default=json_handler, separators=separators)
 
 
 def are_emails_muted():

@@ -29,7 +29,7 @@ def get_permission_query_conditions(for_user):
 	if for_user == "Administrator":
 		return
 
-	return """(`tabNotification Log`.for_user = '{user}')""".format(user=for_user)
+	return """(`tabNotification Log`.for_user = {user})""".format(user=frappe.db.escape(for_user))
 
 
 def get_title(doctype, docname, title_field=None):
@@ -148,6 +148,6 @@ def trigger_indicator_hide():
 
 def set_notifications_as_unseen(user):
 	try:
-		frappe.db.set_value("Notification Settings", user, "seen", 0)
+		frappe.db.set_value("Notification Settings", user, "seen", 0, update_modified=False)
 	except frappe.DoesNotExistError:
 		return

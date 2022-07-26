@@ -472,7 +472,7 @@ class Document(BaseDocument):
 
 	def get_title(self):
 		"""Get the document title based on title_field or `title` or `name`"""
-		return self.get(self.meta.get_title_field())
+		return self.get(self.meta.get_title_field()) or ""
 
 	def set_title_field(self):
 		"""Set title field based on template"""
@@ -1093,7 +1093,9 @@ class Document(BaseDocument):
 			self.run_method("on_update_after_submit")
 
 		self.clear_cache()
-		self.notify_update()
+
+		if self.flags.get("notify_update", True):
+			self.notify_update()
 
 		update_global_search(self)
 
@@ -1146,7 +1148,7 @@ class Document(BaseDocument):
 		:param fieldname: fieldname of the property to be updated, or a {"field":"value"} dictionary
 		:param value: value of the property to be updated
 		:param update_modified: default True. updates the `modified` and `modified_by` properties
-		:param notify: default False. run doc.notify_updated() to send updates via socketio
+		:param notify: default False. run doc.notify_update() to send updates via socketio
 		:param commit: default False. run frappe.db.commit()
 		"""
 		if isinstance(fieldname, dict):
@@ -1212,11 +1214,10 @@ class Document(BaseDocument):
 			return
 
 		version = frappe.new_doc("Version")
-		if not self._doc_before_save:
-			version.for_insert(self)
+
+		if version.update_version_info(self._doc_before_save, self):
 			version.insert(ignore_permissions=True)
-		elif version.set_diff(self._doc_before_save, self):
-			version.insert(ignore_permissions=True)
+
 			if not frappe.flags.in_migrate:
 				# follow since you made a change?
 				follow_document(self.doctype, self.name, frappe.session.user)
@@ -1385,6 +1386,30 @@ class Document(BaseDocument):
 	def get_signature(self):
 		"""Returns signature (hash) for private URL."""
 		return hashlib.sha224(get_datetime_str(self.creation).encode()).hexdigest()
+
+	def get_document_share_key(self, expires_on=None, no_expiry=False):
+		if no_expiry:
+			expires_on = None
+
+		existing_key = frappe.db.exists(
+			"Document Share Key",
+			{
+				"reference_doctype": self.doctype,
+				"reference_docname": self.name,
+				"expires_on": expires_on,
+			},
+		)
+		if existing_key:
+			doc = frappe.get_doc("Document Share Key", existing_key)
+		else:
+			doc = frappe.new_doc("Document Share Key")
+			doc.reference_doctype = self.doctype
+			doc.reference_docname = self.name
+			doc.expires_on = expires_on
+			doc.flags.no_expiry = no_expiry
+			doc.insert(ignore_permissions=True)
+
+		return doc.key
 
 	def get_liked_by(self):
 		liked_by = getattr(self, "_liked_by", None)

@@ -135,6 +135,7 @@ def get_safe_globals():
 			),
 			make_get_request=frappe.integrations.utils.make_get_request,
 			make_post_request=frappe.integrations.utils.make_post_request,
+			get_payment_gateway_controller=frappe.integrations.utils.get_payment_gateway_controller,
 			socketio_port=frappe.conf.socketio_port,
 			get_hooks=get_hooks,
 			enqueue=safe_enqueue,
@@ -150,7 +151,7 @@ def get_safe_globals():
 		scrub=scrub,
 		guess_mimetype=mimetypes.guess_type,
 		html2text=html2text,
-		dev_server=1 if frappe._dev_server else 0,
+		dev_server=frappe.local.dev_server,
 		run_script=run_script,
 		is_job_queued=is_job_queued,
 	)

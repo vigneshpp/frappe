@@ -28,6 +28,7 @@ from frappe.utils import (
 	comma_or,
 	cstr,
 	get_datetime,
+	get_string_between,
 	sanitize_html,
 	strip,
 	validate_email_address,
@@ -664,7 +665,8 @@ class EmailAccount(Document):
 
 		Message-ID is formatted as `{message_id}@{site}`"""
 		parent = None
-		in_reply_to = (email.mail.get("In-Reply-To") or "").strip(" <>")
+		in_reply_to = email.mail.get("In-Reply-To") or ""
+		in_reply_to = get_string_between("<", in_reply_to, ">")
 
 		if in_reply_to:
 			if "@{0}".format(frappe.local.site) in in_reply_to:
@@ -699,7 +701,7 @@ class EmailAccount(Document):
 					["reference_doctype", "reference_name"],
 					as_dict=1,
 				)
-				if comm:
+				if comm and comm.reference_doctype and comm.reference_name:
 					parent = frappe._dict(doctype=comm.reference_doctype, name=comm.reference_name)
 
 		return parent
@@ -818,6 +820,12 @@ class EmailAccount(Document):
 				frappe.throw(_("Automatic Linking can be activated only for one Email Account."))
 
 	def append_email_to_sent_folder(self, message):
+		if not (self.enable_incoming and self.use_imap):
+			# don't try appending if enable incoming and imap is not set
+			# as email domain's updation can cause email account(s) to forcibly
+			# update their settings.
+			return
+
 		email_server = None
 		try:
 			email_server = self.get_incoming_server(in_receive=True)

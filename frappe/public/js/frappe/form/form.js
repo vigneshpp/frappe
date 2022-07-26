@@ -38,6 +38,12 @@ frappe.ui.form.Form = class FrappeForm {
 		this.parent = parent;
 		this.doctype_layout = frappe.get_doc('DocType Layout', doctype_layout_name);
 		this.setup_meta(doctype);
+
+		this.beforeUnloadListener = (event) => {
+			event.preventDefault();
+			// A String is returned for compatability with older Browsers. Return Value has to be truthy to trigger "Leave Site" Dialog
+			return event.returnValue = 'There are unsaved changes, are you sure you want to exit?';
+		};
 	}
 
 	setup_meta() {
@@ -169,7 +175,7 @@ frappe.ui.form.Form = class FrappeForm {
 		grid_shortcut_keys.forEach(row => {
 			frappe.ui.keys.add_shortcut({
 				shortcut: row.shortcut,
-				page: this,
+				page: this.page,
 				description: __(row.description),
 				ignore_inputs: true,
 				condition: () => !this.is_new()
@@ -290,6 +296,8 @@ frappe.ui.form.Form = class FrappeForm {
 
 	refresh(docname) {
 		var switched = docname ? true : false;
+
+		removeEventListener("beforeunload", this.beforeUnloadListener, {capture: true});
 
 		if(docname) {
 			this.switch_doc(docname);
@@ -1164,6 +1172,9 @@ frappe.ui.form.Form = class FrappeForm {
 	dirty() {
 		this.doc.__unsaved = 1;
 		this.$wrapper.trigger('dirty');
+		if (!frappe.boot.developer_mode) {
+			addEventListener("beforeunload", this.beforeUnloadListener, {capture: true});
+		}
 	}
 
 	get_docinfo() {
@@ -1296,7 +1307,7 @@ frappe.ui.form.Form = class FrappeForm {
 		}
 		for (var i=0, l=fnames.length; i<l; i++) {
 			var fieldname = fnames[i];
-			var field = frappe.meta.get_docfield(cur_frm.doctype, fieldname, this.docname);
+			var field = frappe.meta.get_docfield(this.doctype, fieldname, this.docname);
 			if(field) {
 				fn(field);
 				this.refresh_field(fieldname);
@@ -1549,11 +1560,11 @@ frappe.ui.form.Form = class FrappeForm {
 	set_indicator_formatter(fieldname, get_color, get_text) {
 		// get doctype from parent
 		var doctype;
-		if(frappe.meta.docfield_map[this.doctype][fieldname]) {
+		if (frappe.meta.docfield_map[this.doctype][fieldname]) {
 			doctype = this.doctype;
 		} else {
 			frappe.meta.get_table_fields(this.doctype).every(function(df) {
-				if(frappe.meta.docfield_map[df.options][fieldname]) {
+				if (frappe.meta.docfield_map[df.options][fieldname]) {
 					doctype = df.options;
 					return false;
 				} else {
@@ -1564,11 +1575,11 @@ frappe.ui.form.Form = class FrappeForm {
 
 		frappe.meta.docfield_map[doctype][fieldname].formatter =
 			function(value, df, options, doc) {
-				if(value) {
+				if (value) {
 					var label;
-					if(get_text) {
+					if (get_text) {
 						label = get_text(doc);
-					} else if(frappe.form.link_formatters[df.options]) {
+					} else if (frappe.form.link_formatters[df.options]) {
 						label = frappe.form.link_formatters[df.options](value, doc);
 					} else {
 						label = value;
@@ -1576,7 +1587,14 @@ frappe.ui.form.Form = class FrappeForm {
 
 					const escaped_name = encodeURIComponent(value);
 
-					return `<a class="indicator ${get_color(doc || {})}" href="/app/${frappe.router.slug(df.options)}/${escaped_name}" data-doctype="${doctype}" data-name="${value}">${label}</a>`;
+					return `
+						<a class="indicator ${get_color(doc || {})}"
+							href="/app/${frappe.router.slug(df.options)}/${escaped_name}"
+							data-doctype="${df.options}"
+							data-name="${value}">
+							${label}
+						</a>
+					`;
 				} else {
 					return '';
 				}

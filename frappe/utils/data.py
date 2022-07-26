@@ -703,7 +703,7 @@ def has_common(l1, l2):
 def cast_fieldtype(fieldtype, value, show_warning=True):
 	if show_warning:
 		message = (
-			"Function `frappe.utils.data.cast` has been deprecated in favour"
+			"Function `frappe.utils.data.cast_fieldtype` has been deprecated in favour"
 			" of `frappe.utils.data.cast`. Use the newer util for safer type casting."
 		)
 		secho(message, fg="yellow")
@@ -858,7 +858,7 @@ def floor(s):
 	"""
 	try:
 		num = cint(math.floor(flt(s)))
-	except:
+	except Exception:
 		num = 0
 	return num
 
@@ -880,7 +880,7 @@ def ceil(s):
 	"""
 	try:
 		num = cint(math.ceil(flt(s)))
-	except:
+	except Exception:
 		num = 0
 	return num
 
@@ -1773,6 +1773,16 @@ def unique(seq):
 def strip(val, chars=None):
 	# \ufeff is no-width-break, \u200b is no-width-space
 	return (val or "").replace("\ufeff", "").replace("\u200b", "").strip(chars)
+
+
+def get_string_between(start, string, end):
+	if not string:
+		return ""
+
+	regex = "{0}(.*){1}".format(start, end)
+	out = re.search(regex, string)
+
+	return out.group(1) if out else string
 
 
 def to_markdown(html):

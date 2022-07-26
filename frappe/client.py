@@ -101,7 +101,7 @@ def get_value(doctype, fieldname, filters=None, as_dict=True, debug=False, paren
 		check_parent_permission(parent, doctype)
 
 	if not frappe.has_permission(doctype):
-		frappe.throw(_("No permission for {0}").format(doctype), frappe.PermissionError)
+		frappe.throw(_("No permission for {0}").format(_(doctype)), frappe.PermissionError)
 
 	filters = get_safe_filters(filters)
 	if isinstance(filters, string_types):
@@ -143,7 +143,7 @@ def get_value(doctype, fieldname, filters=None, as_dict=True, debug=False, paren
 @frappe.whitelist()
 def get_single_value(doctype, field):
 	if not frappe.has_permission(doctype):
-		frappe.throw(_("No permission for {0}").format(doctype), frappe.PermissionError)
+		frappe.throw(_("No permission for {0}").format(_(doctype)), frappe.PermissionError)
 	value = frappe.db.get_single_value(doctype, field)
 	return value
 
@@ -298,17 +298,6 @@ def set_default(key, value, parent=None):
 
 
 @frappe.whitelist(methods=["POST", "PUT"])
-def make_width_property_setter(doc):
-	"""Set width Property Setter
-
-	:param doc: Property Setter document with `width` property"""
-	if isinstance(doc, string_types):
-		doc = json.loads(doc)
-	if doc["doctype"] == "Property Setter" and doc["property"] == "width":
-		frappe.get_doc(doc).insert(ignore_permissions=True)
-
-
-@frappe.whitelist(methods=["POST", "PUT"])
 def bulk_update(docs):
 	"""Bulk update documents
 
@@ -436,11 +425,6 @@ def attach_file(
 		doc.save()
 
 	return _file.as_dict()
-
-
-@frappe.whitelist()
-def get_hooks(hook, app_name=None):
-	return frappe.get_hooks(hook, app_name)
 
 
 @frappe.whitelist()
