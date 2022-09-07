@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2017, Frappe Technologies and Contributors
-# See license.txt
-import unittest
+# License: MIT. See LICENSE
+from frappe.tests.utils import FrappeTestCase
 
-class TestS3BackupSettings(unittest.TestCase):
+
+class TestS3BackupSettings(FrappeTestCase):
 	pass

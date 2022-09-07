@@ -1,11 +1,12 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2015, Frappe Technologies and contributors
-# For license information, please see license.txt
+# License: MIT. See LICENSE
+
+import json
 
 import frappe
-from frappe.model.document import Document
-import json
 from frappe.integrations.utils import json_handler
+from frappe.model.document import Document
+
 
 class IntegrationRequest(Document):
 	def autoname(self):

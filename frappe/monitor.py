@@ -1,15 +1,15 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2020, Frappe Technologies Pvt. Ltd. and Contributors
-# MIT License. See license.txt
+# License: MIT. See LICENSE
 
-from datetime import datetime
 import json
-import traceback
-import frappe
 import os
+import traceback
 import uuid
+from datetime import datetime
+
 import rq
 
+import frappe
 
 MONITOR_REDIS_KEY = "monitor-transactions"
 MONITOR_MAX_ENTRIES = 1000000
@@ -30,6 +30,8 @@ def log_file():
 
 
 class Monitor:
+	__slots__ = ("data",)
+
 	def __init__(self, transaction_type, method, kwargs):
 		try:
 			self.data = frappe._dict(

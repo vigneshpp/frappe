@@ -1,15 +1,22 @@
 @import "./desk/variables";
 
 body {
-	background-color: var(--bg-light-gray);
+	@include media-breakpoint-up(sm) {
+		background-color: var(--bg-light-gray);
+	}
+}
+
+.for-forgot,
+.for-signup,
+.for-email-login {
+	display: none;
 }
 
 .for-login,
 .for-forgot,
 .for-signup,
 .for-email-login {
-	display: none;
-	margin: 70px 0;
+	padding: max(10vh, 60px) 0;
 
 	@include media-breakpoint-up(sm) {
 		.page-card {
@@ -130,7 +137,7 @@ body {
 			}
 
 			.social-logins {
-				margin: var(--margin-md) 0;
+				margin-top: var(--margin-md);
 				font-size: var(--text-md);
 
 				.social-login-buttons {
@@ -142,7 +149,11 @@ body {
 						}
 						min-width: 50%;
 						padding: 0 4px;
-						margin-bottom: var(--margin-sm);
+						margin-bottom: var(--margin-md);
+
+						&:last-child {
+							margin-bottom: 0;
+						}
 					}
 				}
 			}
@@ -166,6 +177,7 @@ body {
 		}
 
 		h4 {
+			margin-top: 1rem;
 			font-size: var(--text-xl);
 			color: var(--text-color);
 		}

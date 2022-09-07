@@ -1,7 +1,10 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
-# MIT License. See license.txt
+# License: MIT. See LICENSE
 
-import frappe, json
+import json
+
+import frappe
+
 
 @frappe.whitelist()
 def update_task(args, field_map):

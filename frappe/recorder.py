@@ -1,20 +1,22 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2018, Frappe Technologies Pvt. Ltd. and Contributors
-# MIT License. See license.txt
-from collections import Counter
+# License: MIT. See LICENSE
 import datetime
 import inspect
 import json
 import re
 import time
-import frappe
+from collections import Counter
+
 import sqlparse
 
+import frappe
 from frappe import _
+from frappe.database.database import is_query_type
 
 RECORDER_INTERCEPT_FLAG = "recorder-intercept"
 RECORDER_REQUEST_SPARSE_HASH = "recorder-requests-sparse"
 RECORDER_REQUEST_HASH = "recorder-requests"
+TRACEBACK_PATH_PATTERN = re.compile(".*/apps/")
 
 
 def sql(*args, **kwargs):
@@ -23,18 +25,12 @@ def sql(*args, **kwargs):
 	end_time = time.time()
 
 	stack = list(get_current_stack_frames())
-
-	if frappe.db.db_type == "postgres":
-		query = frappe.db._cursor.query
-	else:
-		query = frappe.db._cursor._executed
-
-	query = sqlparse.format(query.strip(), keyword_case="upper", reindent=True)
+	query = sqlparse.format(str(frappe.db.last_query).strip(), keyword_case="upper", reindent=True)
 
 	# Collect EXPLAIN for executed query
-	if query.lower().strip().split()[0] in ("select", "update", "delete"):
+	if is_query_type(query, ("select", "update", "delete")):
 		# Only SELECT/UPDATE/DELETE queries can be "EXPLAIN"ed
-		explain_result = frappe.db._sql("EXPLAIN {}".format(query), as_dict=True)
+		explain_result = frappe.db._sql(f"EXPLAIN {query}", as_dict=True)
 	else:
 		explain_result = []
 
@@ -43,7 +39,7 @@ def sql(*args, **kwargs):
 		"stack": stack,
 		"explain_result": explain_result,
 		"time": start_time,
-		"duration": float("{:.3f}".format((end_time - start_time) * 1000)),
+		"duration": float(f"{(end_time - start_time) * 1000:.3f}"),
 	}
 
 	frappe.local._recorder.register(data)
@@ -57,12 +53,13 @@ def get_current_stack_frames():
 		for frame, filename, lineno, function, context, index in list(reversed(frames))[:-2]:
 			if "/apps/" in filename:
 				yield {
-					"filename": re.sub(".*/apps/", "", filename),
+					"filename": TRACEBACK_PATH_PATTERN.sub("", filename),
 					"lineno": lineno,
 					"function": function,
 				}
 	except Exception:
 		pass
+
 
 def record():
 	if __debug__:
@@ -98,12 +95,8 @@ class Recorder:
 			"cmd": self.cmd,
 			"time": self.time,
 			"queries": len(self.calls),
-			"time_queries": float(
-				"{:0.3f}".format(sum(call["duration"] for call in self.calls))
-			),
-			"duration": float(
-				"{:0.3f}".format((datetime.datetime.now() - self.time).total_seconds() * 1000)
-			),
+			"time_queries": float("{:0.3f}".format(sum(call["duration"] for call in self.calls))),
+			"duration": float(f"{(datetime.datetime.now() - self.time).total_seconds() * 1000:0.3f}"),
 			"method": self.method,
 		}
 		frappe.cache().hset(RECORDER_REQUEST_SPARSE_HASH, self.uuid, request_data)
@@ -179,6 +172,13 @@ def get(uuid=None, *args, **kwargs):
 	else:
 		result = list(frappe.cache().hgetall(RECORDER_REQUEST_SPARSE_HASH).values())
 	return result
+
+
+@frappe.whitelist()
+@do_not_record
+@administrator_only
+def export_data(*args, **kwargs):
+	return list(frappe.cache().hgetall(RECORDER_REQUEST_HASH).values())
 
 
 @frappe.whitelist()

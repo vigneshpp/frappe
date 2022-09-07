@@ -1,23 +1,31 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ lang }}" dir="{{ layout_direction }}">
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>{{ title }}</title>
 	<meta name="generator" content="frappe">
 	{{ include_style('print.bundle.css') }}
-	{%- if has_rtl -%}
-		{{ include_style('frappe-rtl.bundle.css') }}
-	{%- endif -%}
-	<style>
-	{{ css }}
-	</style>
+	{% if print_style %}
+		<style>
+		{{ print_style }}
+		</style>
+	{% endif %}
 </head>
 <body>
+	<div class="action-banner print-hide">
+		<a class="p-2" onclick="window.print();">
+			{{ _("Print") }}
+		</a>
+		<a class="p-2"
+			href="/api/method/frappe.utils.print_format.download_pdf?doctype={{doctype}}&name={{name}}&key={{key}}">
+			{{ _('Get PDF') }}
+		</a>
+	</div>
 	<div class="print-format-gutter">
-	    <div class="print-format">
-		{{ body }}
-	    </div>
+		<div class="print-format">
+			{{ body }}
+		</div>
 	</div>
 	<script>
 		document.addEventListener('DOMContentLoaded', () => {

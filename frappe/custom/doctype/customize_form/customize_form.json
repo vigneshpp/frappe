@@ -10,10 +10,8 @@
   "doc_type",
   "properties",
   "label",
-  "max_attachments",
   "search_fields",
   "column_break_5",
-  "allow_copy",
   "istable",
   "editable_grid",
   "quick_entry",
@@ -24,10 +22,18 @@
   "fields_section_break",
   "fields",
   "naming_section",
+  "naming_rule",
   "autoname",
+  "form_settings_section",
+  "image_field",
+  "max_attachments",
+  "column_break_21",
+  "allow_copy",
+  "make_attachments_public",
   "view_settings_section",
   "title_field",
-  "image_field",
+  "show_title_field_in_link",
+  "translated_doctype",
   "default_print_format",
   "column_break_29",
   "show_preview_popup",
@@ -41,12 +47,21 @@
   "actions",
   "document_links_section",
   "links",
+  "document_states_section",
+  "states",
   "section_break_8",
   "sort_field",
   "column_break_10",
   "sort_order"
  ],
  "fields": [
+  {
+   "fieldname": "naming_rule",
+   "fieldtype": "Select",
+   "label": "Naming Rule",
+   "length": 40,
+   "options": "\nSet by user\nBy fieldname\nBy \"Naming Series\" field\nExpression\nExpression (old style)\nRandom\nBy script"
+  },
   {
    "fieldname": "doc_type",
    "fieldtype": "Link",
@@ -276,10 +291,52 @@
    "label": "Naming"
   },
   {
-   "description": "Naming Options:\n<ol><li><b>field:[fieldname]</b> - By Field</li><li><b>naming_series:</b> - By Naming Series (field called naming_series must be present</li><li><b>Prompt</b> - Prompt user for a name</li><li><b>[series]</b> - Series by prefix (separated by a dot); for example PRE.#####</li>\n<li><b>format:EXAMPLE-{MM}morewords{fieldname1}-{fieldname2}-{#####}</b> - Replace all braced words (fieldnames, date words (DD, MM, YY), series) with their value. Outside braces, any characters can be used.</li></ol>",
+   "description": "Naming Options:\n<ol><li><b>field:[fieldname]</b> - By Field</li><li><b>naming_series:</b> - By Naming Series (field called naming_series must be present)</li><li><b>Prompt</b> - Prompt user for a name</li><li><b>[series]</b> - Series by prefix (separated by a dot); for example PRE.#####</li>\n<li><b>format:EXAMPLE-{MM}morewords{fieldname1}-{fieldname2}-{#####}</b> - Replace all braced words (fieldnames, date words (DD, MM, YY), series) with their value. Outside braces, any characters can be used.</li></ol>",
    "fieldname": "autoname",
    "fieldtype": "Data",
    "label": "Auto Name"
+  },
+  {
+   "collapsible": 1,
+   "collapsible_depends_on": "states",
+   "depends_on": "doc_type",
+   "fieldname": "document_states_section",
+   "fieldtype": "Section Break",
+   "label": "Document States"
+  },
+  {
+   "fieldname": "states",
+   "fieldtype": "Table",
+   "label": "States",
+   "options": "DocType State"
+  },
+  {
+   "default": "0",
+   "fieldname": "show_title_field_in_link",
+   "fieldtype": "Check",
+   "label": "Show Title in Link Fields"
+  },
+  {
+   "default": "0",
+   "fieldname": "translated_doctype",
+   "fieldtype": "Check",
+   "label": "Translate Link Fields"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "form_settings_section",
+   "fieldtype": "Section Break",
+   "label": "Form Settings"
+  },
+  {
+   "fieldname": "column_break_21",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "make_attachments_public",
+   "fieldtype": "Check",
+   "label": "Make Attachments Public by Default"
   }
  ],
  "hide_toolbar": 1,
@@ -288,10 +345,11 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2021-06-21 19:01:06.920663",
+ "modified": "2022-08-24 06:57:47.966331",
  "modified_by": "Administrator",
  "module": "Custom",
  "name": "Customize Form",
+ "naming_rule": "Expression (old style)",
  "owner": "Administrator",
  "permissions": [
   {
@@ -308,5 +366,6 @@
  "search_fields": "doc_type",
  "sort_field": "modified",
  "sort_order": "DESC",
+ "states": [],
  "track_changes": 1
 }
