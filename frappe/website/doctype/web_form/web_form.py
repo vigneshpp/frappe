@@ -36,17 +36,20 @@ class WebForm(WebsiteGenerator):
 		if not self.module:
 			self.module = frappe.db.get_value("DocType", self.doc_type, "module")
 
-		if (
-			not (
-				frappe.flags.in_install
-				or frappe.flags.in_patch
-				or frappe.flags.in_test
-				or frappe.flags.in_fixtures
-			)
-			and self.is_standard
-			and not frappe.conf.developer_mode
-		):
-			frappe.throw(_("You need to be in developer mode to edit a Standard Web Form"))
+		in_user_env = not (
+			frappe.flags.in_install
+			or frappe.flags.in_patch
+			or frappe.flags.in_test
+			or frappe.flags.in_fixtures
+		)
+		if in_user_env and self.is_standard and not frappe.conf.developer_mode:
+			# only published can be changed for standard web forms
+			if self.has_value_changed("published"):
+				published_value = self.published
+				self.reload()
+				self.published = published_value
+			else:
+				frappe.throw(_("You need to be in developer mode to edit a Standard Web Form"))
 
 		if not frappe.flags.in_import:
 			self.validate_fields()
@@ -138,7 +141,6 @@ def get_context(context):
 
 	def get_context(self, context):
 		"""Build context to render the `web_form.html` template"""
-		self.set_web_form_module()
 
 		doc, delimeter = make_route_string(frappe.form_dict)
 		context.doc = doc
@@ -273,13 +275,14 @@ def get_context(context):
 
 	def add_custom_context_and_script(self, context):
 		"""Update context from module if standard and append script"""
-		if self.web_form_module:
-			new_context = self.web_form_module.get_context(context)
+		if self.is_standard:
+			web_form_module = get_web_form_module(self)
+			new_context = web_form_module.get_context(context)
 
 			if new_context:
 				context.update(new_context)
 
-			js_path = os.path.join(os.path.dirname(self.web_form_module.__file__), scrub(self.name) + ".js")
+			js_path = os.path.join(os.path.dirname(web_form_module.__file__), scrub(self.name) + ".js")
 			if os.path.exists(js_path):
 				script = frappe.render_template(open(js_path, "r").read(), context)
 
@@ -289,9 +292,7 @@ def get_context(context):
 
 				context.script = script
 
-			css_path = os.path.join(
-				os.path.dirname(self.web_form_module.__file__), scrub(self.name) + ".css"
-			)
+			css_path = os.path.join(os.path.dirname(web_form_module.__file__), scrub(self.name) + ".css")
 			if os.path.exists(css_path):
 				style = open(css_path, "r").read()
 
@@ -367,14 +368,6 @@ def get_context(context):
 
 		return parents
 
-	def set_web_form_module(self):
-		"""Get custom web form module if exists"""
-		self.web_form_module = self.get_web_form_module()
-
-	def get_web_form_module(self):
-		if self.is_standard:
-			return get_doc_module(self.module, self.doctype, self.name)
-
 	def validate_mandatory(self, doc):
 		"""Validate mandatory web form fields"""
 		missing = []
@@ -411,6 +404,11 @@ def get_context(context):
 
 		else:
 			return False
+
+
+def get_web_form_module(doc):
+	if doc.is_standard:
+		return get_doc_module(doc.module, doc.doctype, doc.name)
 
 
 @frappe.whitelist(allow_guest=True)
