@@ -7,7 +7,7 @@ import random
 import re
 import string
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from time import time
 
 from pypika.dialects import MySQLQueryBuilder, PostgreSQLQueryBuilder
@@ -28,9 +28,9 @@ from frappe.database.utils import (
 from frappe.exceptions import DoesNotExistError, ImplicitCommitError
 from frappe.model.utils.link_count import flush_local_link_count
 from frappe.query_builder.functions import Count
-from frappe.query_builder.utils import DocType
 from frappe.utils import cast as cast_fieldtype
-from frappe.utils import get_datetime, get_table_name, getdate, now, sbool
+from frappe.utils import cint, get_datetime, get_table_name, getdate, now, sbool
+from frappe.utils.deprecations import deprecated
 
 IFNULL_PATTERN = re.compile(r"ifnull\(", flags=re.IGNORECASE)
 INDEX_PATTERN = re.compile(r"\s*\([^)]+\)\s*")
@@ -83,14 +83,12 @@ class Database:
 		ac_name=None,
 		use_default=0,
 		port=None,
-		read_only=False,
 	):
 		self.setup_type_map()
 		self.host = host or frappe.conf.db_host or "127.0.0.1"
 		self.port = port or frappe.conf.db_port or ""
 		self.user = user or frappe.conf.db_name
 		self.db_name = frappe.conf.db_name
-		self.read_only = read_only  # Uses READ ONLY connection if set
 		self._conn = None
 
 		if ac_name:
@@ -117,6 +115,17 @@ class Database:
 		self._cursor = self._conn.cursor()
 		frappe.local.rollback_observers = []
 
+		try:
+			if execution_timeout := get_query_execution_timeout():
+				self.set_execution_timeout(execution_timeout)
+		except Exception as e:
+			frappe.logger("database").warning(f"Couldn't set execution timeout {e}")
+
+	def set_execution_timeout(self, seconds: int):
+		"""Set session speicifc timeout on exeuction of statements.
+		If any statement takes more time it will be killed along with entire transaction."""
+		raise NotImplementedError
+
 	def use(self, db_name):
 		"""`USE` db_name."""
 		self._conn.select_db(db_name)
@@ -138,12 +147,11 @@ class Database:
 		self,
 		query: Query,
 		values: QueryValues = EmptyQueryValues,
+		*,
 		as_dict=0,
 		as_list=0,
-		formatted=0,
 		debug=0,
 		ignore_ddl=0,
-		as_utf8=0,
 		auto_commit=0,
 		update=None,
 		explain=False,
@@ -156,10 +164,8 @@ class Database:
 		:param values: Tuple / List / Dict of values to be escaped and substituted in the query.
 		:param as_dict: Return as a dictionary.
 		:param as_list: Always return as a list.
-		:param formatted: Format values like date etc.
 		:param debug: Print query and `EXPLAIN` in debug log.
 		:param ignore_ddl: Catch exception if table, column missing.
-		:param as_utf8: Encode values as UTF 8.
 		:param auto_commit: Commit after executing the query.
 		:param update: Update this dict to all rows (if returned `as_dict`).
 		:param run: Returns query without executing it if False.
@@ -221,6 +227,15 @@ class Database:
 			elif self.is_timedout(e):
 				raise frappe.QueryTimeoutError(e) from e
 
+			elif self.is_read_only_mode_error(e):
+				frappe.throw(
+					_(
+						"Site is running in read only mode, this action can not be performed right now. Please try again later."
+					),
+					title=_("In Read Only Mode"),
+					exc=frappe.InReadOnlyMode,
+				)
+
 			# TODO: added temporarily
 			elif self.db_type == "postgres":
 				traceback.print_stack()
@@ -258,13 +273,13 @@ class Database:
 
 		# scrub output if required
 		if as_dict:
-			ret = self.fetch_as_dict(formatted, as_utf8)
+			ret = self.fetch_as_dict()
 			if update:
 				for r in ret:
 					r.update(update)
 			return ret
-		elif as_list or as_utf8:
-			return self.convert_to_lists(self.last_result, formatted, as_utf8)
+		elif as_list:
+			return self.convert_to_lists(self.last_result)
 		return self.last_result
 
 	def _log_query(self, mogrified_query: str, debug: bool = False, explain: bool = False) -> None:
@@ -371,56 +386,27 @@ class Database:
 		):
 			raise ImplicitCommitError("This statement can cause implicit commit")
 
-	def fetch_as_dict(self, formatted=0, as_utf8=0) -> list[frappe._dict]:
+	def fetch_as_dict(self) -> list[frappe._dict]:
 		"""Internal. Converts results to dict."""
 		result = self.last_result
-		ret = []
 		if result:
 			keys = [column[0] for column in self._cursor.description]
 
-		for r in result:
-			values = []
-			for value in r:
-				if as_utf8 and isinstance(value, str):
-					value = value.encode("utf-8")
-				values.append(value)
-
-			ret.append(frappe._dict(zip(keys, values)))
-		return ret
+		return [frappe._dict(zip(keys, row)) for row in result]
 
 	@staticmethod
 	def clear_db_table_cache(query):
 		if query and is_query_type(query, ("drop", "create")):
 			frappe.cache().delete_key("db_tables")
 
-	@staticmethod
-	def needs_formatting(result, formatted):
-		"""Returns true if the first row in the result has a Date, Datetime, Long Int."""
-		if result and result[0]:
-			for v in result[0]:
-				if isinstance(v, (datetime.date, datetime.timedelta, datetime.datetime, int)):
-					return True
-				if formatted and isinstance(v, (int, float)):
-					return True
-
-		return False
-
 	def get_description(self):
 		"""Returns result metadata."""
 		return self._cursor.description
 
 	@staticmethod
-	def convert_to_lists(res, formatted=0, as_utf8=0):
+	def convert_to_lists(res):
 		"""Convert tuple output to lists (internal)."""
-		nres = []
-		for r in res:
-			nr = []
-			for val in r:
-				if as_utf8 and isinstance(val, str):
-					val = val.encode("utf-8")
-				nr.append(val)
-			nres.append(nr)
-		return nres
+		return [[value for value in row] for row in res]
 
 	def get(self, doctype, filters=None, as_dict=True, cache=False):
 		"""Returns `get_value` with fieldname='*'"""
@@ -780,13 +766,11 @@ class Database:
 		distinct=False,
 		limit=None,
 	):
-		field_objects = []
 		query = frappe.qb.engine.get_query(
 			table=doctype,
 			filters=filters,
 			orderby=order_by,
 			for_update=for_update,
-			field_objects=field_objects,
 			fields=fields,
 			distinct=distinct,
 			limit=limit,
@@ -822,10 +806,6 @@ class Database:
 			).run(debug=debug, run=run, as_dict=as_dict)
 		return {}
 
-	def update(self, *args, **kwargs):
-		"""Update multiple values. Alias for `set_value`."""
-		return self.set_value(*args, **kwargs)
-
 	def set_value(
 		self,
 		dt,
@@ -851,7 +831,6 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Set as false, if you don't want to update the timestamp.
 		:param debug: Print the query in the developer / js console.
-		:param for_update: Will add a row-level lock to the value that is being set so that it can be released on commit.
 		"""
 		is_single_doctype = not (dn and dt != dn)
 		to_update = field if isinstance(field, dict) else {field: val}
@@ -873,19 +852,11 @@ class Database:
 			frappe.clear_document_cache(dt, dt)
 
 		else:
-			table = DocType(dt)
+			query = frappe.qb.engine.build_conditions(table=dt, filters=dn, update=True)
 
-			if for_update:
-				docnames = tuple(
-					self.get_values(dt, dn, "name", debug=debug, for_update=for_update, pluck=True)
-				) or (NullValue(),)
-				query = frappe.qb.update(table).where(table.name.isin(docnames))
-
-				for docname in docnames:
-					frappe.clear_document_cache(dt, docname)
-
+			if isinstance(dn, str):
+				frappe.clear_document_cache(dt, dn)
 			else:
-				query = frappe.qb.engine.build_conditions(table=dt, filters=dn, update=True)
 				# TODO: Fix this; doesn't work rn - gavin@frappe.io
 				# frappe.cache().hdel_keys(dt, "document_cache")
 				# Workaround: clear all document caches
@@ -898,30 +869,6 @@ class Database:
 
 		if dt in self.value_cache:
 			del self.value_cache[dt]
-
-	@staticmethod
-	def set(doc, field, val):
-		"""Set value in document. **Avoid**"""
-		doc.db_set(field, val)
-
-	def touch(self, doctype, docname):
-		"""Update the modified timestamp of this document."""
-		modified = now()
-		DocType = frappe.qb.DocType(doctype)
-		frappe.qb.update(DocType).set(DocType.modified, modified).where(DocType.name == docname).run()
-		return modified
-
-	@staticmethod
-	def set_temp(value):
-		"""Set a temperory value and return a key."""
-		key = frappe.generate_hash()
-		frappe.cache().hset("temp", key, value)
-		return key
-
-	@staticmethod
-	def get_temp(key):
-		"""Return the temperory value and delete it."""
-		return frappe.cache().hget("temp", key)
 
 	def set_global(self, key, val, user="__global"):
 		"""Save a global key value. Global values will be automatically set if they match fieldname."""
@@ -958,8 +905,10 @@ class Database:
 
 		return defaults.get(frappe.scrub(key))
 
-	def begin(self):
-		self.sql("START TRANSACTION")
+	def begin(self, *, read_only=False):
+		read_only = read_only or frappe.flags.read_only
+		mode = "READ ONLY" if read_only else ""
+		self.sql(f"START TRANSACTION {mode}")
 
 	def commit(self):
 		"""Commit current transaction. Calls SQL `COMMIT`."""
@@ -967,9 +916,7 @@ class Database:
 			frappe.call(method[0], *(method[1] or []), **(method[2] or {}))
 
 		self.sql("commit")
-		if self.db_type == "postgres":
-			# Postgres requires explicitly starting new transaction
-			self.begin()
+		self.begin()  # explicitly start a new transaction
 
 		frappe.local.rollback_observers = []
 		self.flush_realtime_log()
@@ -1082,7 +1029,7 @@ class Database:
 		return getdate(date).strftime("%Y-%m-%d")
 
 	@staticmethod
-	def format_datetime(datetime):
+	def format_datetime(datetime):  # noqa: F811
 		if not datetime:
 			return FallBackDateTimeStr
 
@@ -1226,9 +1173,6 @@ class Database:
 		"""
 		return self.sql_ddl(f"truncate `{get_table_name(doctype)}`")
 
-	def clear_table(self, doctype):
-		return self.truncate(doctype)
-
 	def get_last_created(self, doctype):
 		last_record = self.get_all(doctype, ("creation"), limit=1, order_by="creation desc")
 		if last_record:
@@ -1300,12 +1244,23 @@ class Database:
 
 
 def enqueue_jobs_after_commit():
-	from frappe.utils.background_jobs import execute_job, get_queue
+	from frappe.utils.background_jobs import (
+		RQ_JOB_FAILURE_TTL,
+		RQ_RESULTS_TTL,
+		execute_job,
+		get_queue,
+	)
 
 	if frappe.flags.enqueue_after_commit and len(frappe.flags.enqueue_after_commit) > 0:
 		for job in frappe.flags.enqueue_after_commit:
 			q = get_queue(job.get("queue"), is_async=job.get("is_async"))
-			q.enqueue_call(execute_job, timeout=job.get("timeout"), kwargs=job.get("queue_args"))
+			q.enqueue_call(
+				execute_job,
+				timeout=job.get("timeout"),
+				kwargs=job.get("queue_args"),
+				failure_ttl=RQ_JOB_FAILURE_TTL,
+				result_ttl=RQ_RESULTS_TTL,
+			)
 		frappe.flags.enqueue_after_commit = []
 
 
@@ -1333,3 +1288,28 @@ def savepoint(catch: type | tuple[type, ...] = Exception):
 		frappe.db.rollback(save_point=savepoint)
 	else:
 		frappe.db.release_savepoint(savepoint)
+
+
+def get_query_execution_timeout() -> int:
+	"""Get execution timeout based on current timeout in different contexts.
+
+	    HTTP requests: HTTP timeout or a default (300)
+	    Background jobs: Job timeout
+	Console/Commands: No timeout = 0.
+
+	    Note: Timeout adds 1.5x as "safety factor"
+	"""
+	from rq import get_current_job
+
+	if not frappe.conf.get("enable_db_statement_timeout"):
+		return 0
+
+	# Zero means no timeout, which is the default value in db.
+	timeout = 0
+	with suppress(Exception):
+		if getattr(frappe.local, "request", None):
+			timeout = frappe.conf.http_timeout or 300
+		elif job := get_current_job():
+			timeout = job.timeout
+
+	return int(cint(timeout) * 1.5)

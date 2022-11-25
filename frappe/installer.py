@@ -3,14 +3,19 @@
 
 import json
 import os
+import re
+import subprocess
 import sys
 from collections import OrderedDict
+from contextlib import suppress
+from shutil import which
 
 import click
 
 import frappe
 from frappe.defaults import _clear_cache
 from frappe.utils import cint, is_git_url
+from frappe.utils.dashboard import sync_dashboards
 
 
 def _is_scheduler_enabled() -> bool:
@@ -301,6 +306,7 @@ def install_app(name, verbose=False, set_as_patched=True, force=False):
 	sync_jobs()
 	sync_fixtures(name)
 	sync_customizations(name)
+	sync_dashboards(name)
 
 	for after_sync in app_hooks.after_sync or []:
 		frappe.get_attr(after_sync)()  #
@@ -400,7 +406,7 @@ def _delete_modules(modules: list[str], dry_run: bool) -> list[str]:
 
 			if not dry_run:
 				if doctype.issingle:
-					frappe.delete_doc("DocType", doctype.name, ignore_on_trash=True)
+					frappe.delete_doc("DocType", doctype.name, ignore_on_trash=True, force=True)
 				else:
 					drop_doctypes.append(doctype.name)
 
@@ -458,7 +464,7 @@ def _delete_doctypes(doctypes: list[str], dry_run: bool) -> None:
 	for doctype in set(doctypes):
 		print(f"* dropping Table for '{doctype}'...")
 		if not dry_run:
-			frappe.delete_doc("DocType", doctype, ignore_on_trash=True)
+			frappe.delete_doc("DocType", doctype, ignore_on_trash=True, force=True)
 			frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `tab{doctype}`")
 
 
@@ -651,9 +657,21 @@ def convert_archive_content(sql_file_path):
 	if frappe.conf.db_type == "mariadb":
 		# ever since mariaDB 10.6, row_format COMPRESSED has been deprecated and removed
 		# this step is added to ease restoring sites depending on older mariaDB servers
+		# This change was reverted by mariadb in 10.6.6
+		# Ref: https://mariadb.com/kb/en/innodb-compressed-row-format/#read-only
 		from pathlib import Path
 
 		from frappe.utils import random_string
+
+		version = _guess_mariadb_version()
+		if not version or (version <= (10, 6, 0) or version >= (10, 6, 6)):
+			return
+
+		click.secho(
+			"MariaDB version being used does not support ROW_FORMAT=COMPRESSED, "
+			"converting into DYNAMIC format.",
+			fg="yellow",
+		)
 
 		old_sql_file_path = Path(f"{sql_file_path}_{random_string(10)}")
 		sql_file_path = Path(sql_file_path)
@@ -680,6 +698,20 @@ def extract_sql_gzip(sql_gz_path):
 		raise
 
 	return decompressed_file
+
+
+def _guess_mariadb_version() -> tuple[int] | None:
+	# Using command-line because we *might* not have a connection yet and this command is required
+	# in non-interactive mode.
+	# Use db.sql("select version()") instead if connection is available.
+	with suppress(Exception):
+		mysql = which("mysql")
+		version_output = subprocess.getoutput(f"{mysql} --version")
+		version_regex = r"(?P<version>\d+\.\d+\.\d+)-MariaDB"
+
+		version = re.search(version_regex, version_output).group("version")
+
+		return tuple(int(v) for v in version.split("."))
 
 
 def extract_files(site_name, file_path):

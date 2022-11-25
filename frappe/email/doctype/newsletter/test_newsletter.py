@@ -74,7 +74,7 @@ class TestNewsletterMixin:
 				).insert(ignore_if_duplicate=True)
 			except Exception:
 				frappe.db.rollback(save_point=savepoint)
-				frappe.db.update(doctype, email_filters, "unsubscribed", 0)
+				frappe.db.set_value(doctype, email_filters, "unsubscribed", 0)
 
 			frappe.db.release_savepoint(savepoint)
 
@@ -236,13 +236,15 @@ class TestNewsletter(TestNewsletterMixin, FrappeTestCase):
 		email_queue_list = [frappe.get_doc("Email Queue", e.name) for e in frappe.get_all("Email Queue")]
 		self.assertEqual(len(email_queue_list), 4)
 
-		# emulate partial send
-		email_queue_list[0].status = "Error"
-		email_queue_list[0].recipients[0].status = "Error"
-		email_queue_list[0].save()
+		# delete a queue document to emulate partial send
+		queue_recipient_name = email_queue_list[0].recipients[0].recipient
+		email_queue_list[0].delete()
 		newsletter.email_sent = False
+
+		# make sure the pending recipient is only the one which has been deleted
+		self.assertEqual(newsletter.get_pending_recipients(), [queue_recipient_name])
 
 		# retry
 		newsletter.send_emails()
-		email_queue_list = [frappe.get_doc("Email Queue", e.name) for e in frappe.get_all("Email Queue")]
-		self.assertEqual(len(email_queue_list), 5)
+		self.assertEqual(frappe.db.count("Email Queue"), 4)
+		self.assertTrue(newsletter.email_sent)

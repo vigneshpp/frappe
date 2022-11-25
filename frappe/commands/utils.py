@@ -2,7 +2,7 @@ import json
 import os
 import subprocess
 import sys
-from distutils.spawn import find_executable
+from shutil import which
 
 import click
 
@@ -12,6 +12,7 @@ from frappe.coverage import CodeCoverage
 from frappe.exceptions import SiteNotSpecifiedError
 from frappe.utils import cint, update_progress_bar
 
+find_executable = which  # backwards compatibility
 DATA_IMPORT_DEPRECATION = (
 	"[DEPRECATED] The `import-csv` command used 'Data Import Legacy' which has been deprecated.\n"
 	"Use `data-import` command instead to import data via 'Data Import'."
@@ -525,7 +526,7 @@ def postgres(context):
 def _mariadb():
 	from frappe.database.mariadb.database import MariaDBDatabase
 
-	mysql = find_executable("mysql")
+	mysql = which("mysql")
 	command = [
 		mysql,
 		"--port",
@@ -544,7 +545,7 @@ def _mariadb():
 
 
 def _psql():
-	psql = find_executable("psql")
+	psql = which("psql")
 	subprocess.run([psql, "-d", frappe.conf.db_name])
 
 
@@ -819,9 +820,16 @@ def run_tests(
 @click.option("--total-builds", help="Total number of builds", default=1)
 @click.option("--with-coverage", is_flag=True, help="Build coverage file")
 @click.option("--use-orchestrator", is_flag=True, help="Use orchestrator to run parallel tests")
+@click.option("--dry-run", is_flag=True, default=False, help="Dont actually run tests")
 @pass_context
 def run_parallel_tests(
-	context, app, build_number, total_builds, with_coverage=False, use_orchestrator=False
+	context,
+	app,
+	build_number,
+	total_builds,
+	with_coverage=False,
+	use_orchestrator=False,
+	dry_run=False,
 ):
 	from traceback_with_variables import activate_by_import
 
@@ -834,7 +842,13 @@ def run_parallel_tests(
 		else:
 			from frappe.parallel_test_runner import ParallelTestRunner
 
-			ParallelTestRunner(app, site=site, build_number=build_number, total_builds=total_builds)
+			ParallelTestRunner(
+				app,
+				site=site,
+				build_number=build_number,
+				total_builds=total_builds,
+				dry_run=dry_run,
+			)
 
 
 @click.command(
@@ -874,7 +888,6 @@ def run_ui_tests(
 
 	node_bin = subprocess.getoutput("npm bin")
 	cypress_path = f"{node_bin}/cypress"
-	plugin_path = f"{node_bin}/../cypress-file-upload"
 	drag_drop_plugin_path = f"{node_bin}/../@4tw/cypress-drag-drop"
 	real_events_plugin_path = f"{node_bin}/../cypress-real-events"
 	testing_library_path = f"{node_bin}/../@testing-library"
@@ -883,7 +896,6 @@ def run_ui_tests(
 	# check if cypress in path...if not, install it.
 	if not (
 		os.path.exists(cypress_path)
-		and os.path.exists(plugin_path)
 		and os.path.exists(drag_drop_plugin_path)
 		and os.path.exists(real_events_plugin_path)
 		and os.path.exists(testing_library_path)
@@ -894,10 +906,10 @@ def run_ui_tests(
 		packages = " ".join(
 			[
 				"cypress@^10",
-				"cypress-file-upload@^5",
 				"@4tw/cypress-drag-drop@^2",
 				"cypress-real-events",
 				"@testing-library/cypress@^8",
+				"@testing-library/dom@8.17.1",
 				"@cypress/code-coverage@^3",
 			]
 		)

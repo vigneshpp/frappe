@@ -13,7 +13,7 @@ import frappe.permissions
 import frappe.share
 from frappe import _
 from frappe.core.doctype.server_script.server_script_utils import get_server_script_map
-from frappe.database.utils import FallBackDateTimeStr
+from frappe.database.utils import FallBackDateTimeStr, NestedSetHierarchy
 from frappe.model import optional_fields
 from frappe.model.meta import get_table_columns
 from frappe.model.utils.user_settings import get_user_settings, update_user_settings
@@ -455,10 +455,10 @@ class DatabaseQuery:
 		)
 
 	def check_read_permission(self, doctype):
-		ptype = "select" if frappe.only_has_select_perm(doctype) else "read"
-
 		if not self.flags.ignore_permissions and not frappe.has_permission(
-			doctype, ptype=ptype, parent_doctype=self.doctype
+			doctype,
+			ptype="select" if frappe.only_has_select_perm(doctype) else "read",
+			parent_doctype=self.doctype,
 		):
 			frappe.flags.error_message = _("Insufficient Permission for {0}").format(frappe.bold(doctype))
 			raise frappe.PermissionError(doctype)
@@ -568,21 +568,14 @@ class DatabaseQuery:
 		can_be_null = True
 
 		# prepare in condition
-		if f.operator.lower() in (
-			"ancestors of",
-			"descendants of",
-			"not ancestors of",
-			"not descendants of",
-		):
+		if f.operator.lower() in NestedSetHierarchy:
 			values = f.value or ""
 
 			# TODO: handle list and tuple
 			# if not isinstance(values, (list, tuple)):
 			# 	values = values.split(",")
-
 			field = meta.get_field(f.fieldname)
 			ref_doctype = field.options if field else f.doctype
-
 			lft, rgt = "", ""
 			if f.value:
 				lft, rgt = frappe.db.get_value(ref_doctype, f.value, ["lft", "rgt"])
@@ -613,7 +606,10 @@ class DatabaseQuery:
 
 		elif f.operator.lower() in ("in", "not in"):
 			# if values contain '' or falsy values then only coalesce column
-			can_be_null = not f.value or any(v is None or v == "" for v in f.value)
+			# for `in` query this is only required if values contain '' or values are empty.
+			# for `not in` queries we can't be sure as column values might contain null.
+			if f.operator.lower() == "in":
+				can_be_null = not f.value or any(v is None or v == "" for v in f.value)
 
 			values = f.value or ""
 			if isinstance(values, str):
@@ -639,7 +635,7 @@ class DatabaseQuery:
 				f.value = date_range
 				fallback = f"'{FallBackDateTimeStr}'"
 
-			if f.operator in (">", "<") and (f.fieldname in ("creation", "modified")):
+			if f.operator in (">", "<", ">=", "<=") and (f.fieldname in ("creation", "modified")):
 				value = cstr(f.value)
 				fallback = f"'{FallBackDateTimeStr}'"
 

@@ -329,7 +329,7 @@ class DocType(Document):
 			"DocField", "parent", dict(fieldtype=["in", frappe.model.table_fields], options=self.name)
 		)
 		for p in parent_list:
-			frappe.db.update("DocType", p.parent, {}, for_update=False)
+			frappe.db.set_value("DocType", p.parent, {}, for_update=False)
 
 	def scrub_field_names(self):
 		"""Sluggify fieldnames if not set from Label."""
@@ -413,10 +413,6 @@ class DocType(Document):
 
 		if not frappe.flags.in_install and hasattr(self, "before_update"):
 			self.sync_global_search()
-
-		# clear from local cache
-		if self.name in frappe.local.meta_cache:
-			del frappe.local.meta_cache[self.name]
 
 		clear_linked_doctype_cache()
 
@@ -1198,6 +1194,9 @@ def validate_fields(meta):
 			frappe.throw(_("Precision should be between 1 and 6"))
 
 	def check_unique_and_text(docname, d):
+		if meta.is_virtual:
+			return
+
 		if meta.issingle:
 			d.unique = 0
 			d.search_index = 0

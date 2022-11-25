@@ -6,9 +6,8 @@ import frappe
 import frappe.database
 import frappe.utils
 import frappe.utils.user
-from frappe import _, conf
+from frappe import _
 from frappe.core.doctype.activity_log.activity_log import add_authentication_log
-from frappe.modules.patch_handler import check_session_stopped
 from frappe.sessions import Session, clear_sessions, delete_session
 from frappe.translate import get_language
 from frappe.twofactor import (
@@ -21,6 +20,9 @@ from frappe.utils import cint, date_diff, datetime, get_datetime, today
 from frappe.utils.password import check_password
 from frappe.website.utils import get_home_page
 
+SAFE_HTTP_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
+UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
+
 
 class HTTPRequest:
 	def __init__(self):
@@ -29,9 +31,6 @@ class HTTPRequest:
 
 		# load cookies
 		self.set_cookies()
-
-		# set frappe.local.db
-		self.connect()
 
 		# login and start/resume user session
 		self.set_session()
@@ -44,9 +43,6 @@ class HTTPRequest:
 
 		# write out latest cookies
 		frappe.local.cookie_manager.init_cookies()
-
-		# check session status
-		check_session_stopped()
 
 	@property
 	def domain(self):
@@ -74,38 +70,24 @@ class HTTPRequest:
 		frappe.local.login_manager = LoginManager()
 
 	def validate_csrf_token(self):
-		if frappe.local.request and frappe.local.request.method in ("POST", "PUT", "DELETE"):
-			if not frappe.local.session:
-				return
-			if (
-				not frappe.local.session.data.csrf_token
-				or frappe.local.session.data.device == "mobile"
-				or frappe.conf.get("ignore_csrf", None)
-			):
-				# not via boot
-				return
+		if (
+			not frappe.request
+			or frappe.request.method not in UNSAFE_HTTP_METHODS
+			or frappe.conf.ignore_csrf
+			or not frappe.session
+			or not (saved_token := frappe.session.data.csrf_token)
+			or (
+				(frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop("csrf_token", None))
+				== saved_token
+			)
+		):
+			return
 
-			csrf_token = frappe.get_request_header("X-Frappe-CSRF-Token")
-			if not csrf_token and "csrf_token" in frappe.local.form_dict:
-				csrf_token = frappe.local.form_dict.csrf_token
-				del frappe.local.form_dict["csrf_token"]
-
-			if frappe.local.session.data.csrf_token != csrf_token:
-				frappe.local.flags.disable_traceback = True
-				frappe.throw(_("Invalid Request"), frappe.CSRFTokenError)
+		frappe.flags.disable_traceback = True
+		frappe.throw(_("Invalid Request"), frappe.CSRFTokenError)
 
 	def set_lang(self):
 		frappe.local.lang = get_language()
-
-	def get_db_name(self):
-		"""get database name from conf"""
-		return conf.db_name
-
-	def connect(self):
-		"""connect to db, from ac_name or db_name"""
-		frappe.local.db = frappe.database.get_db(
-			user=self.get_db_name(), password=getattr(conf, "db_password", "")
-		)
 
 
 class LoginManager:
@@ -370,10 +352,6 @@ class CookieManager:
 	def set_cookie(self, key, value, expires=None, secure=False, httponly=False, samesite="Lax"):
 		if not secure and hasattr(frappe.local, "request"):
 			secure = frappe.local.request.scheme == "https"
-
-		# Cordova does not work with Lax
-		if frappe.local.session.data.device == "mobile":
-			samesite = None
 
 		self.cookies[key] = {
 			"value": value,

@@ -3,7 +3,7 @@ import socket
 import time
 from collections import defaultdict
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 from uuid import uuid4
 
 import redis
@@ -21,6 +21,11 @@ from frappe.utils.redis_queue import RedisQueue
 
 if TYPE_CHECKING:
 	from rq.job import Job
+
+
+# TTL to keep RQ job logs in redis for.
+RQ_JOB_FAILURE_TTL = 7 * 24 * 60 * 60  # 7 days instead of 1 year (default)
+RQ_RESULTS_TTL = 10 * 60
 
 
 @lru_cache
@@ -47,6 +52,8 @@ def enqueue(
 	method,
 	queue="default",
 	timeout=None,
+	on_success=None,
+	on_failure=None,
 	event=None,
 	is_async=True,
 	job_name=None,
@@ -55,7 +62,7 @@ def enqueue(
 	*,
 	at_front=False,
 	**kwargs,
-) -> "Job" | Any:
+) -> Union["Job", Any]:
 	"""
 	Enqueue method to be executed using a background worker
 
@@ -109,7 +116,16 @@ def enqueue(
 		)
 		return frappe.flags.enqueue_after_commit
 
-	return q.enqueue_call(execute_job, timeout=timeout, kwargs=queue_args, at_front=at_front)
+	return q.enqueue_call(
+		execute_job,
+		on_success=on_success,
+		on_failure=on_failure,
+		timeout=timeout,
+		kwargs=queue_args,
+		at_front=at_front,
+		failure_ttl=RQ_JOB_FAILURE_TTL,
+		result_ttl=RQ_RESULTS_TTL,
+	)
 
 
 def enqueue_doc(
@@ -369,3 +385,14 @@ def test_job(s):
 
 	print("sleeping...")
 	time.sleep(s)
+
+
+def is_job_queued(job_name: str) -> bool:
+	for queue in get_queues():
+		for job_id in queue.get_job_ids():
+			if not job_id:
+				continue
+			job = queue.fetch_job(job_id)
+			if job.kwargs.get("job_name") == job_name and job.kwargs.get("site") == frappe.local.site:
+				return True
+	return False

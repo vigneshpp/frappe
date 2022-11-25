@@ -18,7 +18,6 @@ frappe.breadcrumbs = {
 		Workflow: "Settings",
 		Printing: "Settings",
 		Setup: "Settings",
-		"Event Streaming": "Tools",
 		Automation: "Tools",
 	},
 
@@ -41,7 +40,6 @@ frappe.breadcrumbs = {
 				type: type,
 			};
 		}
-
 		this.all[frappe.breadcrumbs.current_page()] = obj;
 		this.update();
 	},
@@ -138,13 +136,13 @@ frappe.breadcrumbs = {
 		const doctype_meta = frappe.get_doc("DocType", doctype);
 		if (
 			(doctype === "User" && !frappe.user.has_role("System Manager")) ||
-			(doctype_meta && doctype_meta.issingle)
+			doctype_meta?.issingle
 		) {
 			// no user listview for non-system managers and single doctypes
 		} else {
 			let route;
 			const doctype_route = frappe.router.slug(frappe.router.doctype_layout || doctype);
-			if (frappe.boot.treeviews.indexOf(doctype) !== -1) {
+			if (doctype_meta?.is_tree) {
 				let view = frappe.model.user_settings[doctype].last_view || "Tree";
 				route = `${doctype_route}/view/${view}`;
 			} else {
