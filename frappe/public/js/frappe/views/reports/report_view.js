@@ -56,7 +56,7 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 		if (this.list_view_settings && this.list_view_settings.disable_auto_refresh) {
 			return;
 		}
-		frappe.socketio.list_subscribe(this.doctype);
+		frappe.socketio.doctype_subscribe(this.doctype);
 		frappe.realtime.on("list_update", (data) => this.on_update(data));
 	}
 
@@ -218,7 +218,7 @@ frappe.views.ReportView = class ReportView extends frappe.views.ListView {
 	}
 
 	render_count() {
-		if (this.list_view_setting && this.list_view_settings.disable_count) {
+		if (this.list_view_settings && this.list_view_settings.disable_count) {
 			return;
 		}
 		let $list_count = this.$paging_area.find('.list-count');
