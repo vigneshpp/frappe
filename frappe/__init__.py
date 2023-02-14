@@ -40,7 +40,7 @@ from .utils.lazy_loader import lazy_import
 # Lazy imports
 faker = lazy_import("faker")
 
-__version__ = "13.49.0"
+__version__ = "13.49.2"
 
 __title__ = "Frappe Framework"
 
@@ -557,7 +557,7 @@ def get_user():
 
 def get_roles(username=None):
 	"""Returns roles of current user."""
-	if not local.session:
+	if not local.session or not local.session.user:
 		return ["Guest"]
 	import frappe.permissions
 
