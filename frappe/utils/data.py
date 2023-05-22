@@ -1514,55 +1514,20 @@ def escape_html(text: str) -> str:
 
 def pretty_date(iso_datetime: datetime.datetime | str) -> str:
 	"""
-	Takes an ISO time and returns a string representing how
-	long ago the date represents.
-	Ported from PrettyDate by John Resig
-	"""
-	from frappe import _
+	Return a localized string representation of the delta to the current system time.
 
+	For example, "1 hour ago", "2 days ago", "in 5 seconds", etc.
+	"""
 	if not iso_datetime:
 		return ""
-	import math
+
+	from babel.dates import format_timedelta
 
 	if isinstance(iso_datetime, str):
 		iso_datetime = datetime.datetime.strptime(iso_datetime, DATETIME_FORMAT)
 	now_dt = datetime.datetime.strptime(now(), DATETIME_FORMAT)
-	dt_diff = now_dt - iso_datetime
-
-	# available only in python 2.7+
-	# dt_diff_seconds = dt_diff.total_seconds()
-
-	dt_diff_seconds = dt_diff.days * 86400.0 + dt_diff.seconds
-
-	dt_diff_days = math.floor(dt_diff_seconds / 86400.0)
-
-	# differnt cases
-	if dt_diff_seconds < 60.0:
-		return _("just now")
-	elif dt_diff_seconds < 120.0:
-		return _("1 minute ago")
-	elif dt_diff_seconds < 3600.0:
-		return _("{0} minutes ago").format(cint(math.floor(dt_diff_seconds / 60.0)))
-	elif dt_diff_seconds < 7200.0:
-		return _("1 hour ago")
-	elif dt_diff_seconds < 86400.0:
-		return _("{0} hours ago").format(cint(math.floor(dt_diff_seconds / 3600.0)))
-	elif dt_diff_days == 1.0:
-		return _("Yesterday")
-	elif dt_diff_days < 7.0:
-		return _("{0} days ago").format(cint(dt_diff_days))
-	elif dt_diff_days < 12:
-		return _("1 week ago")
-	elif dt_diff_days < 31.0:
-		return _("{0} weeks ago").format(dt_diff_days // 7)
-	elif dt_diff_days < 46:
-		return _("1 month ago")
-	elif dt_diff_days < 365.0:
-		return _("{0} months ago").format(dt_diff_days // 30)
-	elif dt_diff_days < 550.0:
-		return _("1 year ago")
-	else:
-		return _("{0} years ago").format(dt_diff_days // 365)
+	locale = frappe.local.lang.replace("-", "_") if frappe.local.lang else None
+	return format_timedelta(iso_datetime - now_dt, add_direction=True, locale=locale)
 
 
 def comma_or(some_list, add_quotes=True):
@@ -2256,11 +2221,20 @@ def is_site_link(link: str) -> bool:
 	return urlparse(link).netloc == urlparse(frappe.utils.get_url()).netloc
 
 
-def add_source_to_url(url: str, reference_doctype: str, reference_docname: str) -> str:
+def add_trackers_to_url(url: str, source: str, campaign: str, medium: str = "email") -> str:
 	url_parts = list(urlparse(url))
-	query = dict(parse_qsl(url_parts[4])) | {
-		"source": f"{reference_doctype} > {reference_docname}",
+	if url_parts[0] == "mailto":
+		return url
+
+	trackers = {
+		"source": source,
+		"medium": medium,
 	}
+
+	if campaign:
+		trackers["campaign"] = campaign
+
+	query = dict(parse_qsl(url_parts[4])) | trackers
 
 	url_parts[4] = urlencode(query)
 	return urlunparse(url_parts)
