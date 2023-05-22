@@ -56,8 +56,8 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 
 		this.view = "List";
 		// initialize with saved order by
-		this.sort_by = this.view_user_settings.sort_by || "modified";
-		this.sort_order = this.view_user_settings.sort_order || "desc";
+		this.sort_by = this.view_user_settings.sort_by || this.sort_by || "modified";
+		this.sort_order = this.view_user_settings.sort_order || this.sort_order || "desc";
 
 		// set filters from user_settings or list_settings
 		if (
@@ -1290,11 +1290,10 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 			if (!data || (data.doctype !== this.doctype)) {
 				return;
 			}
-			if (data.doctype && data.name) {
-				let doc = frappe.get_doc(data.doctype, data.name);
-				if (doc && doc.__unsaved) {
-					frappe.model.remove_from_locals(data.doctype, data.name);
-				}
+
+			// if some bulk operation is happening by selecting list items, don't refresh
+			if (this.$checks && this.$checks.length) {
+				return;
 			}
 
 			if (this.filter_area.is_being_edited()) {
@@ -1308,6 +1307,13 @@ frappe.views.ListView = class ListView extends frappe.views.BaseList {
 
 	process_document_refreshes() {
 		if (!this.pending_document_refreshes.length) return;
+
+		const route = frappe.get_route() || [];
+		if (!cur_list || route[0] != "List" || cur_list.doctype != route[1]) {
+			// wait till user is back on list view before refreshing
+			this.pending_document_refreshes = [];
+			return;
+		}
 
 		const names = this.pending_document_refreshes.map((d) => d.name);
 		this.pending_document_refreshes = this.pending_document_refreshes.filter(

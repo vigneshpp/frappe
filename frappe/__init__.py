@@ -40,7 +40,7 @@ from .utils.lazy_loader import lazy_import
 # Lazy imports
 faker = lazy_import("faker")
 
-__version__ = "13.51.0"
+__version__ = "13.56.3"
 
 __title__ = "Frappe Framework"
 
@@ -179,9 +179,9 @@ if typing.TYPE_CHECKING:
 # end: static analysis hack
 
 
-def init(site, sites_path=None, new_site=False):
+def init(site, sites_path=".", new_site=False, force=False):
 	"""Initialize frappe for the current site. Reset thread locals `frappe.local`"""
-	if getattr(local, "initialised", None):
+	if getattr(local, "initialised", None) and not force:
 		return
 
 	if not sites_path:
