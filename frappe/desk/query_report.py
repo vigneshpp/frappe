@@ -119,7 +119,7 @@ def generate_report_result(
 		"report_summary": report_summary,
 		"skip_total_row": skip_total_row or 0,
 		"status": None,
-		"execution_time": frappe.cache().hget("report_execution_time", report.name) or 0,
+		"execution_time": frappe.cache.hget("report_execution_time", report.name) or 0,
 	}
 
 
@@ -170,7 +170,8 @@ def get_script(report_name):
 	return {
 		"script": render_include(script),
 		"html_format": html_format,
-		"execution_time": frappe.cache().hget("report_execution_time", report_name) or 0,
+		"execution_time": frappe.cache.hget("report_execution_time", report_name) or 0,
+		"filters": report.filters,
 	}
 
 
@@ -200,7 +201,7 @@ def run(
 	if sbool(are_default_filters) and report.custom_filters:
 		filters = report.custom_filters
 
-	if report.prepared_report and not ignore_prepared_report and not custom_columns:
+	if report.prepared_report and not sbool(ignore_prepared_report) and not custom_columns:
 		if filters:
 			if isinstance(filters, str):
 				filters = json.loads(filters)
@@ -348,6 +349,13 @@ def build_xlsx_data(data, visible_idx, include_indentation, ignore_visible_idx=F
 		datetime.timedelta,
 	)
 
+	if len(visible_idx) == len(data.result):
+		# It's not possible to have same length and different content.
+		ignore_visible_idx = True
+	else:
+		# Note: converted for faster lookups
+		visible_idx = set(visible_idx)
+
 	result = [[]]
 	column_widths = []
 
@@ -451,14 +459,16 @@ def add_total_row(result, columns, meta=None, is_tree=False, parent_field=None):
 
 
 @frappe.whitelist()
-def get_data_for_custom_field(doctype, field):
+def get_data_for_custom_field(doctype, field, names=None):
 
 	if not frappe.has_permission(doctype, "read"):
 		frappe.throw(_("Not Permitted to read {0}").format(doctype), frappe.PermissionError)
 
-	value_map = frappe._dict(frappe.get_all(doctype, fields=["name", field], as_list=1))
+	filters = {}
+	if names:
+		filters.update({"name": ["in", json.loads(names)]})
 
-	return value_map
+	return frappe._dict(frappe.get_list(doctype, filters=filters, fields=["name", field], as_list=1))
 
 
 def get_data_for_custom_report(columns):

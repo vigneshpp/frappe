@@ -48,8 +48,7 @@ class TestCachingUtils(FrappeTestCase):
 
 		# ensure that external service was called only once
 		# thereby return value of request_specific_api is cached
-		for _ in range(5):
-			retval.append(request_specific_api(120, 23))
+		retval.extend(request_specific_api(120, 23) for _ in range(5))
 		external_service.assert_called_once()
 		self.assertTrue(same_output_received())
 
@@ -164,6 +163,25 @@ class TestRedisCache(FrappeAPITestCase):
 		# kwargs should hit cache too
 		self.assertEqual(function_call_count, 4)
 
+	def test_global_clear_cache(self):
+		function_call_count = 0
+
+		@redis_cache()
+		def calculate_area(radius: float) -> float:
+			nonlocal function_call_count
+			function_call_count += 1
+			return 3.14 * radius**2
+
+		calculate_area(10)
+		calculate_area(10)
+		calculate_area(10)
+		self.assertEqual(function_call_count, 1)
+
+		# This is supposed to clear cache for the active site
+		frappe.clear_cache()
+		calculate_area(10)
+		self.assertEqual(function_call_count, 2)
+
 
 class TestDocumentCache(FrappeAPITestCase):
 	TEST_DOCTYPE = "User"
@@ -215,13 +233,14 @@ class TestDocumentCache(FrappeAPITestCase):
 class TestRedisWrapper(FrappeAPITestCase):
 	def test_delete_keys(self):
 
-		c = frappe.cache()
-
 		prefix = "test_del_"
 
 		for i in range(5):
-			c.set_value(f"{prefix}{i}", 1)
+			frappe.cache.set_value(f"{prefix}{i}", 1)
 
-		self.assertEqual(len(c.get_keys(prefix)), 5)
-		c.delete_keys(prefix)
-		self.assertEqual(len(c.get_keys(prefix)), 0)
+		self.assertEqual(len(frappe.cache.get_keys(prefix)), 5)
+		frappe.cache.delete_keys(prefix)
+		self.assertEqual(len(frappe.cache.get_keys(prefix)), 0)
+
+	def test_backward_compat_cache(self):
+		self.assertEqual(frappe.cache, frappe.cache())

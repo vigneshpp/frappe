@@ -65,7 +65,10 @@ frappe.views.Workspace = class Workspace {
 		if (this.all_pages) {
 			frappe.workspaces = {};
 			for (let page of this.all_pages) {
-				frappe.workspaces[frappe.router.slug(page.name)] = { title: page.title };
+				frappe.workspaces[frappe.router.slug(page.name)] = {
+					title: page.title,
+					public: page.public,
+				};
 			}
 			this.make_sidebar();
 			reload && this.show();
@@ -242,15 +245,16 @@ frappe.views.Workspace = class Workspace {
 		}
 
 		let page = this.get_page_to_show();
-		this.page.set_title(__(page.name));
-
-		this.update_selected_sidebar(this.current_page, false); //remove selected from old page
-		this.update_selected_sidebar(page, true); //add selected on new page
 
 		if (!frappe.router.current_route[0]) {
+			frappe.route_flags.replace_route = true;
 			frappe.set_route(frappe.router.slug(page.public ? page.name : "private/" + page.name));
+			return;
 		}
 
+		this.page.set_title(__(page.name));
+		this.update_selected_sidebar(this.current_page, false); //remove selected from old page
+		this.update_selected_sidebar(page, true); //add selected on new page
 		this.show_page(page);
 	}
 
@@ -325,17 +329,14 @@ frappe.views.Workspace = class Workspace {
 				public: localStorage.is_current_page_public == "true",
 			};
 		} else if (Object.keys(this.all_pages).length !== 0) {
-			default_page = { name: this.all_pages[0].title, public: true };
+			default_page = { name: this.all_pages[0].title, public: this.all_pages[0].public };
 		} else {
 			default_page = { name: "Build", public: true };
 		}
 
-		let page =
-			(frappe.get_route()[1] == "private" ? frappe.get_route()[2] : frappe.get_route()[1]) ||
-			default_page.name;
-		let is_public = frappe.get_route()[1]
-			? frappe.get_route()[1] != "private"
-			: default_page.public;
+		const route = frappe.get_route();
+		const page = (route[1] == "private" ? route[2] : route[1]) || default_page.name;
+		const is_public = route[1] ? route[1] != "private" : default_page.public;
 		return { name: page, public: is_public };
 	}
 
@@ -346,10 +347,11 @@ frappe.views.Workspace = class Workspace {
 			`).appendTo(this.body);
 		}
 
-		if (this.all_pages) {
+		if (this.all_pages.length) {
 			this.create_page_skeleton();
 
-			let pages = page.public ? this.public_pages : this.private_pages;
+			let pages =
+				page.public && this.public_pages.length ? this.public_pages : this.private_pages;
 			let current_page = pages.filter((p) => p.title == page.name)[0];
 			this.content = current_page && JSON.parse(current_page.content);
 
@@ -1211,6 +1213,7 @@ frappe.views.Workspace = class Workspace {
 
 						this.make_sidebar();
 						this.show_sidebar_actions();
+						localStorage.setItem("new_workspace", JSON.stringify(new_page));
 					});
 			},
 		});

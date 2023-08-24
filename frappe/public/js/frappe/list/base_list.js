@@ -667,8 +667,7 @@ class FilterArea {
 
 		const fields_dict = this.list_view.page.fields_dict;
 
-		let out = filters.reduce((out, filter) => {
-			// eslint-disable-next-line
+		return filters.reduce((out, filter) => {
 			const [dt, fieldname, condition, value] = filter;
 			out.promise = out.promise || Promise.resolve();
 			out.non_standard_filters = out.non_standard_filters || [];
@@ -690,8 +689,6 @@ class FilterArea {
 			}
 			return out;
 		}, {});
-
-		return out;
 	}
 
 	remove_filters(filters) {

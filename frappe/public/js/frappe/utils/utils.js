@@ -340,9 +340,21 @@ Object.assign(frappe.utils, {
 			scroll_top = 0;
 		}
 
+		const highlight = () => {
+			if (highlight_element) {
+				$(element).addClass("highlight");
+				document.addEventListener(
+					"click",
+					function () {
+						$(element).removeClass("highlight");
+					},
+					{ once: true }
+				);
+			}
+		};
 		// already there
 		if (scroll_top == element_to_be_scrolled.scrollTop()) {
-			return;
+			return highlight();
 		}
 
 		if (animate) {
@@ -352,16 +364,7 @@ Object.assign(frappe.utils, {
 				})
 				.promise()
 				.then(() => {
-					if (highlight_element) {
-						$(element).addClass("highlight");
-						document.addEventListener(
-							"click",
-							function () {
-								$(element).removeClass("highlight");
-							},
-							{ once: true }
-						);
-					}
+					highlight();
 					callback && callback();
 				});
 		} else {
@@ -371,8 +374,7 @@ Object.assign(frappe.utils, {
 	get_scroll_position: function (element, additional_offset) {
 		let header_offset =
 			$(".navbar").height() + $(".page-head:visible").height() || $(".navbar").height();
-		let scroll_top = $(element).offset().top - header_offset - cint(additional_offset);
-		return scroll_top;
+		return $(element).offset().top - header_offset - cint(additional_offset);
 	},
 	filter_dict: function (dict, filters) {
 		var ret = [];
@@ -478,7 +480,7 @@ Object.assign(frappe.utils, {
 				break;
 			case "url":
 				regExp =
-					/^((([A-Za-z0-9.+-]+:(?:\/\/)?)(?:[-;:&=\+\,\w]@)?[A-Za-z0-9.-]+(:[0-9]+)?|(?:www.|[-;:&=\+\$,\w]+@)[A-Za-z0-9.-]+)((?:\/[\+~%\/.\w-_]*)?\??(?:[-\+=&;%@.\w_]*)#?(?:[\w]*))?)$/i;
+					/^((([A-Za-z0-9.+-]+:(?:\/\/)?)(?:[-;:&=\+\,\w]@)?[A-Za-z0-9.-]+(:[0-9]+)?|(?:www.|[-;:&=\+\$,\w]+@)[A-Za-z0-9.-]+)((?:\/[\+~%\/.\w-_]*)?\??(?:[-\+=&;%@.\w_]*)#?(?:[\w]*))?)$/i; // eslint-disable-line
 				break;
 			case "dateIso":
 				regExp = /^(\d{4})\D?(0[1-9]|1[0-2])\D?([12]\d|0[1-9]|3[01])$/;
@@ -789,10 +791,6 @@ Object.assign(frappe.utils, {
 		frappe.msgprint(__("Note: Changing the Page Name will break previous URL to this page."));
 	},
 
-	notify: function (subject, body, route, onclick) {
-		console.log("push notifications are evil and deprecated");
-	},
-
 	set_title: function (title) {
 		frappe._original_title = title;
 		if (frappe._title_prefix) {
@@ -953,11 +951,11 @@ Object.assign(frappe.utils, {
 			return "";
 		} else if (values.length > 0) {
 			if (column.column.fieldtype == "Percent" || type === "mean") {
-				return values.reduce((a, b) => a + flt(b)) / values.length;
+				return values.reduce((a, b) => flt(a) + flt(b)) / values.length;
 			} else if (column.column.fieldtype == "Int") {
-				return values.reduce((a, b) => a + cint(b));
+				return values.reduce((a, b) => cint(a) + cint(b));
 			} else if (frappe.model.is_numeric_field(column.column.fieldtype)) {
-				return values.reduce((a, b) => a + flt(b));
+				return values.reduce((a, b) => flt(a) + flt(b));
 			} else {
 				return null;
 			}
@@ -1085,8 +1083,8 @@ Object.assign(frappe.utils, {
 			let expression_function = new Function(...variable_names, code);
 			return expression_function(...variables);
 		} catch (error) {
-			console.log("Error evaluating the following expression:"); // eslint-disable-line no-console
-			console.error(code); // eslint-disable-line no-console
+			console.log("Error evaluating the following expression:");
+			console.error(code);
 			throw error;
 		}
 	},
@@ -1181,11 +1179,10 @@ Object.assign(frappe.utils, {
 	},
 
 	get_duration_options: function (docfield) {
-		let duration_options = {
+		return {
 			hide_days: docfield.hide_days,
 			hide_seconds: docfield.hide_seconds,
 		};
-		return duration_options;
 	},
 
 	get_number_system: function (country) {
@@ -1204,6 +1201,7 @@ Object.assign(frappe.utils, {
 			attribution:
 				'&copy; <a href="http://osm.org/copyright">OpenStreetMap</a> contributors',
 		},
+		image_path: "/assets/frappe/images/leaflet/",
 	},
 
 	icon(icon_name, size = "sm", icon_class = "", icon_style = "", svg_class = "") {
@@ -1292,6 +1290,9 @@ Object.assign(frappe.utils, {
 							break;
 						case "Kanban":
 							route = `${doctype_slug}/view/kanban`;
+							if (item.kanban_board) {
+								route += `/${item.kanban_board}`;
+							}
 							break;
 						default:
 							route = doctype_slug;
@@ -1558,8 +1559,8 @@ Object.assign(frappe.utils, {
 					return title;
 				});
 		} catch (error) {
-			console.log("Error while fetching link title."); // eslint-disable-line
-			console.log(error); // eslint-disable-line
+			console.log("Error while fetching link title.");
+			console.log(error);
 			return Promise.resolve(name);
 		}
 	},

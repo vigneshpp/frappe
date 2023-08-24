@@ -21,8 +21,8 @@ def get_page_info_from_web_page_with_dynamic_routes(path):
 	rules, page_info = [], {}
 
 	for d in get_dynamic_web_pages():
-		rules.append(Rule("/" + d.route, endpoint=d.name))
-		d.doctype = "Web Page"
+		rules.append(Rule(f"/{d.route}", endpoint=d.name))
+		d.doctype = d.doctype or "Web Page"
 		page_info[d.name] = d
 
 	end_point = evaluate_dynamic_routes(rules, path)
@@ -100,7 +100,7 @@ def get_pages(app=None):
 
 		return pages
 
-	return frappe.cache().get_value("website_pages", lambda: _build(app))
+	return frappe.cache.get_value("website_pages", lambda: _build(app))
 
 
 def get_pages_from_path(start, app, app_path):
@@ -266,8 +266,7 @@ def get_base_template(path=None):
 	for pattern in patterns_desc:
 		if re.match(pattern, path):
 			templates = base_template_map[pattern]
-			base_template = templates[-1]
-			return base_template
+			return templates[-1]
 
 
 def setup_index(page_info):
@@ -310,7 +309,7 @@ def get_doctypes_with_web_view():
 		]
 		return doctypes
 
-	return frappe.cache().get_value("doctypes_with_web_view", _get)
+	return frappe.cache.get_value("doctypes_with_web_view", _get)
 
 
 def get_start_folders():

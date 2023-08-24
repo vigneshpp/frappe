@@ -108,6 +108,7 @@ permission_query_conditions = {
 	"Communication": "frappe.core.doctype.communication.communication.get_permission_query_conditions_for_communication",
 	"Workflow Action": "frappe.workflow.doctype.workflow_action.workflow_action.get_permission_query_conditions",
 	"Prepared Report": "frappe.core.doctype.prepared_report.prepared_report.get_permission_query_condition",
+	"File": "frappe.core.doctype.file.file.get_permission_query_conditions",
 }
 
 has_permission = {
@@ -134,7 +135,6 @@ jinja = {
 	"filters": [
 		"frappe.utils.data.global_date_format",
 		"frappe.utils.markdown",
-		"frappe.website.utils.get_shade",
 		"frappe.website.utils.abs_url",
 	],
 }
@@ -146,8 +146,8 @@ doc_events = {
 		"on_update": [
 			"frappe.desk.notifications.clear_doctype_notifications",
 			"frappe.workflow.doctype.workflow_action.workflow_action.process_workflow_actions",
-			"frappe.automation.doctype.assignment_rule.assignment_rule.apply",
 			"frappe.core.doctype.file.utils.attach_files_to_document",
+			"frappe.automation.doctype.assignment_rule.assignment_rule.apply",
 			"frappe.automation.doctype.assignment_rule.assignment_rule.update_due_date",
 			"frappe.core.doctype.user_type.user_type.apply_permissions_for_non_standard_user_type",
 		],
@@ -155,13 +155,16 @@ doc_events = {
 		"on_cancel": [
 			"frappe.desk.notifications.clear_doctype_notifications",
 			"frappe.workflow.doctype.workflow_action.workflow_action.process_workflow_actions",
+			"frappe.automation.doctype.assignment_rule.assignment_rule.apply",
 		],
 		"on_trash": [
 			"frappe.desk.notifications.clear_doctype_notifications",
 			"frappe.workflow.doctype.workflow_action.workflow_action.process_workflow_actions",
 		],
 		"on_update_after_submit": [
-			"frappe.workflow.doctype.workflow_action.workflow_action.process_workflow_actions"
+			"frappe.workflow.doctype.workflow_action.workflow_action.process_workflow_actions",
+			"frappe.automation.doctype.assignment_rule.assignment_rule.apply",
+			"frappe.automation.doctype.assignment_rule.assignment_rule.update_due_date",
 		],
 		"on_change": [
 			"frappe.social.doctype.energy_point_rule.energy_point_rule.process_energy_points",
@@ -196,9 +199,9 @@ scheduler_events = {
 			"frappe.email.doctype.email_account.email_account.pull",
 		],
 		# Hourly but offset by 30 minutes
-		# "30 * * * *": [
-		#
-		# ],
+		"30 * * * *": [
+			"frappe.core.doctype.prepared_report.prepared_report.expire_stalled_report",
+		],
 		# Daily but offset by 45 minutes
 		"45 0 * * *": [
 			"frappe.core.doctype.log_settings.log_settings.run_log_clean_up",
@@ -214,7 +217,6 @@ scheduler_events = {
 	"hourly": [
 		"frappe.model.utils.link_count.update_link_count",
 		"frappe.model.utils.user_settings.sync_user_settings",
-		"frappe.utils.error.collect_error_snapshots",
 		"frappe.desk.page.backups.backups.delete_downloadable_backups",
 		"frappe.deferred_insert.save_to_db",
 		"frappe.desk.form.document_follow.send_hourly_updates",
@@ -223,7 +225,6 @@ scheduler_events = {
 		"frappe.website.doctype.personal_data_deletion_request.personal_data_deletion_request.process_data_deletion_request",
 	],
 	"daily": [
-		"frappe.email.queue.set_expiry_for_email_queue",
 		"frappe.desk.notifications.clear_notifications",
 		"frappe.desk.doctype.event.event.send_event_digest",
 		"frappe.sessions.clear_expired_sessions",
@@ -425,8 +426,12 @@ before_job = [
 after_job = [
 	"frappe.monitor.stop",
 	"frappe.utils.file_lock.release_document_locks",
+	"frappe.utils.telemetry.flush",
 ]
 
 extend_bootinfo = [
 	"frappe.utils.telemetry.add_bootinfo",
+	"frappe.core.doctype.user_permission.user_permission.send_user_permissions",
 ]
+
+export_python_type_annotations = True
