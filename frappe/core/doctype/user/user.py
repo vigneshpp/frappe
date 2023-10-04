@@ -104,7 +104,7 @@ class User(Document):
 		simultaneous_sessions: DF.Int
 		social_logins: DF.Table[UserSocialLogin]
 		thread_notify: DF.Check
-		time_zone: DF.Literal
+		time_zone: DF.Autocomplete | None
 		unsubscribed: DF.Check
 		user_emails: DF.Table[UserEmail]
 		user_image: DF.AttachImage | None
@@ -781,7 +781,10 @@ def get_all_roles(arg=None):
 
 	roles = frappe.get_all(
 		"Role",
-		filters={"name": ("not in", "Administrator,Guest,All"), "disabled": 0},
+		filters={
+			"name": ("not in", frappe.permissions.AUTOMATIC_ROLES),
+			"disabled": 0,
+		},
 		or_filters={"ifnull(restrict_to_domain, '')": "", "restrict_to_domain": ("in", active_domains)},
 		order_by="name",
 	)

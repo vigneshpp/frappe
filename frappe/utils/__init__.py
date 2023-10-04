@@ -21,7 +21,7 @@ from collections.abc import (
 )
 from email.header import decode_header, make_header
 from email.utils import formataddr, parseaddr
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from urllib.parse import quote, urlparse
 
 from redis.exceptions import ConnectionError
@@ -529,7 +529,10 @@ def get_request_site_address(full_address=False):
 
 
 def get_site_url(site):
-	return f"http://{site}:{frappe.get_conf(site).webserver_port}"
+	conf = frappe.get_conf(site)
+	if conf.host_name:
+		return conf.host_name
+	return f"http://{site}:{conf.webserver_port}"
 
 
 def encode_dict(d, encoding="utf-8"):
@@ -1079,15 +1082,33 @@ def dictify(arg):
 	return arg
 
 
-def add_user_info(user, user_info):
-	if user not in user_info:
-		info = (
-			frappe.db.get_value(
-				"User", user, ["full_name", "user_image", "name", "email", "time_zone"], as_dict=True
-			)
-			or frappe._dict()
-		)
-		user_info[user] = frappe._dict(
+class _UserInfo(TypedDict):
+	fullname: str
+	image: str
+	name: str
+	email: str
+	time_zone: str
+
+
+def add_user_info(user: str | list[str] | set[str], user_info: dict[str, _UserInfo]) -> None:
+	if not user:
+		return
+
+	if isinstance(user, str):
+		user = [user]
+
+	missing_users = [u for u in user if u not in user_info]
+	if not missing_users:
+		return
+
+	missing_info = frappe.get_all(
+		"User",
+		{"name": ("in", missing_users)},
+		["full_name", "user_image", "name", "email", "time_zone"],
+	)
+
+	for info in missing_info:
+		user_info.setdefault(info.name, frappe._dict()).update(
 			fullname=info.full_name or user,
 			image=info.user_image,
 			name=user,
@@ -1130,6 +1151,9 @@ class CallbackManager:
 	def add(self, func: Callable) -> None:
 		"""Add a function to queue, functions are executed in order of addition."""
 		self._functions.append(func)
+
+	def __call__(self, func: Callable) -> None:
+		self.add(func)
 
 	def run(self):
 		"""Run all functions in queue"""

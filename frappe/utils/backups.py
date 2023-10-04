@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 # imports - module imports
 import frappe
+import frappe.utils
 from frappe import conf
 from frappe.utils import cint, get_file_size, get_url, now, now_datetime
 
@@ -31,7 +32,7 @@ class BackupGenerator:
 	"""
 	This class contains methods to perform On Demand Backup
 
-	To initialize, specify (db_name, user, password, db_file_name=None, db_host="localhost")
+	To initialize, specify (db_name, user, password, db_file_name=None, db_host="127.0.0.1")
 	If specifying db_file_name, also append ".sql.gz"
 	"""
 
@@ -343,12 +344,15 @@ class BackupGenerator:
 			backup_path = self.backup_path_files if folder == "public" else self.backup_path_private_files
 
 			if self.compress_files:
-				cmd_string = "tar cf - {1} | gzip > {0}"
+				cmd_string = "self=$$; ( tar cf - {1} || kill $self ) | gzip > {0}"
 			else:
 				cmd_string = "tar -cf {0} {1}"
 
 			frappe.utils.execute_in_shell(
-				cmd_string.format(backup_path, files_path), verbose=self.verbose, low_priority=True
+				cmd_string.format(backup_path, files_path),
+				verbose=self.verbose,
+				low_priority=True,
+				check_exit_code=True,
 			)
 
 	def copy_site_config(self):
@@ -626,7 +630,7 @@ def get_backup_path():
 @frappe.whitelist()
 def get_backup_encryption_key():
 	frappe.only_for("System Manager")
-	return frappe.conf.get(BACKUP_ENCRYPTION_CONFIG_KEY)
+	return get_or_generate_backup_encryption_key()
 
 
 def get_or_generate_backup_encryption_key():

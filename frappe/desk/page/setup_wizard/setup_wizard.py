@@ -5,6 +5,7 @@ import json
 
 import frappe
 from frappe.geo.country_info import get_country_info
+from frappe.permissions import AUTOMATIC_ROLES
 from frappe.translate import get_messages_for_boot, send_translations, set_default_language
 from frappe.utils import cint, now, strip
 from frappe.utils.password import update_password
@@ -107,6 +108,7 @@ def update_global_settings(args):
 
 	update_system_settings(args)
 	update_user_name(args)
+	set_timezone(args)
 
 
 def run_post_setup_complete(args):
@@ -247,6 +249,12 @@ def update_user_name(args):
 		add_all_roles_to(args.get("name"))
 
 
+def set_timezone(args):
+	if args.get("timezone"):
+		for name in frappe.STANDARD_USERS:
+			frappe.db.set_value("User", name, "time_zone", args.get("timezone"))
+
+
 def parse_args(args):
 	if not args:
 		args = frappe.local.form_dict
@@ -272,13 +280,11 @@ def add_all_roles_to(name):
 def _get_default_roles() -> set[str]:
 	skip_roles = {
 		"Administrator",
-		"Guest",
-		"All",
 		"Customer",
 		"Supplier",
 		"Partner",
 		"Employee",
-	}
+	}.union(AUTOMATIC_ROLES)
 	return set(frappe.get_all("Role", pluck="name")) - skip_roles
 
 

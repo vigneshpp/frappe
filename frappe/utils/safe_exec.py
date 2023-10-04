@@ -69,7 +69,7 @@ def safe_exec(script, _globals=None, _locals=None, restrict_commit_rollback=Fals
 	if not is_safe_exec_enabled():
 
 		msg = _("Server Scripts are disabled. Please enable server scripts from bench configuration.")
-		docs_cta = _("Read the documentation to know")
+		docs_cta = _("Read the documentation to know more")
 		msg += f"<br><a href='https://frappeframework.com/docs/user/en/desk/scripting/server-script'>{docs_cta}</a>"
 		frappe.throw(msg, ServerScriptNotEnabled, title="Server Scripts Disabled")
 
@@ -117,12 +117,6 @@ def safe_eval(code, eval_globals=None, eval_locals=None):
 
 def _validate_safe_eval_syntax(code):
 	BLOCKED_NODES = (ast.NamedExpr,)
-	for attribute in UNSAFE_ATTRIBUTES:
-		if attribute in code:
-			frappe.throw(f'Illegal rule {frappe.bold(code)}. Cannot use "{attribute}"', exc=AttributeError)
-
-	if "__" in code:
-		frappe.throw(f'Illegal rule {frappe.bold(code)}. Cannot use "__"', exc=AttributeError)
 
 	tree = ast.parse(code, mode="eval")
 	for node in ast.walk(tree):
@@ -231,6 +225,10 @@ def get_safe_globals():
 				sql=read_sql,
 				commit=frappe.db.commit,
 				rollback=frappe.db.rollback,
+				after_commit=frappe.db.after_commit,
+				before_commit=frappe.db.before_commit,
+				after_rollback=frappe.db.after_rollback,
+				before_rollback=frappe.db.before_rollback,
 				add_index=frappe.db.add_index,
 			),
 			lang=getattr(frappe.local, "lang", "en"),
