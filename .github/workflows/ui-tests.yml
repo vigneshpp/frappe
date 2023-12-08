@@ -67,7 +67,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Check for valid Python & Merge Conflicts
         run: |
@@ -77,7 +77,7 @@ jobs:
               exit 1
           fi
 
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: 18
           check-latest: true
@@ -120,6 +120,7 @@ jobs:
         env:
           BEFORE: ${{ env.GITHUB_EVENT_PATH.before }}
           AFTER: ${{ env.GITHUB_EVENT_PATH.after }}
+          FRAPPE_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           TYPE: ui
           DB: mariadb
 

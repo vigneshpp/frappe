@@ -23,6 +23,7 @@ class NotificationSettings(Document):
 		enable_email_mention: DF.Check
 		enable_email_notifications: DF.Check
 		enable_email_share: DF.Check
+		enable_email_threads_on_assigned_document: DF.Check
 		enabled: DF.Check
 		energy_points_system_notifications: DF.Check
 		seen: DF.Check
@@ -70,7 +71,7 @@ def create_notification_settings(user):
 		_doc.insert(ignore_permissions=True)
 
 
-def toggle_notifications(user: str, enable: bool = False):
+def toggle_notifications(user: str, enable: bool = False, ignore_permissions=False):
 	try:
 		settings = frappe.get_doc("Notification Settings", user)
 	except frappe.DoesNotExistError:
@@ -79,7 +80,7 @@ def toggle_notifications(user: str, enable: bool = False):
 
 	if settings.enabled != enable:
 		settings.enabled = enable
-		settings.save()
+		settings.save(ignore_permissions=ignore_permissions)
 
 
 @frappe.whitelist()

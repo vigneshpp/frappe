@@ -16,6 +16,7 @@ from frappe import _
 from frappe.cache_manager import clear_controller_cache, clear_user_cache
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
 from frappe.custom.doctype.property_setter.property_setter import make_property_setter
+from frappe.database import savepoint
 from frappe.database.schema import validate_column_length, validate_column_name
 from frappe.desk.notifications import delete_notification_count_for, get_filters_for
 from frappe.desk.utils import validate_route_conflict
@@ -135,6 +136,7 @@ class DocType(Document):
 		is_virtual: DF.Check
 		issingle: DF.Check
 		istable: DF.Check
+		link_filters: DF.JSON
 		links: DF.Table[DocTypeLink]
 		make_attachments_public: DF.Check
 		max_attachments: DF.Int
@@ -160,6 +162,7 @@ class DocType(Document):
 		route: DF.Data | None
 		search_fields: DF.Data | None
 		sender_field: DF.Data | None
+		sender_name_field: DF.Data | None
 		show_name_in_global_search: DF.Check
 		show_preview_popup: DF.Check
 		show_title_field_in_link: DF.Check
@@ -175,6 +178,7 @@ class DocType(Document):
 		translated_doctype: DF.Check
 		website_search_field: DF.Data | None
 	# end: auto-generated types
+
 	def validate(self):
 		"""Validate DocType before saving.
 
@@ -288,7 +292,7 @@ class DocType(Document):
 		if not [d.fieldname for d in self.fields if d.in_list_view]:
 			cnt = 0
 			for d in self.fields:
-				if d.reqd and not d.hidden and not d.fieldtype in not_allowed_in_list_view:
+				if d.reqd and not d.hidden and d.fieldtype not in not_allowed_in_list_view:
 					d.in_list_view = 1
 					cnt += 1
 					if cnt == 4:
@@ -303,7 +307,7 @@ class DocType(Document):
 	def check_indexing_for_dashboard_links(self):
 		"""Enable indexing for outgoing links used in dashboard"""
 		for d in self.fields:
-			if d.fieldtype == "Link" and not (d.unique or d.search_index):
+			if d.fieldtype == "Link" and not d.unique and not d.search_index:
 				referred_as_link = frappe.db.exists(
 					"DocType Link",
 					{"parent": d.options, "link_doctype": self.name, "link_fieldname": d.fieldname},
@@ -349,8 +353,10 @@ class DocType(Document):
 
 		self.flags.update_fields_to_fetch_queries = []
 
-		if set(old_fields_to_fetch) != {df.fieldname for df in new_meta.get_fields_to_fetch()}:
-			for df in new_meta.get_fields_to_fetch():
+		new_fields_to_fetch = new_meta.get_fields_to_fetch()
+
+		if set(old_fields_to_fetch) != {df.fieldname for df in new_fields_to_fetch}:
+			for df in new_fields_to_fetch:
 				if df.fieldname not in old_fields_to_fetch:
 					link_fieldname, source_fieldname = df.fetch_from.split(".", 1)
 					link_df = new_meta.get_field(link_fieldname)
@@ -361,16 +367,23 @@ class DocType(Document):
 							SET `{fieldname}` = source.`{source_fieldname}`
 							FROM `tab{link_doctype}` as source
 							WHERE `{link_fieldname}` = source.name
-							AND ifnull(`{fieldname}`, '')=''
 						"""
+						if df.not_nullable:
+							update_query += "AND `{fieldname}`=''"
+						else:
+							update_query += "AND ifnull(`{fieldname}`, '')=''"
+
 					else:
 						update_query = """
 							UPDATE `tab{doctype}` as target
 							INNER JOIN `tab{link_doctype}` as source
 							ON `target`.`{link_fieldname}` = `source`.`name`
 							SET `target`.`{fieldname}` = `source`.`{source_fieldname}`
-							WHERE ifnull(`target`.`{fieldname}`, '')=""
 						"""
+						if df.not_nullable:
+							update_query += "WHERE `target`.`{fieldname}`=''"
+						else:
+							update_query += "WHERE ifnull(`target`.`{fieldname}`, '')=''"
 
 					self.flags.update_fields_to_fetch_queries.append(
 						update_query.format(
@@ -401,7 +414,7 @@ class DocType(Document):
 
 		if self.has_web_view:
 			# route field must be present
-			if not "route" in [d.fieldname for d in self.fields]:
+			if "route" not in [d.fieldname for d in self.fields]:
 				frappe.throw(_('Field "route" is mandatory for Web Views'), title="Missing Field")
 
 			# clear website cache
@@ -522,7 +535,9 @@ class DocType(Document):
 			if self.flags.in_insert:
 				self.run_module_method("after_doctype_insert")
 
+		self.sync_doctype_layouts()
 		delete_notification_count_for(doctype=self.name)
+
 		frappe.clear_cache(doctype=self.name)
 
 		# clear user cache so that on the next reload this doctype is included in boot
@@ -532,6 +547,17 @@ class DocType(Document):
 			self.sync_global_search()
 
 		clear_linked_doctype_cache()
+
+	@savepoint(catch=Exception)
+	def sync_doctype_layouts(self):
+		"""Sync Doctype Layout"""
+		doctype_layouts = frappe.get_all(
+			"DocType Layout", filters={"document_type": self.name}, pluck="name", ignore_ddl=True
+		)
+		for layout in doctype_layouts:
+			layout_doc = frappe.get_doc("DocType Layout", layout)
+			layout_doc.sync_fields()
+			layout_doc.save()
 
 	def setup_autoincrement_and_sequence(self):
 		"""Changes name type and makes sequence on change (if required)"""
@@ -854,6 +880,7 @@ class DocType(Document):
 						"read_only": 1,
 						"print_hide": 1,
 						"no_copy": 1,
+						"search_index": 1,
 					},
 				)
 
@@ -1240,7 +1267,7 @@ def validate_fields(meta):
 						),
 						WrongOptionsDoctypeLinkError,
 					)
-				elif not (options == d.options):
+				elif options != d.options:
 					frappe.throw(
 						_("{0}: Options {1} must be the same as doctype name {2} for the field {3}").format(
 							docname, d.options, options, d.label
@@ -1488,7 +1515,7 @@ def validate_fields(meta):
 
 	def check_table_multiselect_option(docfield):
 		"""check if the doctype provided in Option has atleast 1 Link field"""
-		if not docfield.fieldtype == "Table MultiSelect":
+		if docfield.fieldtype != "Table MultiSelect":
 			return
 
 		doctype = docfield.options
@@ -1554,7 +1581,7 @@ def validate_fields(meta):
 				title=_("Invalid Option"),
 			)
 
-		if not (meta.is_virtual == child_doctype_meta.is_virtual):
+		if meta.is_virtual != child_doctype_meta.is_virtual:
 			error_msg = " should be virtual." if meta.is_virtual else " cannot be virtual."
 			frappe.throw(
 				_("Child Table {0} for field {1}" + error_msg).format(
@@ -1866,7 +1893,7 @@ def check_email_append_to(doc):
 	if doc.sender_field and not sender_field:
 		frappe.throw(_("Select a valid Sender Field for creating documents from Email"))
 
-	if not sender_field.options == "Email":
+	if sender_field.options != "Email":
 		frappe.throw(_("Sender Field should have Email in options"))
 
 

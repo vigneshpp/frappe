@@ -281,7 +281,7 @@ class MariaDBDatabase(MariaDBConnectionUtil, MariaDBExceptionUtil, Database):
 		)
 
 	def create_global_search_table(self):
-		if not "__global_search" in self.get_tables():
+		if "__global_search" not in self.get_tables():
 			self.sql(
 				"""create table __global_search(
 				doctype varchar(100),
@@ -310,7 +310,7 @@ class MariaDBDatabase(MariaDBConnectionUtil, MariaDBExceptionUtil, Database):
 		)
 
 	@staticmethod
-	def get_on_duplicate_update(key=None):
+	def get_on_duplicate_update():
 		return "ON DUPLICATE key UPDATE "
 
 	def get_table_columns_description(self, table_name):
@@ -329,7 +329,8 @@ class MariaDBDatabase(MariaDBConnectionUtil, MariaDBExceptionUtil, Database):
 					and Seq_in_index = 1
 					limit 1
 			), 0) as 'index',
-			column_key = 'UNI' as 'unique'
+			column_key = 'UNI' as 'unique',
+			(is_nullable = 'NO') AS 'not_nullable'
 			from information_schema.columns as columns
 			where table_name = '{table_name}' """.format(
 				table_name=table_name

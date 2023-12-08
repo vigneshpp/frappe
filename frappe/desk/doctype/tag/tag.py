@@ -48,8 +48,6 @@ def add_tags(tags, dt, docs, color=None):
 		for tag in tags:
 			DocTags(dt).add(doc, tag)
 
-	# return tag
-
 
 @frappe.whitelist()
 def remove_tag(tag, dt, dn):
@@ -89,7 +87,7 @@ class DocTags:
 	def add(self, dn, tag):
 		"""add a new user tag"""
 		tl = self.get_tags(dn).split(",")
-		if not tag in tl:
+		if tag not in tl:
 			tl.append(tag)
 			if not frappe.db.exists("Tag", tag):
 				frappe.get_doc({"doctype": "Tag", "name": tag}).insert(ignore_permissions=True)
@@ -153,6 +151,7 @@ def update_tags(doc, tags):
 
 	:param doc: Document to be added to global tags
 	"""
+	doc.check_permission("write")
 	new_tags = {tag.strip() for tag in tags.split(",") if tag}
 	existing_tags = [
 		tag.tag

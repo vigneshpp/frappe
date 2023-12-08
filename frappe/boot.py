@@ -122,12 +122,12 @@ def get_letter_heads():
 
 
 def load_conf_settings(bootinfo):
-	from frappe import conf
+	from frappe.core.api.file import get_max_file_size
 
-	bootinfo.max_file_size = conf.get("max_file_size") or 10485760
+	bootinfo.max_file_size = get_max_file_size()
 	for key in ("developer_mode", "socketio_port", "file_watcher_port"):
-		if key in conf:
-			bootinfo[key] = conf.get(key)
+		if key in frappe.conf:
+			bootinfo[key] = frappe.conf.get(key)
 
 
 def load_desktop_data(bootinfo):
@@ -295,8 +295,7 @@ def add_home_page(bootinfo, docs):
 		docs.append(page)
 		bootinfo["home_page"] = page.name
 	except (frappe.DoesNotExistError, frappe.PermissionError):
-		if frappe.message_log:
-			frappe.message_log.pop()
+		frappe.clear_last_message()
 		bootinfo["home_page"] = "Workspaces"
 
 

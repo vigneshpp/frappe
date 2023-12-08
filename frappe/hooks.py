@@ -31,6 +31,7 @@ app_include_js = [
 	"report.bundle.js",
 	"telemetry.bundle.js",
 ]
+
 app_include_css = [
 	"desk.bundle.css",
 	"report.bundle.css",
@@ -61,6 +62,10 @@ website_route_rules = [
 
 website_redirects = [
 	{"source": r"/desk(.*)", "target": r"/app\1"},
+	{
+		"source": "/.well-known/openid-configuration",
+		"target": "/api/method/frappe.integrations.oauth2.openid_configuration",
+	},
 ]
 
 base_template = "templates/base.html"
@@ -118,6 +123,7 @@ permission_query_conditions = {
 has_permission = {
 	"Event": "frappe.desk.doctype.event.event.has_permission",
 	"ToDo": "frappe.desk.doctype.todo.todo.has_permission",
+	"Note": "frappe.desk.doctype.note.note.has_permission",
 	"User": "frappe.core.doctype.user.user.has_permission",
 	"Dashboard Chart": "frappe.desk.doctype.dashboard_chart.dashboard_chart.has_permission",
 	"Number Card": "frappe.desk.doctype.number_card.number_card.has_permission",
@@ -264,11 +270,6 @@ scheduler_events = {
 	],
 }
 
-get_translated_dict = {
-	("doctype", "System Settings"): "frappe.geo.country_info.get_translated_dict",
-	("page", "setup-wizard"): "frappe.geo.country_info.get_translated_dict",
-}
-
 sounds = [
 	{"name": "email", "src": "/assets/frappe/sounds/email.mp3", "volume": 0.1},
 	{"name": "submit", "src": "/assets/frappe/sounds/submit.mp3", "volume": 0.1},
@@ -413,6 +414,7 @@ ignore_links_on_delete = [
 	"Integration Request",
 	"Unhandled Email",
 	"Webhook Request Log",
+	"Workspace",
 ]
 
 # Request Hooks
@@ -435,6 +437,22 @@ after_job = [
 extend_bootinfo = [
 	"frappe.utils.telemetry.add_bootinfo",
 	"frappe.core.doctype.user_permission.user_permission.send_user_permissions",
+	"frappe.utils.sentry.add_bootinfo",
 ]
 
 export_python_type_annotations = True
+
+# log doctype cleanups to automatically add in log settings
+default_log_clearing_doctypes = {
+	"Error Log": 30,
+	"Activity Log": 90,
+	"Email Queue": 30,
+	"Scheduled Job Log": 90,
+	"Route History": 90,
+	"Submission Queue": 30,
+	"Prepared Report": 30,
+	"Webhook Request Log": 30,
+	"Integration Request": 90,
+	"Unhandled Email": 30,
+	"Reminder": 30,
+}

@@ -182,7 +182,7 @@ class QuickListDialog extends WidgetDialog {
 	process_data(data) {
 		if (this.filter_group) {
 			let filters = this.filter_group.get_filters();
-			data.quick_list_filter = frappe.utils.get_filter_as_json(filters);
+			data.quick_list_filter = JSON.stringify(filters);
 		}
 
 		data.label = data.label ? data.label : data.document_type;
@@ -396,6 +396,7 @@ class ShortcutDialog extends WidgetDialog {
 
 							const views = ["List", "Report Builder", "Dashboard", "New"];
 							if (meta.is_tree === 1) views.push("Tree");
+							if (meta.image_field) views.push("Image");
 							if (frappe.boot.calendars.includes(doctype)) views.push("Calendar");
 
 							const response = await frappe.db.get_value(
@@ -418,7 +419,6 @@ class ShortcutDialog extends WidgetDialog {
 				fieldtype: "Data",
 				fieldname: "url",
 				label: "URL",
-				options: "URL",
 				default: "",
 				depends_on: (s) => s.type == "URL",
 				mandatory_depends_on: (s) => s.type == "URL",
@@ -427,7 +427,7 @@ class ShortcutDialog extends WidgetDialog {
 				fieldtype: "Select",
 				fieldname: "doc_view",
 				label: "DocType View",
-				options: "List\nReport Builder\nDashboard\nTree\nNew\nCalendar\nKanban",
+				options: "List\nReport Builder\nDashboard\nTree\nNew\nCalendar\nKanban\nImage",
 				description: __(
 					"Which view of the associated DocType should this shortcut take you to?"
 				),
@@ -540,13 +540,17 @@ class ShortcutDialog extends WidgetDialog {
 	process_data(data) {
 		if (this.dialog.get_value("type") == "DocType" && this.filter_group) {
 			let filters = this.filter_group.get_filters();
-			data.stats_filter = frappe.utils.get_filter_as_json(filters);
+			data.stats_filter = JSON.stringify(filters);
 		}
 
 		data.label = data.label ? data.label : frappe.model.unscrub(data.link_to);
 
 		if (data.url) {
-			!validate_url(data.url) &&
+			let _url = data.url;
+			if (data.url.startsWith("/")) {
+				_url = frappe.urllib.get_base_url() + data.url;
+			}
+			!validate_url(_url) &&
 				frappe.throw({
 					message: __("<b>{0}</b> is not a valid URL", [data.url]),
 					title: __("Invalid URL"),

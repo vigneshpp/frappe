@@ -147,10 +147,13 @@ frappe.ui.GroupBy = class {
 					doctype_fields.forEach((field) => {
 						// pick numeric fields for sum / avg
 						if (frappe.model.is_numeric_field(field.fieldtype)) {
+							let field_label = field.label
+								? field.label
+								: frappe.model.unscrub(field.fieldname);
 							let option_text =
 								doctype == this.doctype
-									? field.label
-									: `${field.label} (${__(doctype)})`;
+									? field_label
+									: `${__(field_label)} (${__(doctype)})`;
 							this.aggregate_on_html += `<option data-doctype="${doctype}"
 								value="${field.fieldname}">${__(option_text)}</option>`;
 						}
@@ -427,7 +430,7 @@ frappe.ui.GroupBy = class {
 	}
 
 	get_group_by_field_label() {
-		let field = this.group_by_fields[this.group_by_doctype].find(
+		let field = this.group_by_fields[this.group_by_doctype]?.find(
 			(field) => field.fieldname == this.group_by_field
 		);
 		return field?.label || field?.fieldname;

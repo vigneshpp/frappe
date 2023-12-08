@@ -379,7 +379,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		frappe.xcall(method, { args: args }).then(() => {
 			let message;
 			if (dashboard_name) {
-				let dashboard_route_html = `<a href="#dashboard-view/${dashboard_name}">${dashboard_name}</a>`;
+				let dashboard_route_html = `<a href="/app/dashboard-view/${dashboard_name}">${dashboard_name}</a>`;
 				message = __("New {0} {1} added to Dashboard {2}", [
 					__(doctype),
 					name,
@@ -1259,17 +1259,15 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 				width: parseInt(column.width) || null,
 				editable: false,
 				compareValue: compareFn,
-				format: (value, row, column, data, for_filter = false) => {
-					if (for_filter && column?.fieldtype === "Link") {
-						return value || "";
-					}
+				format: (value, row, column, data, filter) => {
 					if (this.report_settings.formatter) {
 						return this.report_settings.formatter(
 							value,
 							row,
 							column,
 							data,
-							format_cell
+							format_cell,
+							filter
 						);
 					}
 					return format_cell(value, row, column, data);
@@ -1538,9 +1536,9 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 					cell.content = frappe.utils.get_formatted_duration(cell.content);
 				}
 				if (include_indentation && i === 0) {
-					cell.content = "   ".repeat(row.meta.indent) + (cell.content || "");
+					cell.content = "   ".repeat(row.meta.indent) + (cell.content ?? "");
 				}
-				return cell.content || "";
+				return cell.content ?? "";
 			});
 		});
 	}

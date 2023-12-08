@@ -48,6 +48,11 @@ from frappe.exceptions import SiteNotSpecifiedError
 @click.option(
 	"--set-default", is_flag=True, default=False, help="Set the new site as default site"
 )
+@click.option(
+	"--setup-db/--no-setup-db",
+	default=True,
+	help="Create user and database in mariadb/postgres; only bootstrap if false",
+)
 def new_site(
 	site,
 	db_root_username=None,
@@ -64,6 +69,7 @@ def new_site(
 	db_host=None,
 	db_port=None,
 	set_default=False,
+	setup_db=True,
 ):
 	"Create a new site"
 	from frappe.installer import _new_site, extract_sql_from_archive
@@ -88,6 +94,7 @@ def new_site(
 		db_type=db_type,
 		db_host=db_host,
 		db_port=db_port,
+		setup_db=setup_db,
 	)
 
 	if set_default:
@@ -406,7 +413,6 @@ def _reinstall(
 	verbose=False,
 ):
 	from frappe.installer import _new_site
-	from frappe.utils.synchronization import filelock
 
 	if not yes:
 		click.confirm("This will wipe your database. Are you sure you want to reinstall?", abort=True)
@@ -944,9 +950,9 @@ def move(dest_dir, site):
 	site_dump_exists = True
 	count = 0
 	while site_dump_exists:
-		final_new_path = new_path + (count and str(count) or "")
+		final_new_path = new_path + str(count or "")
 		site_dump_exists = os.path.exists(final_new_path)
-		count = int(count or 0) + 1
+		count += 1
 
 	shutil.move(old_path, final_new_path)
 	frappe.destroy()
@@ -1283,7 +1289,7 @@ def trim_database(context, dry_run, format, no_backup, yes=False):
 		for table_name in database_tables:
 			if not table_name.startswith("tab"):
 				continue
-			if not (table_name.replace("tab", "", 1) in doctype_tables or table_name in STANDARD_TABLES):
+			if table_name.replace("tab", "", 1) not in doctype_tables and table_name not in STANDARD_TABLES:
 				TABLES_TO_DROP.append(table_name)
 
 		if not TABLES_TO_DROP:

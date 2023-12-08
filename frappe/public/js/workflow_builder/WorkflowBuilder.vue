@@ -37,8 +37,7 @@ const {
 } = useVueFlow();
 
 let main = ref(null);
-// this change to keep the state as it is when saving
-//onClickOutside(main, loose_focus);
+onClickOutside(main, loose_focus);
 
 // cmd/ctrl + s to save the form
 const { meta_s, ctrl_s, Backspace, meta_backspace, ctrl_backspace } = useMagicKeys();
@@ -129,6 +128,7 @@ onConnect((edge) => {
 		data: {
 			action: "",
 			allowed: "All",
+			allow_self_approval: 1,
 			from: source_node.data.state,
 			to: target_node.data.state,
 			from_id: source_node.id,

@@ -9,6 +9,7 @@ import frappe.defaults
 import frappe.permissions
 import frappe.share
 from frappe import STANDARD_USERS, _, msgprint, throw
+from frappe.auth import MAX_PASSWORD_SIZE
 from frappe.core.doctype.user_type.user_type import user_linked_with_permission_on_doctype
 from frappe.desk.doctype.notification_settings.notification_settings import (
 	create_notification_settings,
@@ -248,7 +249,7 @@ class User(Document):
 			frappe.local.login_manager.logout(user=self.name)
 
 		# toggle notifications based on the user's status
-		toggle_notifications(self.name, enable=cint(self.enabled))
+		toggle_notifications(self.name, enable=cint(self.enabled), ignore_permissions=True)
 
 	def add_system_manager_role(self):
 		if self.is_system_manager_disabled():
@@ -549,6 +550,10 @@ class User(Document):
 		# delete user permissions
 		frappe.db.delete("User Permission", {"user": self.name})
 
+		# Delete OAuth data
+		frappe.db.delete("OAuth Authorization Code", {"user": self.name})
+		frappe.db.delete("Token Cache", {"user": self.name})
+
 	def before_rename(self, old_name, new_name, merge=False):
 		frappe.clear_cache(user=old_name)
 		self.validate_rename(old_name, new_name)
@@ -775,7 +780,7 @@ def get_timezones():
 
 
 @frappe.whitelist()
-def get_all_roles(arg=None):
+def get_all_roles():
 	"""return all roles"""
 	active_domains = frappe.get_active_domains()
 
@@ -789,7 +794,7 @@ def get_all_roles(arg=None):
 		order_by="name",
 	)
 
-	return [role.get("name") for role in roles]
+	return sorted([role.get("name") for role in roles])
 
 
 @frappe.whitelist()
@@ -818,6 +823,9 @@ def update_password(
 	        key (str, optional): Password reset key. Defaults to None.
 	        old_password (str, optional): Old password. Defaults to None.
 	"""
+
+	if len(new_password) > MAX_PASSWORD_SIZE:
+		frappe.throw(_("Password size exceeded the maximum allowed size."))
 
 	result = test_password_strength(new_password)
 	feedback = result.get("feedback", None)
@@ -868,7 +876,7 @@ def test_password_strength(
 			"Arguments `key` and `old_password` are deprecated in function `test_password_strength`."
 		)
 
-	enable_password_policy = frappe.get_system_settings("enable_password_policy") or 0
+	enable_password_policy = frappe.get_system_settings("enable_password_policy")
 
 	if not enable_password_policy:
 		return {}
@@ -881,7 +889,7 @@ def test_password_strength(
 	if new_password:
 		result = _test_password_strength(new_password, user_inputs=user_data)
 		password_policy_validation_passed = False
-		minimum_password_score = cint(frappe.get_system_settings("minimum_password_score")) or 0
+		minimum_password_score = cint(frappe.get_system_settings("minimum_password_score"))
 
 		# score should be greater than 0 and minimum_password_score
 		if result.get("score") and result.get("score") >= minimum_password_score:
@@ -1219,27 +1227,31 @@ def create_contact(user, ignore_links=False, ignore_mandatory=False):
 
 	contact_name = get_contact_name(user.email)
 	if not contact_name:
-		contact = frappe.get_doc(
-			{
-				"doctype": "Contact",
-				"first_name": user.first_name,
-				"last_name": user.last_name,
-				"user": user.name,
-				"gender": user.gender,
-			}
-		)
+		try:
+			contact = frappe.get_doc(
+				{
+					"doctype": "Contact",
+					"first_name": user.first_name,
+					"last_name": user.last_name,
+					"user": user.name,
+					"gender": user.gender,
+				}
+			)
 
-		if user.email:
-			contact.add_email(user.email, is_primary=True)
+			if user.email:
+				contact.add_email(user.email, is_primary=True)
 
-		if user.phone:
-			contact.add_phone(user.phone, is_primary_phone=True)
+			if user.phone:
+				contact.add_phone(user.phone, is_primary_phone=True)
 
-		if user.mobile_no:
-			contact.add_phone(user.mobile_no, is_primary_mobile_no=True)
-		contact.insert(
-			ignore_permissions=True, ignore_links=ignore_links, ignore_mandatory=ignore_mandatory
-		)
+			if user.mobile_no:
+				contact.add_phone(user.mobile_no, is_primary_mobile_no=True)
+
+			contact.insert(
+				ignore_permissions=True, ignore_links=ignore_links, ignore_mandatory=ignore_mandatory
+			)
+		except frappe.DuplicateEntryError:
+			pass
 	else:
 		contact = frappe.get_doc("Contact", contact_name)
 		contact.first_name = user.first_name
