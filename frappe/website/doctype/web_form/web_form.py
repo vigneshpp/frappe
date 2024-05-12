@@ -40,7 +40,7 @@ class WebForm(WebsiteGenerator):
 		breadcrumbs: DF.Code | None
 		button_label: DF.Data | None
 		client_script: DF.Code | None
-		condition: DF.Code | None
+		condition_json: DF.JSON | None
 		custom_css: DF.Code | None
 		doc_type: DF.Link
 		introduction_text: DF.TextEditor | None
@@ -66,6 +66,7 @@ class WebForm(WebsiteGenerator):
 		web_form_fields: DF.Table[WebFormField]
 		website_sidebar: DF.Link | None
 	# end: auto-generated types
+
 	website = frappe._dict(no_cache=1)
 
 	def validate(self):
@@ -107,7 +108,7 @@ class WebForm(WebsiteGenerator):
 			frappe.throw(_("Following fields are missing:") + "<br>" + "<br>".join(missing))
 
 	def reset_field_parent(self):
-		"""Convert link fields to select with names as options"""
+		"""Convert link fields to select with names as options."""
 		for df in self.web_form_fields:
 			df.parent = self.doc_type
 
@@ -279,11 +280,9 @@ def get_context(context):
 			if field.fieldtype == "Select" and field.options:
 				messages.extend(field.options.split("\n"))
 
-		messages.extend(col.label for col in self.list_columns)
+		messages.extend(col.get("label") if col else "" for col in self.list_columns)
 
-		context.translated_messages = frappe.as_json(
-			{message: _(message) for message in messages if message}
-		)
+		context.translated_messages = frappe.as_json({message: _(message) for message in messages if message})
 
 	def load_list_data(self, context):
 		if not self.list_columns:
@@ -444,7 +443,7 @@ def get_web_form_module(doc):
 
 
 @frappe.whitelist(allow_guest=True)
-@rate_limit(key="web_form", limit=5, seconds=60)
+@rate_limit(key="web_form", limit=10, seconds=60)
 def accept(web_form, data):
 	"""Save the web form"""
 	data = frappe._dict(json.loads(data))
@@ -653,51 +652,33 @@ def get_in_list_view_fields(doctype):
 	return [get_field_df(f) for f in fields]
 
 
-@frappe.whitelist(allow_guest=True)
 def get_link_options(web_form_name, doctype, allow_read_on_all_link_options=False):
-	web_form_doc = frappe.get_doc("Web Form", web_form_name)
-	doctype_validated = False
-	limited_to_user = False
-	if web_form_doc.login_required:
-		# check if frappe session user is not guest or admin
-		if frappe.session.user != "Guest":
-			doctype_validated = True
+	web_form: WebForm = frappe.get_doc("Web Form", web_form_name)
 
-			if not allow_read_on_all_link_options:
-				limited_to_user = True
-		else:
-			frappe.throw(_("You must be logged in to use this form."), frappe.PermissionError)
+	if web_form.login_required and frappe.session.user == "Guest":
+		frappe.throw(_("You must be logged in to use this form."), frappe.PermissionError)
 
-	else:
-		for field in web_form_doc.web_form_fields:
-			if field.options == doctype:
-				doctype_validated = True
-				break
-
-	if doctype_validated:
-		link_options, filters = [], {}
-
-		if limited_to_user:
-			filters = {"owner": frappe.session.user}
-
-		fields = ["name as value"]
-
-		meta = frappe.get_meta(doctype)
-
-		if meta.title_field and meta.show_title_field_in_link:
-			fields.append(f"{meta.title_field} as label")
-
-		link_options = frappe.get_all(doctype, filters, fields)
-
-		if meta.title_field and meta.show_title_field_in_link:
-			return json.dumps(link_options, default=str)
-		else:
-			return "\n".join([str(doc.value) for doc in link_options])
-
-	else:
-		raise frappe.PermissionError(
-			_("You don't have permission to access the {0} DocType.").format(doctype)
+	if not web_form.published or not any(f for f in web_form.web_form_fields if f.options == doctype):
+		frappe.throw(
+			_("You don't have permission to access the {0} DocType.").format(doctype), frappe.PermissionError
 		)
+
+	link_options, filters = [], {}
+	if web_form.login_required and not allow_read_on_all_link_options:
+		filters = {"owner": frappe.session.user}
+
+	fields = ["name as value"]
+
+	meta = frappe.get_meta(doctype)
+	if meta.title_field and meta.show_title_field_in_link:
+		fields.append(f"{meta.title_field} as label")
+
+	link_options = frappe.get_all(doctype, filters, fields)
+
+	if meta.title_field and meta.show_title_field_in_link:
+		return json.dumps(link_options, default=str)
+	else:
+		return "\n".join([str(doc.value) for doc in link_options])
 
 
 @redis_cache(ttl=60 * 60)

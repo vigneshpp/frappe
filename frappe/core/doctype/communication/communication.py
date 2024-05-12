@@ -119,6 +119,7 @@ class Communication(Document, CommunicationEmailMixin):
 		unread_notification_sent: DF.Check
 		user: DF.Link | None
 	# end: auto-generated types
+
 	"""Communication represents an external communication like Email."""
 
 	no_feed_on_delete = True
@@ -133,7 +134,6 @@ class Communication(Document, CommunicationEmailMixin):
 			and self.uid
 			and self.uid != -1
 		):
-
 			email_flag_queue = frappe.db.get_value(
 				"Email Flag Queue", {"communication": self.name, "is_completed": 0}
 			)
@@ -298,7 +298,7 @@ class Communication(Document, CommunicationEmailMixin):
 
 	@staticmethod
 	def _get_emails_list(emails=None, exclude_displayname=False):
-		"""Returns list of emails from given email string.
+		"""Return list of emails from given email string.
 
 		* Removes duplicate mailids
 		* Removes display name from email address if exclude_displayname is True
@@ -306,18 +306,18 @@ class Communication(Document, CommunicationEmailMixin):
 		emails = split_emails(emails) if isinstance(emails, str) else (emails or [])
 		if exclude_displayname:
 			return [email.lower() for email in {parse_addr(email)[1] for email in emails} if email]
-		return [email.lower() for email in set(emails) if email]
+		return [email for email in set(emails) if email]
 
 	def to_list(self, exclude_displayname=True):
-		"""Returns to list."""
+		"""Return `to` list."""
 		return self._get_emails_list(self.recipients, exclude_displayname=exclude_displayname)
 
 	def cc_list(self, exclude_displayname=True):
-		"""Returns cc list."""
+		"""Return `cc` list."""
 		return self._get_emails_list(self.cc, exclude_displayname=exclude_displayname)
 
 	def bcc_list(self, exclude_displayname=True):
-		"""Returns bcc list."""
+		"""Return `bcc` list."""
 		return self._get_emails_list(self.bcc, exclude_displayname=exclude_displayname)
 
 	def get_attachments(self):
@@ -438,7 +438,7 @@ class Communication(Document, CommunicationEmailMixin):
 				frappe.db.commit()
 
 	def parse_email_for_timeline_links(self):
-		if not frappe.db.get_value("Email Account", self.email_account, "enable_automatic_linking"):
+		if not frappe.db.get_value("Email Account", filters={"enable_automatic_linking": 1}):
 			return
 
 		for doctype, docname in parse_email([self.recipients, self.cc, self.bcc]):
@@ -501,14 +501,17 @@ def on_doctype_update():
 	frappe.db.add_index("Communication", ["message_id(140)"])
 
 
-def has_permission(doc, ptype, user):
+def has_permission(doc, ptype, user=None, debug=False):
 	if ptype == "read":
 		if doc.reference_doctype == "Communication" and doc.reference_name == doc.name:
-			return
+			return True
 
 		if doc.reference_doctype and doc.reference_name:
-			if frappe.has_permission(doc.reference_doctype, ptype="read", doc=doc.reference_name):
-				return True
+			return frappe.has_permission(
+				doc.reference_doctype, ptype="read", doc=doc.reference_name, user=user, debug=debug
+			)
+
+	return True
 
 
 def get_permission_query_conditions_for_communication(user):
@@ -553,6 +556,7 @@ def get_contacts(email_strings: list[str], auto_create_contact=False) -> list[st
 				contact.insert(ignore_permissions=True)
 				contact_name = contact.name
 			except Exception:
+				contact_name = None
 				contact.log_error("Unable to add contact")
 
 		if contact_name:
@@ -615,9 +619,9 @@ def parse_email(email_strings):
 
 
 def get_email_without_link(email):
-	"""
-	returns email address without doctype links
-	returns admin@example.com for email admin+doctype+docname@example.com
+	"""Return email address without doctype links.
+
+	e.g. 'admin@example.com' is returned for email 'admin+doctype+docname@example.com'
 	"""
 	if not frappe.get_all("Email Account", filters={"enable_automatic_linking": 1}):
 		return email
@@ -662,7 +666,10 @@ def update_parent_document_on_communication(doc):
 
 def update_first_response_time(parent, communication):
 	if parent.meta.has_field("first_response_time") and not parent.get("first_response_time"):
-		if is_system_user(communication.sender):
+		if (
+			is_system_user(communication.sender)
+			or frappe.get_cached_value("User", frappe.session.user, "user_type") == "System User"
+		):
 			if communication.sent_or_received == "Sent":
 				first_responded_on = communication.creation
 				if parent.meta.has_field("first_responded_on"):

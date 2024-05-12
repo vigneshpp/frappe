@@ -310,6 +310,16 @@ frappe.ui.form.Toolbar = class Toolbar {
 		const allow_print_for_draft = cint(print_settings.allow_print_for_draft);
 		const allow_print_for_cancelled = cint(print_settings.allow_print_for_cancelled);
 
+		if (is_submittable && docstatus == 0 && !this.has_workflow()) {
+			this.page.add_menu_item(
+				__("Discard"),
+				function () {
+					me.frm._discard();
+				},
+				true
+			);
+		}
+
 		if (
 			!is_submittable ||
 			docstatus == 1 ||
@@ -372,7 +382,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 		}
 
 		// duplicate
-		if (in_list(frappe.boot.user.can_create, me.frm.doctype) && !me.frm.meta.allow_copy) {
+		if (frappe.boot.user.can_create.includes(me.frm.doctype) && !me.frm.meta.allow_copy) {
 			this.page.add_menu_item(
 				__("Duplicate"),
 				function () {
@@ -453,7 +463,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 			},
 			true,
 			{
-				shortcut: "ctrl+z",
+				shortcut: "Ctrl+Z",
 				condition: () => !this.frm.is_form_builder(),
 				description: __("Undo last action"),
 			}
@@ -465,7 +475,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 			},
 			true,
 			{
-				shortcut: "ctrl+y",
+				shortcut: "Ctrl+Y",
 				condition: () => !this.frm.is_form_builder(),
 				description: __("Redo last action"),
 			}
@@ -506,7 +516,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 			this.page.add_menu_item(
 				__("View Audit Trail"),
 				function () {
-					me.frm.show_audit_trail();
+					frappe.set_route("audit-trail");
 				},
 				true
 			);
@@ -584,9 +594,7 @@ frappe.ui.form.Toolbar = class Toolbar {
 	}
 	has_workflow() {
 		if (this._has_workflow === undefined)
-			this._has_workflow = frappe.get_list("Workflow", {
-				document_type: this.frm.doctype,
-			}).length;
+			this._has_workflow = frappe.model.has_workflow(this.frm.doctype);
 		return this._has_workflow;
 	}
 	get_docstatus() {

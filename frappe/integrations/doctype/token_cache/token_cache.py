@@ -32,6 +32,7 @@ class TokenCache(Document):
 		token_type: DF.Data | None
 		user: DF.Link | None
 	# end: auto-generated types
+
 	def get_auth_header(self):
 		if self.access_token:
 			return {"Authorization": "Bearer " + self.get_password("access_token")}
@@ -52,8 +53,10 @@ class TokenCache(Document):
 
 		self.token_type = token_type
 		self.access_token = cstr(data.get("access_token", ""))
-		self.refresh_token = cstr(data.get("refresh_token", ""))
 		self.expires_in = cint(data.get("expires_in", 0))
+
+		if "refresh_token" in data:
+			self.refresh_token = cstr(data.get("refresh_token"))
 
 		new_scopes = data.get("scope")
 		if new_scopes:

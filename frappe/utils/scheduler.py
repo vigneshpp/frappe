@@ -14,10 +14,14 @@ import random
 import time
 from typing import NoReturn
 
+import setproctitle
+from croniter import CroniterBadCronError
+
 # imports - module imports
 import frappe
 from frappe.utils import cint, get_datetime, get_sites, now_datetime
 from frappe.utils.background_jobs import set_niceness
+from frappe.utils.synchronization import filelock
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -31,16 +35,22 @@ def cprint(*args, **kwargs):
 		pass
 
 
+def _proctitle(message):
+	setproctitle.setproctitle(f"frappe-scheduler: {message}")
+
+
 def start_scheduler() -> NoReturn:
 	"""Run enqueue_events_for_all_sites based on scheduler tick.
 	Specify scheduler_interval in seconds in common_site_config.json"""
 
-	tick = cint(frappe.get_conf().scheduler_tick_interval) or 60
+	tick = get_scheduler_tick()
 	set_niceness()
 
-	while True:
-		time.sleep(tick)
-		enqueue_events_for_all_sites()
+	with filelock("scheduler_process", timeout=1, is_global=True):
+		while True:
+			_proctitle("idle")
+			time.sleep(tick)
+			enqueue_events_for_all_sites()
 
 
 def enqueue_events_for_all_sites() -> None:
@@ -68,6 +78,7 @@ def enqueue_events_for_site(site: str) -> None:
 		frappe.logger("scheduler").error(f"Exception in Enqueue Events for Site {site}", exc_info=True)
 
 	try:
+		_proctitle(f"scheduling events for {site}")
 		frappe.init(site=site)
 		frappe.connect()
 		if is_scheduler_inactive():
@@ -90,8 +101,13 @@ def enqueue_events() -> list[str] | None:
 		enqueued_jobs = []
 		for job_type in frappe.get_all("Scheduled Job Type", filters={"stopped": 0}, fields="*"):
 			job_type = frappe.get_doc(doctype="Scheduled Job Type", **job_type)
-			if job_type.enqueue():
-				enqueued_jobs.append(job_type.method)
+			try:
+				if job_type.enqueue():
+					enqueued_jobs.append(job_type.method)
+			except CroniterBadCronError:
+				frappe.logger("scheduler").error(
+					f"Invalid Job on {frappe.local.site} - {job_type.name}", exc_info=True
+				)
 
 		return enqueued_jobs
 
@@ -141,11 +157,11 @@ def disable_scheduler():
 
 
 def schedule_jobs_based_on_activity(check_time=None):
-	"""Returns True for active sites defined by Activity Log
-	Returns True for inactive sites once in 24 hours"""
+	"""Return True for active sites as defined by `Activity Log`.
+	Also return True for inactive sites once every 24 hours based on `Scheduled Job Log`."""
 	if is_dormant(check_time=check_time):
 		# ensure last job is one day old
-		last_job_timestamp = _get_last_modified_timestamp("Scheduled Job Log")
+		last_job_timestamp = _get_last_creation_timestamp("Scheduled Job Log")
 		if not last_job_timestamp:
 			return True
 		else:
@@ -161,7 +177,7 @@ def schedule_jobs_based_on_activity(check_time=None):
 
 
 def is_dormant(check_time=None):
-	last_activity_log_timestamp = _get_last_modified_timestamp("Activity Log")
+	last_activity_log_timestamp = _get_last_creation_timestamp("Activity Log")
 	since = (frappe.get_system_settings("dormant_days") or 4) * 86400
 	if not last_activity_log_timestamp:
 		return True
@@ -170,10 +186,8 @@ def is_dormant(check_time=None):
 	return False
 
 
-def _get_last_modified_timestamp(doctype):
-	timestamp = frappe.db.get_value(
-		doctype, filters={}, fieldname="modified", order_by="modified desc"
-	)
+def _get_last_creation_timestamp(doctype):
+	timestamp = frappe.db.get_value(doctype, filters={}, fieldname="creation", order_by="creation desc")
 	if timestamp:
 		return get_datetime(timestamp)
 
@@ -198,3 +212,7 @@ def get_scheduler_status():
 	if is_scheduler_inactive():
 		return {"status": "inactive"}
 	return {"status": "active"}
+
+
+def get_scheduler_tick() -> int:
+	return cint(frappe.get_conf().scheduler_tick_interval) or 60

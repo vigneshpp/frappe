@@ -34,7 +34,7 @@ class Notification(Document):
 		attach_print: DF.Check
 		channel: DF.Literal["Email", "Slack", "System Notification", "SMS"]
 		condition: DF.Code | None
-		date_changed: DF.Literal
+		date_changed: DF.Literal[None]
 		days_in_advance: DF.Int
 		document_type: DF.Link
 		enabled: DF.Check
@@ -62,11 +62,12 @@ class Notification(Document):
 		send_to_all_assignees: DF.Check
 		sender: DF.Link | None
 		sender_email: DF.Data | None
-		set_property_after_alert: DF.Literal
+		set_property_after_alert: DF.Literal[None]
 		slack_webhook_url: DF.Link | None
 		subject: DF.Data | None
-		value_changed: DF.Literal
+		value_changed: DF.Literal[None]
 	# end: auto-generated types
+
 	def onload(self):
 		"""load message"""
 		if self.is_standard:
@@ -281,6 +282,9 @@ def get_context(context):
 				bcc=bcc,
 				communication_type="Automated Message",
 			).get("name")
+			# set the outgoing email account because we did in fact send it via sendmail above
+			comm = frappe.get_doc("Communication", communication)
+			comm.get_outgoing_email_account()
 
 		frappe.sendmail(
 			recipients=recipients,
@@ -366,7 +370,9 @@ def get_context(context):
 
 			# For sending messages to specified role
 			if recipient.receiver_by_role:
-				receiver_list += get_info_based_on_role(recipient.receiver_by_role, "mobile_no")
+				receiver_list += get_info_based_on_role(
+					recipient.receiver_by_role, "mobile_no", ignore_permissions=True
+				)
 
 		return receiver_list
 
@@ -379,7 +385,6 @@ def get_context(context):
 		if (doc.docstatus == 0 and not print_settings.allow_print_for_draft) or (
 			doc.docstatus == 2 and not print_settings.allow_print_for_cancelled
 		):
-
 			# ignoring attachment as draft and cancelled documents are not allowed to print
 			status = "Draft" if doc.docstatus == 0 else "Cancelled"
 			frappe.throw(
@@ -505,8 +510,7 @@ def evaluate_alert(doc: Document, alert, event):
 		frappe.throw(message, title=_("Error in Notification"))
 	except Exception as e:
 		title = str(e)
-		message = frappe.get_traceback()
-		frappe.log_error(message=message, title=title)
+		frappe.log_error(title=title)
 
 		msg = f"<details><summary>{title}</summary>{message}</details>"
 		frappe.throw(msg, title=_("Error in Notification"))

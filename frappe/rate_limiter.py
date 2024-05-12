@@ -89,7 +89,7 @@ class RateLimiter:
 
 
 def rate_limit(
-	key: str = None,
+	key: str | None = None,
 	limit: int | Callable = 5,
 	seconds: int = 24 * 60 * 60,
 	methods: str | list = "ALL",
@@ -110,7 +110,7 @@ def rate_limit(
 	:param ip_based: flag to allow ip based rate-limiting
 	:type ip_based: Boolean
 
-	:returns: a decorator function that limit the number of requests per endpoint
+	Return: a decorator function that limit the number of requests per endpoint
 	"""
 
 	def ratelimit_decorator(fn):
@@ -138,7 +138,7 @@ def rate_limit(
 			if not identity:
 				frappe.throw(_("Either key or IP flag is required."))
 
-			cache_key = f"rl:{frappe.form_dict.cmd}:{identity}"
+			cache_key = frappe.cache.make_key(f"rl:{frappe.form_dict.cmd}:{identity}")
 
 			value = frappe.cache.get(cache_key)
 			if not value:
@@ -147,7 +147,8 @@ def rate_limit(
 			value = frappe.cache.incrby(cache_key, 1)
 			if value > _limit:
 				frappe.throw(
-					_("You hit the rate limit because of too many requests. Please try after sometime.")
+					_("You hit the rate limit because of too many requests. Please try after sometime."),
+					frappe.RateLimitExceededError,
 				)
 
 			return fn(*args, **kwargs)

@@ -10,6 +10,7 @@ import frappe
 from frappe.cache_manager import clear_doctype_cache
 from frappe.core.doctype.doctype.doctype import (
 	CannotIndexedError,
+	DocType,
 	DoctypeLinkError,
 	HiddenAndMandatoryWithoutDefaultError,
 	IllegalMandatoryError,
@@ -220,9 +221,7 @@ class TestDocType(FrappeTestCase):
 			self.assertListEqual(
 				[f["fieldname"] for f in test_doctype_json["fields"]], test_doctype_json["field_order"]
 			)
-			self.assertListEqual(
-				[f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order
-			)
+			self.assertListEqual([f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order)
 			self.assertListEqual(test_doctype_json["field_order"], initial_fields_order)
 
 			# remove field_order to test reload_doc/sync/migrate is backwards compatible without field_order
@@ -246,9 +245,7 @@ class TestDocType(FrappeTestCase):
 			self.assertListEqual(
 				[f["fieldname"] for f in test_doctype_json["fields"]], test_doctype_json["field_order"]
 			)
-			self.assertListEqual(
-				[f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order
-			)
+			self.assertListEqual([f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order)
 			self.assertListEqual(test_doctype_json["field_order"], initial_fields_order)
 
 			# reorder fields: swap row 1 and 3
@@ -259,9 +256,7 @@ class TestDocType(FrappeTestCase):
 			# assert that reordering fields only affects `field_order` rather than `fields` attr
 			test_doctype.save()
 			test_doctype_json = frappe.get_file_json(path)
-			self.assertListEqual(
-				[f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order
-			)
+			self.assertListEqual([f["fieldname"] for f in test_doctype_json["fields"]], initial_fields_order)
 			self.assertListEqual(
 				test_doctype_json["field_order"], ["field_3", "field_2", "field_1", "field_4"]
 			)
@@ -786,8 +781,9 @@ def new_doctype(
 	depends_on: str = "",
 	fields: list[dict] | None = None,
 	custom: bool = True,
+	default: str | None = None,
 	**kwargs,
-):
+) -> "DocType":
 	if not name:
 		# Test prefix is required to avoid coverage
 		name = "Test " + "".join(random.sample(string.ascii_lowercase, 10))
@@ -803,6 +799,7 @@ def new_doctype(
 					"fieldname": "some_fieldname",
 					"fieldtype": "Data",
 					"unique": unique,
+					"default": default,
 					"depends_on": depends_on,
 				}
 			],

@@ -16,7 +16,7 @@ class DbManager:
 	def create_user(self, user, password, host=None):
 		host = host or self.get_current_host()
 		password_predicate = f" IDENTIFIED BY '{password}'" if password else ""
-		self.db.sql(f"CREATE USER '{user}'@'{host}'{password_predicate}")
+		self.db.sql(f"CREATE USER IF NOT EXISTS '{user}'@'{host}'{password_predicate}")
 
 	def delete_user(self, target, host=None):
 		host = host or self.get_current_host()
@@ -25,7 +25,7 @@ class DbManager:
 	def create_database(self, target):
 		if target in self.get_database_list():
 			self.drop_database(target)
-		self.db.sql(f"CREATE DATABASE `{target}`")
+		self.db.sql(f"CREATE DATABASE `{target}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 
 	def drop_database(self, target):
 		self.db.sql_ddl(f"DROP DATABASE IF EXISTS `{target}`")
@@ -57,18 +57,20 @@ class DbManager:
 		from frappe.database import get_command
 		from frappe.utils import execute_in_shell
 
-		pv = which("pv")
+		command = ["set -o pipefail;"]
 
-		command = []
+		if source.endswith(".gz"):
+			if gzip := which("gzip"):
+				command.extend([gzip, "-cd", source, "|"])
+				source = []
+			else:
+				raise Exception("`gzip` not installed")
 
-		if pv:
-			command.extend([pv, source, "|"])
-			source = []
-			print("Restoring Database file...")
 		else:
 			source = ["<", source]
 
 		bin, args, bin_name = get_command(
+			socket=frappe.conf.db_socket,
 			host=frappe.conf.db_host,
 			port=frappe.conf.db_port,
 			user=user,

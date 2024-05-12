@@ -76,6 +76,7 @@ class SiteMigration:
 		"""Complete setup required for site migration"""
 		frappe.flags.touched_tables = set()
 		self.touched_tables_file = frappe.get_site_path("touched_tables.json")
+		frappe.clear_cache()
 		add_column(doctype="DocType", column_name="migration_hash", fieldtype="Data")
 		clear_global_cache()
 
@@ -151,7 +152,7 @@ class SiteMigration:
 				frappe.get_attr(fn)()
 
 	def required_services_running(self) -> bool:
-		"""Returns True if all required services are running. Returns False and prints
+		"""Return True if all required services are running. Return False and print
 		instructions to stdout when required services are not available.
 		"""
 		service_status = check_connection(redis_services=["redis_cache"])
