@@ -15,7 +15,7 @@ frappe.ui.form.ControlTable = class ControlTable extends frappe.ui.form.Control 
 		if (this.frm) {
 			this.frm.grids[this.frm.grids.length] = this;
 		}
-
+		const me = this;
 		this.$wrapper.on("paste", ":text", (e) => {
 			const table_field = this.df.fieldname;
 			const grid = this.grid;
@@ -117,7 +117,7 @@ frappe.ui.form.ControlTable = class ControlTable extends frappe.ui.form.Control 
 	get_field(field_name) {
 		let fieldname;
 		field_name = field_name.toLowerCase();
-		this.grid.meta.fields.some((field) => {
+		this.grid?.meta?.fields.some((field) => {
 			if (frappe.model.no_value_type.includes(field.fieldtype)) {
 				return false;
 			}

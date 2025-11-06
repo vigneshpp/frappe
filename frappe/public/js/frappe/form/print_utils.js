@@ -1,25 +1,20 @@
-frappe.ui.get_print_settings = function (pdf, callback, letter_head, pick_columns) {
+frappe.ui.get_print_settings = function (
+	pdf,
+	callback,
+	letter_head,
+	pick_columns,
+	has_filters = false
+) {
 	var print_settings = locals[":Print Settings"]["Print Settings"];
 
-	var default_letter_head =
-		locals[":Company"] && frappe.defaults.get_default("company")
-			? locals[":Company"][frappe.defaults.get_default("company")]["default_letter_head"]
-			: "";
+	var company = frappe.defaults.get_default("company");
+	var default_letter_head = "";
+
+	if (locals[":Company"] && locals[":Company"][company]) {
+		default_letter_head = locals[":Company"][company]["default_letter_head"] || "";
+	}
 
 	var columns = [
-		{
-			fieldtype: "Check",
-			fieldname: "with_letter_head",
-			label: __("With Letter head"),
-		},
-		{
-			fieldtype: "Select",
-			fieldname: "letter_head",
-			label: __("Letter Head"),
-			depends_on: "with_letter_head",
-			options: Object.keys(frappe.boot.letter_heads),
-			default: letter_head || default_letter_head,
-		},
 		{
 			fieldtype: "Select",
 			fieldname: "orientation",
@@ -30,7 +25,42 @@ frappe.ui.get_print_settings = function (pdf, callback, letter_head, pick_column
 			],
 			default: "Landscape",
 		},
+		{
+			fieldtype: "Link",
+			fieldname: "report",
+			label: __("Report"),
+			options: "Print Format",
+			get_query: () => ({
+				filters: {
+					print_format_for: "Report",
+					print_format_type: "JS",
+					report: frappe.query_report ? frappe.query_report.report_name : "",
+					disabled: 0,
+				},
+			}),
+		},
+		{
+			fieldtype: "Check",
+			fieldname: "with_letter_head",
+			label: __("With Letter head"),
+		},
+		{
+			fieldtype: "Link",
+			fieldname: "letter_head",
+			label: __("Letter Head"),
+			depends_on: "with_letter_head",
+			options: "Letter Head",
+			default: letter_head || default_letter_head,
+		},
 	];
+
+	if (has_filters) {
+		columns.push({
+			label: __("Include filters"),
+			fieldtype: "Check",
+			fieldname: "include_filters",
+		});
+	}
 
 	if (pick_columns) {
 		columns.push(
@@ -201,7 +231,7 @@ frappe.ui.form.qz_fail = function (e) {
 	// notify qz errors
 	frappe.show_alert(
 		{
-			message: __("QZ Tray Failed: ") + e.toString(),
+			message: __("QZ Tray Failed:") + " " + e.toString(),
 			indicator: "red",
 		},
 		20

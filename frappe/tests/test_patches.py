@@ -3,7 +3,7 @@ from unittest.mock import mock_open, patch
 
 import frappe
 from frappe.modules import patch_handler
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 EMTPY_FILE = ""
 EMTPY_SECTION = """
@@ -48,7 +48,7 @@ app.module.patch4
 """
 
 
-class TestPatches(FrappeTestCase):
+class TestPatches(IntegrationTestCase):
 	def test_patch_module_names(self):
 		frappe.flags.final_patches = []
 		frappe.flags.in_install = True
@@ -78,7 +78,7 @@ class TestPatches(FrappeTestCase):
 		self.assertGreaterEqual(finished_patches, len(all_patches))
 
 
-class TestPatchReader(FrappeTestCase):
+class TestPatchReader(IntegrationTestCase):
 	def get_patches(self):
 		return (
 			patch_handler.get_patches_from_app("frappe"),
@@ -121,7 +121,7 @@ class TestPatchReader(FrappeTestCase):
 
 	@patch("builtins.open", new_callable=mock_open, read_data=EDGE_CASES)
 	def test_new_style_edge_cases(self, _file):
-		all, pre, post = self.get_patches()
+		_all, pre, _post = self.get_patches()
 		self.assertEqual(
 			pre,
 			[
@@ -134,7 +134,7 @@ class TestPatchReader(FrappeTestCase):
 
 	@patch("builtins.open", new_callable=mock_open, read_data=COMMENTED_OUT)
 	def test_ignore_comments(self, _file):
-		all, pre, post = self.get_patches()
+		_all, pre, _post = self.get_patches()
 		self.assertEqual(pre, ["app.module.patch1", "app.module.patch3"])
 
 	def test_verify_patch_txt(self):

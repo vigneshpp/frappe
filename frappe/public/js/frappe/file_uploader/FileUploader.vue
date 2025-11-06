@@ -13,7 +13,7 @@
 				<div class="text-center">
 					{{ __("Drag and drop files here or upload from") }}
 				</div>
-				<div class="mt-2 text-center">
+				<div class="mt-3 text-center">
 					<button class="btn btn-file-upload" @click="browse_files">
 						<svg
 							width="30"
@@ -150,7 +150,7 @@
 						<div class="mt-1">{{ __("Camera") }}</div>
 					</button>
 					<button
-						v-if="google_drive_settings.enabled"
+						v-if="allow_google_drive && google_drive_settings.enabled"
 						class="btn btn-file-upload"
 						@click="show_google_drive_picker"
 					>
@@ -163,8 +163,25 @@
 						</svg>
 						<div class="mt-1">{{ __("Google Drive") }}</div>
 					</button>
+					<template v-for="option in additional_upload_handlers">
+						<button class="btn btn-file-upload" @click="option.wrappedAction">
+							<svg
+								v-if="typeof option.icon === 'string'"
+								v-html="option.icon"
+								width="30"
+								height="30"
+							/>
+							<component
+								v-else-if="option.icon"
+								:is="option.icon"
+								width="30"
+								height="30"
+							/>
+							<div class="mt-1">{{ option.label }}</div>
+						</button>
+					</template>
 				</div>
-				<div class="text-muted text-medium text-center">
+				<div class="mt-3 text-center" v-if="upload_notes">
 					{{ upload_notes }}
 				</div>
 			</div>
@@ -181,13 +198,18 @@
 					v-for="(file, i) in files"
 					:key="file.name"
 					:file="file"
+					:allow_toggle_private="allow_toggle_private"
+					:allow_toggle_optimize="allow_toggle_optimize"
 					@remove="remove_file(file)"
 					@toggle_private="file.private = !file.private"
 					@toggle_optimize="file.optimize = !file.optimize"
 					@toggle_image_cropper="toggle_image_cropper(i)"
 				/>
 			</div>
-			<div class="flex align-center" v-if="show_upload_button && currently_uploading === -1">
+			<div
+				class="flex align-items-center justify-content-end"
+				v-if="show_upload_button && currently_uploading === -1"
+			>
 				<button class="btn btn-primary btn-sm margin-right" @click="() => upload_files()">
 					<span v-if="files.length === 1">
 						{{ __("Upload file") }}
@@ -196,9 +218,6 @@
 						{{ __("Upload {0} files", [files.length]) }}
 					</span>
 				</button>
-				<div class="text-muted text-medium">
-					{{ __("Click on the lock icon to toggle public/private") }}
-				</div>
 			</div>
 		</div>
 		<ImageCropper
@@ -274,6 +293,24 @@ const props = defineProps({
 	upload_notes: {
 		default: null, // "Images or video, upto 2MB"
 	},
+	allow_web_link: {
+		default: true,
+	},
+	allow_take_photo: {
+		default: true,
+	},
+	allow_toggle_private: {
+		default: true,
+	},
+	allow_toggle_optimize: {
+		default: true,
+	},
+	allow_google_drive: {
+		default: true,
+	},
+	additional_upload_handlers: {
+		default: [],
+	},
 });
 
 // variables
@@ -291,15 +328,17 @@ let trigger_upload = ref(false);
 let close_dialog = ref(false);
 let hide_dialog_footer = ref(false);
 let allow_take_photo = ref(false);
-let allow_web_link = ref(true);
 let google_drive_settings = ref({
 	enabled: false,
 });
 let wrapper_ready = ref(false);
 
 // created
-allow_take_photo.value = window.navigator.mediaDevices;
-if (frappe.user_id !== "Guest") {
+if (props.allow_take_photo) {
+	allow_take_photo.value = window.navigator.mediaDevices;
+}
+
+if (frappe.user_id !== "Guest" && props.allow_google_drive) {
 	frappe.call({
 		// method only available after login
 		method: "frappe.integrations.doctype.google_settings.google_settings.get_file_picker_settings",
@@ -338,6 +377,7 @@ function on_file_input(e) {
 }
 function remove_file(file) {
 	files.value = files.value.filter((f) => f !== file);
+	if (file_input.value) file_input.value.value = "";
 }
 function toggle_image_cropper(index) {
 	crop_image_with_index.value = show_image_cropper.value ? -1 : index;
@@ -579,23 +619,22 @@ function upload_file(file, i) {
 					}
 				} else if (xhr.status === 403) {
 					file.failed = true;
-					let response = JSON.parse(xhr.responseText);
-					file.error_message = `Not permitted. ${response._error_message || ""}.`;
-
-					try {
-						// Append server messages which are useful hint for perm issues
-						let server_messages = JSON.parse(response._server_messages);
-
-						server_messages.forEach((m) => {
-							m = JSON.parse(m);
-							file.error_message += `\n ${m.message} `;
-						});
-					} catch (e) {
-						console.warning("Failed to parse server message", e);
+					let response = parse_error_response(xhr.responseText);
+					file.error_message = `Not permitted. ${response.error_message || ""}.`;
+					if (response.server_messages.length) {
+						file.error_message += `\n${response.server_messages.join("\n")}`;
 					}
 				} else if (xhr.status === 413) {
 					file.failed = true;
 					file.error_message = "Size exceeds the maximum allowed file size.";
+				} else if (xhr.status === 417) {
+					// regular frappe.throw() in backend
+					file.failed = true;
+					file.error_message = null;
+					let response = parse_error_response(xhr.responseText);
+					if (response.server_messages.length) {
+						file.error_message = response.server_messages.join("\n");
+					}
 				} else {
 					file.failed = true;
 					file.error_message =
@@ -627,7 +666,9 @@ function upload_file(file, i) {
 		if (file.file_url) {
 			form_data.append("file_url", file.file_url);
 		}
-
+		if (file.file_size) {
+			form_data.append("file_size", file.file_size);
+		}
 		if (file.file_name) {
 			form_data.append("file_name", file.file_name);
 		}
@@ -635,8 +676,11 @@ function upload_file(file, i) {
 			form_data.append("library_file_name", file.library_file_name);
 		}
 
-		if (props.doctype && props.docname) {
+		if (props.doctype) {
 			form_data.append("doctype", props.doctype);
+		}
+
+		if (props.docname) {
 			form_data.append("docname", props.docname);
 		}
 
@@ -659,6 +703,26 @@ function upload_file(file, i) {
 
 		xhr.send(form_data);
 	});
+}
+function parse_error_response(response_text) {
+	let response = JSON.parse(response_text);
+	let error_message = response._error_message;
+	let server_messages = [];
+
+	try {
+		server_messages.push(
+			...JSON.parse(response._server_messages).map((m) => {
+				let parsed = JSON.parse(m);
+				return parsed.message;
+			})
+		);
+	} catch (e) {
+		console.warning("Failed to parse server message", e);
+	}
+	return {
+		error_message,
+		server_messages,
+	};
 }
 function capture_image() {
 	const capture = new frappe.ui.Capture({
@@ -721,6 +785,7 @@ watch(
 defineExpose({
 	files,
 	add_files,
+	upload_file,
 	upload_files,
 	toggle_all_private,
 	wrapper_ready,

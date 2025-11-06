@@ -2,9 +2,10 @@
 # MIT License. See LICENSE
 
 """
-	Customize Form is a Single DocType used to mask the Property Setter
-	Thus providing a better UI from user perspective
+Customize Form is a Single DocType used to mask the Property Setter
+Thus providing a better UI from user perspective
 """
+
 import json
 
 import frappe
@@ -51,6 +52,7 @@ class CustomizeForm(Document):
 		email_append_to: DF.Check
 		fields: DF.Table[CustomizeFormField]
 		force_re_route_to_default_view: DF.Check
+		grid_page_length: DF.Int
 		image_field: DF.Data | None
 		is_calendar_and_gantt: DF.Check
 		istable: DF.Check
@@ -69,11 +71,15 @@ class CustomizeForm(Document):
 			"Random",
 			"By script",
 		]
+		protect_attached_files: DF.Check
 		queue_in_background: DF.Check
 		quick_entry: DF.Check
+		recipient_account_field: DF.Data | None
+		rows_threshold_for_grid_search: DF.Int
 		search_fields: DF.Data | None
 		sender_field: DF.Data | None
 		sender_name_field: DF.Data | None
+		show_name_in_global_search: DF.Check
 		show_preview_popup: DF.Check
 		show_title_field_in_link: DF.Check
 		sort_field: DF.Literal[None]
@@ -226,8 +232,8 @@ class CustomizeForm(Document):
 		validate_autoincrement_autoname(self)
 		self.flags.update_db = False
 		self.flags.rebuild_doctype_for_global_search = False
-		self.set_property_setters()
 		self.update_custom_fields()
+		self.set_property_setters()
 		self.set_name_translation()
 		validate_fields_for_doctype(self.doc_type)
 		check_email_append_to(self)
@@ -302,6 +308,8 @@ class CustomizeForm(Document):
 		)
 
 	def set_property_setters_for_doctype(self, meta):
+		if self.get("show_name_in_global_search") != meta.get("show_name_in_global_search"):
+			self.flags.rebuild_doctype_for_global_search = True
 		for prop, prop_type in doctype_properties.items():
 			if self.get(prop) != meta.get(prop):
 				self.make_property_setter(prop, self.get(prop), prop_type)
@@ -440,7 +448,7 @@ class CustomizeForm(Document):
 				property_name, json.dumps([d.name for d in self.get(fieldname)]), "Small Text"
 			)
 		else:
-			frappe.db.delete("Property Setter", dict(property=property_name, doc_type=self.doc_type))
+			delete_property_setter(self.doc_type, property=property_name)
 
 	def clear_removed_items(self, doctype, items):
 		"""
@@ -726,10 +734,12 @@ doctype_properties = {
 	"editable_grid": "Check",
 	"max_attachments": "Int",
 	"make_attachments_public": "Check",
+	"protect_attached_files": "Check",
 	"track_changes": "Check",
 	"track_views": "Check",
 	"allow_auto_repeat": "Check",
 	"allow_import": "Check",
+	"show_name_in_global_search": "Check",
 	"show_preview_popup": "Check",
 	"default_email_template": "Data",
 	"email_append_to": "Check",
@@ -742,6 +752,8 @@ doctype_properties = {
 	"default_view": "Select",
 	"force_re_route_to_default_view": "Check",
 	"translated_doctype": "Check",
+	"grid_page_length": "Int",
+	"rows_threshold_for_grid_search": "Int",
 }
 
 docfield_properties = {
@@ -793,6 +805,7 @@ docfield_properties = {
 	"hide_seconds": "Check",
 	"is_virtual": "Check",
 	"link_filters": "JSON",
+	"placeholder": "Data",
 }
 
 doctype_link_properties = {

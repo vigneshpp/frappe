@@ -19,11 +19,12 @@ frappe.listview_settings["DocType"] = {
 		let non_developer = frappe.session.user !== "Administrator" || !frappe.boot.developer_mode;
 		let fields = [
 			{
-				label: __("DocType Name"),
+				label: __("Name"),
 				fieldname: "name",
 				fieldtype: "Data",
 				reqd: 1,
 				default: doctype_name,
+				length: 61,
 			},
 			{ fieldtype: "Column Break" },
 			{

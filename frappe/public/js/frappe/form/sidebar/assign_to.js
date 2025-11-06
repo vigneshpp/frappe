@@ -40,6 +40,7 @@ frappe.ui.form.AssignTo = class AssignTo {
 		avatar_group.click(() => {
 			new frappe.ui.form.AssignmentDialog({
 				assignments: assigned_users,
+				assignment_details: assignments,
 				frm: this.frm,
 			});
 		});
@@ -139,6 +140,25 @@ frappe.ui.form.AssignToDialog = class AssignToDialog {
 
 		me.dialog.set_value("assign_to", assign_to);
 	}
+	user_group_list() {
+		let me = this;
+		let user_group = me.dialog.get_value("assign_to_user_group");
+		me.dialog.set_value("assign_to_me", 0);
+
+		if (user_group) {
+			let user_group_members = [];
+			frappe.db
+				.get_list("User Group Member", {
+					parent_doctype: "User Group",
+					filters: { parent: user_group },
+					fields: ["user"],
+				})
+				.then((response) => {
+					user_group_members = response.map((group_member) => group_member.user);
+					me.dialog.set_value("assign_to", user_group_members);
+				});
+		}
+	}
 	set_description_from_doc() {
 		let me = this;
 
@@ -168,6 +188,13 @@ frappe.ui.form.AssignToDialog = class AssignToDialog {
 						enabled: 1,
 					});
 				},
+			},
+			{
+				label: __("Assign To User Group"),
+				fieldtype: "Link",
+				fieldname: "assign_to_user_group",
+				options: "User Group",
+				onchange: () => me.user_group_list(),
 			},
 			{
 				fieldtype: "Section Break",
@@ -208,7 +235,7 @@ frappe.ui.form.AssignToDialog = class AssignToDialog {
 			},
 			{
 				label: __("Comment"),
-				fieldtype: "Small Text",
+				fieldtype: "Text Editor",
 				fieldname: "description",
 			},
 		];
@@ -219,6 +246,7 @@ frappe.ui.form.AssignmentDialog = class {
 	constructor(opts) {
 		this.frm = opts.frm;
 		this.assignments = opts.assignments;
+		this.assignment_details = opts.assignment_details;
 		this.make();
 	}
 
@@ -327,6 +355,18 @@ frappe.ui.form.AssignmentDialog = class {
 					this.render(assignments);
 				});
 			});
+
+			const html = this.assignment_details
+				.filter((x) => x.owner === assignment && strip_html(x.description))
+				.map((x) => x.description)
+				.join("<hr>");
+			if (html) {
+				$(
+					"<div class='small overflow-auto m-1 p-1 flex-grow-1' style='max-height: 100px;'>"
+				)
+					.html(html)
+					.appendTo(row);
+			}
 		}
 
 		if (assignment === frappe.session.user || this.frm.perm[0].write) {

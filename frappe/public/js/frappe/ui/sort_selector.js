@@ -175,11 +175,11 @@ frappe.ui.SortSelector = class SortSelector {
 			};
 		}
 
-		if (meta.sort_field && meta.sort_field.includes(",")) {
+		if (meta.sort_field) {
 			var parts = meta.sort_field.split(",")[0].split(" ");
 			return {
 				meta_sort_field: parts[0],
-				meta_sort_order: parts[1],
+				meta_sort_order: meta.sort_order ? meta.sort_order.toLowerCase() : "",
 			};
 		} else {
 			return {
@@ -196,12 +196,12 @@ frappe.ui.SortSelector = class SortSelector {
 		}
 	}
 	get_sql_string() {
-		// build string like: `tabSales Invoice`.subject, `tabSales Invoice`.name desc
+		// build string like: `tabSales Invoice`.`subject`, `tabSales Invoice`.`name` desc
 		const table_name = "`tab" + this.doctype + "`";
-		const sort_by = `${table_name}.${this.sort_by}`;
+		const sort_by = `${table_name}.\`${this.sort_by}\``;
 		if (!["name", "creation", "modified"].includes(this.sort_by)) {
 			// add name column for deterministic ordering
-			return `${sort_by} ${this.sort_order}, ${table_name}.name ${this.sort_order}`;
+			return `${sort_by} ${this.sort_order}, ${table_name}.\`name\` ${this.sort_order}`;
 		} else {
 			return `${sort_by} ${this.sort_order}`;
 		}

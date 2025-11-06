@@ -16,14 +16,14 @@ export default class Tab {
 		const id = `${frappe.scrub(this.doctype, "-")}-${this.df.fieldname}`;
 		this.tab_link = $(`
 			<li class="nav-item">
-				<a class="nav-link ${this.df.active ? "active" : ""}" id="${id}-tab"
+				<button class="nav-link ${this.df.active ? "active" : ""}" id="${id}-tab"
 					data-toggle="tab"
 					data-fieldname="${this.df.fieldname}"
 					href="#${id}"
 					role="tab"
 					aria-controls="${id}">
-						${__(this.label)}
-				</a>
+						${__(this.label, null, this.doctype)}
+				</button>
 			</li>
 		`).appendTo(this.tab_link_container);
 
@@ -76,6 +76,7 @@ export default class Tab {
 	add_field(fieldobj) {
 		fieldobj.tab = this;
 	}
+
 	replace_field(fieldobj) {
 		fieldobj.tab = this;
 	}
@@ -96,7 +97,7 @@ export default class Tab {
 
 	setup_listeners() {
 		this.tab_link.find(".nav-link").on("shown.bs.tab", () => {
-			this?.frm.set_active_tab?.(this);
+			this.frm?.set_active_tab?.(this);
 		});
 	}
 }

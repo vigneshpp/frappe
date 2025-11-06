@@ -1,10 +1,12 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 """
-	Utilities for using modules
+Utilities for using modules
 """
+
 import json
 import os
+from pathlib import Path
 from textwrap import dedent, indent
 from typing import TYPE_CHECKING, Union
 
@@ -64,16 +66,20 @@ def export_customizations(
 		frappe.throw(_("Only allowed to export customizations in developer mode"))
 
 	custom = {
-		"custom_fields": frappe.get_all("Custom Field", fields="*", filters={"dt": doctype}),
-		"property_setters": frappe.get_all("Property Setter", fields="*", filters={"doc_type": doctype}),
+		"custom_fields": frappe.get_all("Custom Field", fields="*", filters={"dt": doctype}, order_by="name"),
+		"property_setters": frappe.get_all(
+			"Property Setter", fields="*", filters={"doc_type": doctype}, order_by="name"
+		),
 		"custom_perms": [],
-		"links": frappe.get_all("DocType Link", fields="*", filters={"parent": doctype}),
+		"links": frappe.get_all("DocType Link", fields="*", filters={"parent": doctype}, order_by="name"),
 		"doctype": doctype,
 		"sync_on_migrate": sync_on_migrate,
 	}
 
 	if with_permissions:
-		custom["custom_perms"] = frappe.get_all("Custom DocPerm", fields="*", filters={"parent": doctype})
+		custom["custom_perms"] = frappe.get_all(
+			"Custom DocPerm", fields="*", filters={"parent": doctype}, order_by="name"
+		)
 
 	# also update the custom fields and property setters for all child tables
 	for d in frappe.get_meta(doctype).get_table_fields():
@@ -195,7 +201,11 @@ def scrub_dt_dn(dt: str, dn: str) -> tuple[str, str]:
 
 def get_doc_path(module: str, doctype: str, name: str) -> str:
 	"""Return path of a doc in a module."""
-	return os.path.join(get_module_path(module), *scrub_dt_dn(doctype, name))
+	module_path = Path(get_module_path(module))
+	path = module_path / Path(*scrub_dt_dn(doctype, name))
+	if not path.resolve().is_relative_to(module_path.resolve()):
+		raise ValueError(_("Path {0} is not within module {1}").format(path, module))
+	return path.resolve()
 
 
 def reload_doc(
@@ -242,14 +252,14 @@ def load_doctype_module(doctype, module=None, prefix="", suffix=""):
 	module = module or get_doctype_module(doctype)
 	app = get_module_app(module)
 	key = (app, doctype, prefix, suffix)
-	module_name = get_module_name(doctype, module, prefix, suffix)
+	module_name = get_module_name(doctype, module, prefix, suffix, app)
 
 	if key not in doctype_python_modules:
 		try:
 			doctype_python_modules[key] = frappe.get_module(module_name)
 		except ImportError as e:
 			msg = f"Module import failed for {doctype}, the DocType you're trying to open might be deleted."
-			msg += f"<br> Error: {e}"
+			msg += f"\nError: {e}"
 			raise ImportError(msg) from e
 
 	return doctype_python_modules[key]
@@ -304,21 +314,22 @@ def make_boilerplate(
 		base_class_import = "from frappe.utils.nestedset import NestedSet"
 
 	if doc.get("is_virtual"):
-		controller_body = indent(
-			dedent(
-				"""
+		controller_body = """
 			def db_insert(self, *args, **kwargs):
 				raise NotImplementedError
 
-			def load_from_db(self):
+			def load_from_db(self, *args, **kwargs):
 				raise NotImplementedError
 
-			def db_update(self):
+			def db_update(self, *args, **kwargs):
 				raise NotImplementedError
 
-			def delete(self):
+			def delete(self, *args, **kwargs):
 				raise NotImplementedError
+		"""
 
+		if not doc.get("istable"):
+			controller_body += """
 			@staticmethod
 			def get_list(filters=None, page_length=20, **kwargs):
 				pass
@@ -331,9 +342,8 @@ def make_boilerplate(
 			def get_stats(**kwargs):
 				pass
 			"""
-			),
-			"\t",
-		)
+
+		controller_body = indent(dedent(controller_body), "\t")
 
 	with open(target_file_path, "w") as target, open(template_file_path) as source:
 		template = source.read()

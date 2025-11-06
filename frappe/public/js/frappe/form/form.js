@@ -38,7 +38,7 @@ frappe.ui.form.Form = class FrappeForm {
 		this.events = {};
 		this.fetch_dict = {};
 		this.parent = parent;
-		this.doctype_layout = frappe.get_doc("DocType Layout", doctype_layout_name);
+		this.doctype_layout = frappe.get_meta(doctype_layout_name);
 		this.undo_manager = new UndoManager({ frm: this });
 		this.setup_meta(doctype);
 		this.debounced_reload_doc = frappe.utils.debounce(this.reload_doc.bind(this), 1000);
@@ -52,7 +52,7 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	setup_meta() {
-		this.meta = frappe.get_doc("DocType", this.doctype);
+		this.meta = frappe.get_meta(this.doctype);
 
 		if (this.meta.istable) {
 			this.meta.in_dialog = 1;
@@ -67,6 +67,7 @@ frappe.ui.form.Form = class FrappeForm {
 			Cancel: "cancel",
 			Amend: "amend",
 			Delete: "delete",
+			Mask: "mask",
 		};
 	}
 
@@ -84,6 +85,7 @@ frappe.ui.form.Form = class FrappeForm {
 		frappe.ui.make_app_page({
 			parent: this.wrapper,
 			single_column: is_single_column,
+			sidebar_position: "Right",
 		});
 		this.page = this.wrapper.page;
 		this.layout_main = this.page.main.get(0);
@@ -167,6 +169,7 @@ frappe.ui.form.Form = class FrappeForm {
 			shortcut: "ctrl+p",
 			action: () => this.print_doc(),
 			description: __("Print document"),
+			condition: () => frappe.model.can_print(this.doctype, this) && !this.meta.issingle,
 		});
 
 		let grid_shortcut_keys = [
@@ -331,6 +334,14 @@ frappe.ui.form.Form = class FrappeForm {
 		$(document).on("rename", (ev, dt, old_name, new_name) => {
 			if (dt == this.doctype) this.rename_notify(dt, old_name, new_name);
 		});
+
+		frappe.realtime.on("doc_rename", (data) => {
+			// the current form has been renamed by some backend process
+			if (data.doctype == this.doctype && data.old == this.docname) {
+				// the current form does not exist anymore, route to the new one
+				frappe.set_route("Form", this.doctype, data.new);
+			}
+		});
 	}
 
 	setup_file_drop() {
@@ -417,8 +428,7 @@ frappe.ui.form.Form = class FrappeForm {
 			// read only (workflow)
 			this.read_only = frappe.workflow.is_read_only(this.doctype, this.docname);
 			if (this.read_only) {
-				this.set_read_only(true);
-				frappe.show_alert(__("This form is not editable due to a Workflow."));
+				this.set_read_only();
 			}
 
 			// check if doctype is already open
@@ -438,11 +448,6 @@ frappe.ui.form.Form = class FrappeForm {
 			// load the record for the first time, if not loaded (call 'onload')
 			this.trigger_onload(switched);
 
-			// if print format is shown, refresh the format
-			// if(this.print_preview.wrapper.is(":visible")) {
-			// 	this.print_preview.preview();
-			// }
-
 			if (switched) {
 				if (this.show_print_first && this.doc.docstatus === 1) {
 					// show print view
@@ -459,6 +464,8 @@ frappe.ui.form.Form = class FrappeForm {
 
 			this.show_conflict_message();
 			this.show_submission_queue_banner();
+
+			this.mark_mask_fields_readonly();
 
 			if (frappe.boot.read_only) {
 				this.disable_form();
@@ -514,7 +521,7 @@ frappe.ui.form.Form = class FrappeForm {
 
 				// feedback
 				frappe.msgprint({
-					message: __("{} Complete", [action.label]),
+					message: __("{} Complete", [__(action.label)]),
 					alert: true,
 				});
 			});
@@ -549,7 +556,6 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	trigger_onload(switched) {
-		this.cscript.is_onload = false;
 		if (!this.opendocs[this.docname]) {
 			var me = this;
 			this.cscript.is_onload = true;
@@ -627,6 +633,7 @@ frappe.ui.form.Form = class FrappeForm {
 				() => this.cscript.is_onload && this.is_new() && this.focus_on_first_input(),
 				() => this.run_after_load_hook(),
 				() => this.dashboard.after_refresh(),
+				() => (this.cscript.is_onload = false),
 			]);
 		} else {
 			this.refresh_header(switched);
@@ -670,6 +677,10 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	refresh_fields() {
+		if (this.layout === undefined) {
+			return;
+		}
+
 		this.layout.refresh(this.doc);
 		this.layout.primary_button = this.$wrapper.find(".btn-primary");
 
@@ -735,6 +746,7 @@ frappe.ui.form.Form = class FrappeForm {
 		this.show_submit_message();
 		this.clear_custom_buttons();
 		this.show_web_link();
+		this.show_workflow_read_only_banner();
 	}
 
 	// SAVE
@@ -899,18 +911,15 @@ frappe.ui.form.Form = class FrappeForm {
 				args: {
 					doctype: me.doc.doctype,
 					name: me.doc.name,
+					ignore_doctypes_on_cancel_all: me.ignore_doctypes_on_cancel_all,
 				},
 				freeze: true,
 			})
 			.then((r) => {
 				if (!r.exc) {
-					let doctypes_to_cancel = (r.message.docs || [])
-						.map((value) => {
-							return value.doctype;
-						})
-						.filter((value) => {
-							return !me.ignore_doctypes_on_cancel_all.includes(value);
-						});
+					let doctypes_to_cancel = (r.message.docs || []).map((value) => {
+						return value.doctype;
+					});
 
 					if (doctypes_to_cancel.length) {
 						return me._cancel_all(r, btn, callback, on_error);
@@ -1164,6 +1173,15 @@ frappe.ui.form.Form = class FrappeForm {
 		this.disable_save();
 	}
 
+	mark_mask_fields_readonly() {
+		const masked_fields = this.meta.masked_fields || [];
+
+		masked_fields.forEach((fieldname) => {
+			this.set_df_property(fieldname, "read_only", 1);
+			this.set_df_property(fieldname, "fieldtype", "Data");
+		});
+	}
+
 	handle_save_fail(btn, on_error) {
 		$(btn).prop("disabled", false);
 		if (on_error) {
@@ -1251,8 +1269,6 @@ frappe.ui.form.Form = class FrappeForm {
 		} else if (this.doctype == "DocType") {
 			if (frappe.views.formview[docname] || frappe.pages["List/" + docname]) {
 				window.location.reload();
-				//	frappe.msgprint(__("Cannot open {0} when its instance is open", ['DocType']))
-				// throw 'doctype open conflict'
 			}
 		} else {
 			if (
@@ -1260,8 +1276,6 @@ frappe.ui.form.Form = class FrappeForm {
 				frappe.views.formview.DocType.frm.opendocs[this.doctype]
 			) {
 				window.location.reload();
-				//	frappe.msgprint(__("Cannot open instance when its {0} is open", ['DocType']))
-				// throw 'doctype open conflict'
 			}
 		}
 	}
@@ -1338,12 +1352,14 @@ frappe.ui.form.Form = class FrappeForm {
 			prev,
 		};
 
-		frappe.call("frappe.desk.form.utils.get_next", args).then((r) => {
-			if (r.message) {
-				frappe.set_route("Form", this.doctype, r.message);
-				this.focus_on_first_input();
-			}
-		});
+		frappe
+			.call({ method: "frappe.desk.form.utils.get_next", args, freeze: true })
+			.then((r) => {
+				if (r.message) {
+					frappe.set_route("Form", this.doctype, r.message);
+					this.focus_on_first_input();
+				}
+			});
 	}
 
 	rename_doc() {
@@ -1465,14 +1481,6 @@ frappe.ui.form.Form = class FrappeForm {
 
 		let btn = this.page.add_inner_button(label, fn, group);
 
-		if (btn) {
-			// Add actions as menu item in Mobile View
-			let menu_item_label = group ? `${group} > ${label}` : label;
-			let menu_item = this.page.add_menu_item(menu_item_label, fn, false);
-			menu_item.parent().addClass("hidden-xl");
-
-			this.custom_buttons[label] = btn;
-		}
 		return btn;
 	}
 
@@ -1758,7 +1766,7 @@ frappe.ui.form.Form = class FrappeForm {
 				}
 			} else {
 				frappe.msgprint(__("Field {0} not found.", [f]));
-				throw "frm.set_value";
+				throw `frm.set_value: '${f}' does not exist in the form`;
 			}
 		};
 
@@ -1840,8 +1848,10 @@ frappe.ui.form.Form = class FrappeForm {
 				share: p.share,
 				print: p.print,
 				email: p.email,
+				mask: p.mask,
 			};
 		});
+		this.refresh_fields();
 	}
 
 	trigger(event, doctype, docname) {
@@ -1862,18 +1872,14 @@ frappe.ui.form.Form = class FrappeForm {
 	}
 
 	get_title() {
-		if (this.meta.title_field) {
-			return this.doc[this.meta.title_field];
-		} else {
-			return String(this.doc.name);
-		}
+		return frappe.model.get_doc_title(this.doc);
 	}
 
 	get_selected() {
 		// returns list of children that are selected. returns [parentfield, name] for each
 		var selected = {},
 			me = this;
-		frappe.meta.get_table_fields(this.doctype).forEach(function (df) {
+		frappe.meta.get_table_fields(this.doctype, true).forEach(function (df) {
 			// handle TableMultiselect child fields
 			let _selected = [];
 
@@ -1894,7 +1900,7 @@ frappe.ui.form.Form = class FrappeForm {
 		if (frappe.meta.docfield_map[this.doctype][fieldname]) {
 			doctype = this.doctype;
 		} else {
-			frappe.meta.get_table_fields(this.doctype).every(function (df) {
+			frappe.meta.get_table_fields(this.doctype, true).every(function (df) {
 				if (frappe.meta.docfield_map[df.options][fieldname]) {
 					doctype = df.options;
 					return false;
@@ -1915,7 +1921,7 @@ frappe.ui.form.Form = class FrappeForm {
 				if (get_text) {
 					label = get_text(doc);
 				} else if (frappe.form.link_formatters[df.options]) {
-					label = frappe.form.link_formatters[df.options](value, doc);
+					label = frappe.form.link_formatters[df.options](value, doc, df);
 				} else {
 					label = value;
 				}
@@ -1954,7 +1960,7 @@ frappe.ui.form.Form = class FrappeForm {
 		if (this.can_make_methods && this.can_make_methods[doctype]) {
 			return this.can_make_methods[doctype](this);
 		} else {
-			if (this.meta.is_submittable && !this.doc.docstatus == 1) {
+			if (this.meta.is_submittable && this.doc.docstatus !== 1) {
 				return false;
 			} else {
 				return true;
@@ -2088,16 +2094,11 @@ frappe.ui.form.Form = class FrappeForm {
 					frappe.model.docinfo[doctype][docname][key].splice(docindex, 1);
 				}
 			}
-			// no need to update timeline of owner of comment
-			// gets handled via comment submit code
-			if (
-				!(
-					["add", "update"].includes(action) &&
-					doc.doctype === "Comment" &&
-					doc.owner === frappe.session.user
-				)
-			) {
-				this.timeline && this.timeline.refresh();
+
+			this.timeline && this.timeline.refresh();
+
+			if (["add", "delete"].includes(action) && doc.doctype === "Comment") {
+				this.footer.refresh_comments_count();
 			}
 		});
 	}
@@ -2131,14 +2132,45 @@ frappe.ui.form.Form = class FrappeForm {
 			});
 		});
 	}
+
 	set_active_tab(tab) {
-		if (!this.active_tab_map) {
-			this.active_tab_map = {};
+		const previous_tab_name = this.active_tab_map?.[this.docname]?.df?.fieldname || "";
+		const next_tab_name = tab?.df?.fieldname || "";
+		const has_changed = previous_tab_name !== next_tab_name;
+
+		// A change is always detected on first render, because next_tab_name is always set (= fieldname)
+		// but the previous_tab_name is always empty.
+
+		if (!has_changed) {
+			return; // No change in tab, don't trigger on_tab_change, don't update URL hash
 		}
+
+		this.active_tab_map ??= {};
 		this.active_tab_map[this.docname] = tab;
 
+		// Update URL hash to reflect the active tab
+		const new_hash = next_tab_name.replace("__details", "");
+		const url = new URL(window.location.href);
+		url.hash = new_hash;
+		if (url.href !== window.location.href) {
+			history.replaceState(null, null, url);
+		}
+
 		this.script_manager.trigger("on_tab_change");
+
+		// When switching tabs, we should tell fields to update their display if needed (e.g. Geolocation and Signature fields).
+		// This is done using the already existing on_section_collapse optional method.
+		let in_tab = false;
+		for (const df of this.layout.fields) {
+			const field = this.get_field(df.fieldname);
+			if (df?.fieldtype == "Tab Break") {
+				in_tab = df === tab?.df;
+			} else if (typeof field?.on_section_collapse == "function") {
+				field.on_section_collapse(!in_tab); // hide = !in_tab
+			}
+		}
 	}
+
 	get_active_tab() {
 		return this.active_tab_map && this.active_tab_map[this.docname];
 	}
@@ -2228,6 +2260,26 @@ frappe.ui.form.Form = class FrappeForm {
 					wrapper.remove();
 				}
 			});
+	}
+
+	show_workflow_read_only_banner() {
+		if (!this.read_only) {
+			return;
+		}
+
+		const _show_read_only_banner = () => {
+			this.dashboard.set_headline(
+				__("This form is not editable due to a Workflow."),
+				"blue",
+				true
+			);
+		};
+
+		if (this.dashboard) {
+			_show_read_only_banner();
+		} else {
+			frappe.after_ajax(_show_read_only_banner);
+		}
 	}
 };
 

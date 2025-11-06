@@ -94,7 +94,7 @@ frappe.ui.FieldSelect = class FieldSelect {
 		});
 
 		// add parenttype column
-		var doctype_obj = locals["DocType"][me.doctype];
+		var doctype_obj = frappe.get_meta(me.doctype);
 		if (doctype_obj && cint(doctype_obj.istable)) {
 			std_filters = std_filters.concat([
 				{
@@ -117,6 +117,10 @@ frappe.ui.FieldSelect = class FieldSelect {
 		// main table
 		var main_table_fields = std_filters.concat(frappe.meta.docfield_list[me.doctype]);
 		$.each(frappe.utils.sort(main_table_fields, "label", "string"), function (i, df) {
+			if (df.is_virtual) {
+				return;
+			}
+
 			let doctype =
 				frappe.get_meta(me.doctype).istable && me.parent_doctype
 					? me.parent_doctype
@@ -128,7 +132,7 @@ frappe.ui.FieldSelect = class FieldSelect {
 
 		// child tables
 		$.each(me.table_fields, function (i, table_df) {
-			if (table_df.options) {
+			if (table_df.options && !table_df.is_virtual) {
 				let child_table_fields = [].concat(frappe.meta.docfield_list[table_df.options]);
 
 				if (table_df.fieldtype === "Table MultiSelect") {

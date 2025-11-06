@@ -11,6 +11,7 @@
   "dt",
   "module",
   "label",
+  "placeholder",
   "label_help",
   "fieldname",
   "insert_after",
@@ -84,6 +85,7 @@
    "fieldtype": "Data",
    "in_filter": 1,
    "label": "Label",
+   "length": 255,
    "no_copy": 1,
    "oldfieldname": "label",
    "oldfieldtype": "Data"
@@ -460,13 +462,19 @@
    "fieldname": "show_dashboard",
    "fieldtype": "Check",
    "label": "Show Dashboard"
+  },
+  {
+   "fieldname": "placeholder",
+   "fieldtype": "Data",
+   "label": "Placeholder"
   }
  ],
+ "grid_page_length": 50,
  "icon": "fa fa-glass",
  "idx": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-04-12 16:25:50.349736",
+ "modified": "2025-10-10 11:10:23.862393",
  "modified_by": "Administrator",
  "module": "Custom",
  "name": "Custom Field",
@@ -495,6 +503,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "search_fields": "dt,label,fieldtype,options",
  "sort_field": "creation",
  "sort_order": "DESC",

@@ -2,11 +2,11 @@
 # See license.txt
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 from frappe.utils import today
 
 
-class TestAuditTrail(FrappeTestCase):
+class TestAuditTrail(IntegrationTestCase):
 	def setUp(self):
 		self.child_doctype = create_custom_child_doctype()
 		self.custom_doctype = create_custom_doctype()
@@ -25,7 +25,7 @@ class TestAuditTrail(FrappeTestCase):
 		re_amended_doc = amend_document(amended_doc, changed_fields, {}, 1)
 
 		comparator = create_comparator_doc("Test Custom Doctype for Doc Comparator", re_amended_doc.name)
-		documents, results = comparator.compare_document()
+		_documents, results = comparator.compare_document()
 
 		test_field_values = results["changed"]["Field"]
 		self.check_expected_values(test_field_values, ["first value", "second value", "third value"])
@@ -41,7 +41,7 @@ class TestAuditTrail(FrappeTestCase):
 		amended_doc = amend_document(doc, {}, rows_updated, 1)
 
 		comparator = create_comparator_doc("Test Custom Doctype for Doc Comparator", amended_doc.name)
-		documents, results = comparator.compare_document()
+		_documents, results = comparator.compare_document()
 
 		results = frappe._dict(results)
 		self.check_rows_updated(results.row_changed)

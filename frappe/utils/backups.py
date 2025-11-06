@@ -298,7 +298,7 @@ class BackupGenerator:
 	def zip_files(self):
 		# For backwards compatibility - pre v13
 		click.secho(
-			"BackupGenerator.zip_files has been deprecated in favour of" " BackupGenerator.backup_files",
+			"BackupGenerator.zip_files has been deprecated in favour of BackupGenerator.backup_files",
 			fg="yellow",
 		)
 		return self.backup_files()
@@ -352,12 +352,21 @@ class BackupGenerator:
 			else:
 				cmd_string = "tar -cf {0} {1}"
 
-			frappe.utils.execute_in_shell(
-				cmd_string.format(backup_path, files_path),
-				verbose=self.verbose,
-				low_priority=True,
-				check_exit_code=True,
-			)
+			try:
+				frappe.utils.execute_in_shell(
+					cmd_string.format(backup_path, files_path),
+					verbose=self.verbose,
+					low_priority=True,
+					check_exit_code=True,
+				)
+			except frappe.CommandFailedError as e:
+				if e.err and "file changed as we read it" in e.err:
+					click.secho(
+						"Ignoring `tar: file changed as we read it` to prevent backup failure",
+						fg="red",
+					)
+				else:
+					raise e
 
 	def copy_site_config(self):
 		site_config_backup_path = self.backup_path_conf
@@ -367,12 +376,24 @@ class BackupGenerator:
 			n.write(c.read())
 
 	def take_dump(self):
+		if self.db_type == "sqlite":
+			from pathlib import Path
+
+			import frappe
+
+			db_path = Path(frappe.get_site_path()) / "db" / f"{self.db_name}.db"
+			command = f"gzip -k {db_path} -c > {self.backup_path_db}"
+
+			frappe.utils.execute_in_shell(command, low_priority=True, check_exit_code=True)
+
+			return
+
 		import shlex
 
 		import frappe.utils
 		from frappe.utils.change_log import get_app_branch
 
-		gzip_exc = which("gzip")
+		gzip_exc: str = which("gzip")
 		if not gzip_exc:
 			frappe.throw(
 				_("gzip not found in PATH! This is required to take a backup."), exc=frappe.ExecutableNotFound
