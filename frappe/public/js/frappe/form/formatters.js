@@ -35,11 +35,11 @@ frappe.form.formatters = {
 	},
 	Data: function (value, df) {
 		if (df && df.options == "URL") {
-			if (!value) return;
+			if (!value) return "";
 			return `<a href="${value}" title="Open Link" target="_blank">${value}</a>`;
 		}
 		if (df && df.options == "IBAN") {
-			if (!value) return;
+			if (!value) return "";
 			return frappe.utils.get_formatted_iban(value);
 		}
 		value = value == null ? "" : value;
@@ -397,7 +397,7 @@ frappe.form.formatters = {
 	},
 	Icon: (value) => {
 		return value
-			? `<div>
+			? `<div class='flex' style='gap: 8px;'>
 			<div class="selected-icon">${frappe.utils.icon(value, "md")}</div>
 			<span class="icon-value">${value}</span>
 		</div>`
