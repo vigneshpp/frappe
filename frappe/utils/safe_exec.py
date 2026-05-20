@@ -477,24 +477,32 @@ def read_sql(query, *args, **kwargs):
 
 
 def check_safe_sql_query(query: str, throw: bool = True) -> bool:
+	import re
+
 	"""Check if SQL query is safe for running in restricted context.
 
 	Safe queries:
 	        1. Read only 'select' or 'explain' queries
-	        2. CTE on mariadb where writes are not allowed.
 	"""
 
 	query = query.strip().lower()
 	whitelisted_statements = ("select", "explain")
 
-	if query.startswith(whitelisted_statements) or (
-		query.startswith("with") and frappe.db.db_type == "mariadb"
-	):
+	if re.search(r"\binto\s+(outfile|dumpfile)\b", query):
+		if throw:
+			frappe.throw(
+				_("Read-Only queries are allowed"),
+				title=_("Unsafe SQL query"),
+				exc=frappe.PermissionError,
+			)
+		return False
+
+	if query.startswith(whitelisted_statements):
 		return True
 
 	if throw:
 		frappe.throw(
-			_("Query must be of SELECT or read-only WITH type."),
+			_("Read-Only queries are allowed"),
 			title=_("Unsafe SQL query"),
 			exc=frappe.PermissionError,
 		)
@@ -546,7 +554,11 @@ def _getattr_for_safe_exec(object, name, default=None):
 	# 2. it is not an UNSAFE_ATTRIBUTES
 	_validate_attribute_read(object, name)
 
-	return RestrictedPython.Guards.safer_getattr(object, name, default=default)
+	ret = RestrictedPython.Guards.safer_getattr(object, name, default=default)
+	if isinstance(ret, types.ModuleType | types.CodeType | types.TracebackType | types.FrameType):
+		raise SyntaxError(f"Reading {type(ret)} is not allowed")
+
+	return ret
 
 
 def _get_attr_for_eval(object, name, default=ARGUMENT_NOT_SET):

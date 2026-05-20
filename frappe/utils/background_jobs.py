@@ -451,10 +451,9 @@ def start_worker_pool(
 	if sbool(os.environ.get("FRAPPE_BACKGROUND_WORKERS_NOFORK", False)):
 		worker_klass = FrappeWorkerNoFork
 	else:
-		if sys.version_info >= (3, 14):
-			import multiprocessing
+		import multiprocessing
 
-			multiprocessing.set_start_method("fork", force=True)
+		multiprocessing.set_start_method("fork", force=True)
 		worker_klass = FrappeWorker
 
 	pool = WorkerPool(
@@ -768,12 +767,10 @@ def _start_sentry():
 		ArgvIntegration(),
 	]
 
-	experiments = {}
 	kwargs = {}
 
 	if os.getenv("ENABLE_SENTRY_DB_MONITORING"):
 		integrations.append(FrappeIntegration())
-		experiments["record_sql_params"] = True
 
 	if tracing_sample_rate := os.getenv("SENTRY_TRACING_SAMPLE_RATE"):
 		kwargs["traces_sample_rate"] = float(tracing_sample_rate)
@@ -789,6 +786,5 @@ def _start_sentry():
 		auto_enabling_integrations=False,
 		default_integrations=False,
 		integrations=integrations,
-		_experiments=experiments,
 		**kwargs,
 	)

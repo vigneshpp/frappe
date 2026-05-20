@@ -5,7 +5,7 @@ from frappe import _
 from frappe.utils import cint, cstr, flt
 from frappe.utils.defaults import get_not_null_defaults
 
-# This matches anything that isn't [a-zA-Z0-9_]
+# This matches anything that isn't Unicode Word Characters, Numbers and Underscore.
 SPECIAL_CHAR_PATTERN = re.compile(r"[\W]", flags=re.UNICODE)
 
 VARCHAR_CAST_PATTERN = re.compile(r"varchar\(([\d]+)\)")
@@ -146,7 +146,7 @@ class DBTable:
 					# case when the field is no longer a varchar
 					continue
 				current_length = current_length[0]
-				if cint(current_length) != cint(new_length):
+				if cint(current_length) > cint(new_length):
 					try:
 						# check for truncation
 						max_length = frappe.db.sql(

@@ -46,7 +46,7 @@ def validate_receiver_nos(receiver_list):
 
 
 @frappe.whitelist()
-def get_contact_number(contact_name, ref_doctype, ref_name):
+def get_contact_number(contact_name: str, ref_doctype: str, ref_name: str):
 	"Return mobile number of the given contact."
 	number = frappe.db.sql(
 		"""select mobile_no, phone from tabContact
@@ -62,7 +62,7 @@ def get_contact_number(contact_name, ref_doctype, ref_name):
 
 
 @frappe.whitelist()
-def send_sms(receiver_list, msg, sender_name="", success_msg=True):
+def send_sms(receiver_list: str | list[str], msg: str, sender_name: str = "", success_msg: bool = True):
 	send_sms_hook_methods = frappe.get_hooks("send_sms")
 	if send_sms_hook_methods:
 		return frappe.get_attr(send_sms_hook_methods[-1])(receiver_list, msg, sender_name, success_msg)
@@ -151,6 +151,10 @@ def send_request(gateway_url, params, headers=None, use_post=False, use_json=Fal
 # Create SMS Log
 # =========================================================
 def create_sms_log(args, sent_to):
+	# SMS Log doctype was removed; skip silently if it isn't available
+	# (apps that still ship it will continue to log).
+	if not frappe.db.exists("DocType", "SMS Log"):
+		return
 	sl = frappe.new_doc("SMS Log")
 	sl.sent_on = nowdate()
 	sl.message = args["message"].decode("utf-8")
