@@ -12,7 +12,7 @@ import re
 import ssl
 from contextlib import suppress
 from email.errors import HeaderParseError
-from email.header import decode_header
+from email.header import Header, decode_header
 from urllib.parse import unquote
 
 import chardet
@@ -22,12 +22,14 @@ import frappe
 from frappe import _, safe_decode, safe_encode
 from frappe.core.doctype.file.exceptions import MaxFileSizeReachedError
 from frappe.core.doctype.file.utils import get_random_filename
+from frappe.database import savepoint
 from frappe.email.oauth import Oauth
 from frappe.utils import (
 	add_days,
 	cint,
 	convert_utc_to_system_timezone,
 	cstr,
+	escape_html,
 	extract_email_id,
 	get_datetime,
 	get_string_between,
@@ -226,6 +228,10 @@ class EmailServer:
 		uidnext = int(self.parse_imap_response("UIDNEXT", message[0]) or "1")
 		frappe.db.set_value("Email Account", self.settings.email_account, "uidnext", uidnext)
 
+		# Remove {"} quotes that are added to handle spaces in IMAP Folder names
+		if folder[0] == folder[-1] == '"':
+			folder = folder[1:-1]
+
 		if uid_validity is None:
 			frappe.flags.initial_sync = True
 
@@ -239,15 +245,18 @@ class EmailServer:
 				update_modified=False,
 			)
 
+			sync_count = 100 if uid_validity else int(self.settings.initial_sync_count)
+			from_uid = 1 if uidnext < (sync_count + 1) or (uidnext - sync_count) < 1 else uidnext - sync_count
+
 			if self.settings.use_imap:
-				# Remove {"} quotes that are added to handle spaces in IMAP Folder names
-				if folder[0] == folder[-1] == '"':
-					folder = folder[1:-1]
+				folder_values = {"uidvalidity": current_uid_validity, "uidnext": uidnext}
+				if self.settings.sync_from_uid is not None:
+					folder_values["sync_from_uid"] = from_uid
 
 				frappe.db.set_value(
 					"IMAP Folder",
 					{"parent": self.settings.email_account_name, "folder_name": folder},
-					{"uidvalidity": current_uid_validity, "uidnext": uidnext},
+					folder_values,
 					update_modified=False,
 				)
 			else:
@@ -258,11 +267,22 @@ class EmailServer:
 					update_modified=False,
 				)
 
-			sync_count = 100 if uid_validity else int(self.settings.initial_sync_count)
-			from_uid = 1 if uidnext < (sync_count + 1) or (uidnext - sync_count) < 1 else uidnext - sync_count
 			# sync last 100 email
 			self.settings.email_sync_rule = f"UID {from_uid}:{uidnext}"
 			self.uid_reindexed = True
+		elif self.settings.sync_from_uid == 0 and self.settings.email_sync_rule != "UNSEEN":
+			from frappe.email.doctype.email_account.email_account import get_max_email_uid
+
+			# the account-wide position can lie past this folder's own uids, where no search ever matches
+			sync_from_uid = min(get_max_email_uid(self.settings.email_account), uidnext)
+			frappe.db.set_value(
+				"IMAP Folder",
+				{"parent": self.settings.email_account_name, "folder_name": folder},
+				"sync_from_uid",
+				sync_from_uid,
+				update_modified=False,
+			)
+			self.settings.email_sync_rule = f"UID {sync_from_uid}:*"
 
 	def parse_imap_response(self, cmd, response):
 		pattern = rf"(?<={cmd} )[0-9]*"
@@ -303,7 +323,8 @@ class EmailServer:
 			if self.retry_count < self.retry_limit:
 				self.connect()
 				self.retry_count += 1
-				self.get_messages(folder)
+				self.imap.select(folder, readonly=self.settings.email_sync_rule != "UNSEEN")
+				return self.retrieve_message(uid, msg_num, folder)
 
 		except Exception as e:
 			if self.has_login_limit_exceeded(e):
@@ -448,8 +469,15 @@ class Email:
 			self.subject = "No Subject"
 			return
 
+		subject = self.decode_header_value(raw_subject).strip()
+
+		# Truncate to 140 chars (can be used as a document name)
+		self.subject = subject[:140] if subject else "No Subject"
+
+	@staticmethod
+	def decode_header_value(value: str | Header) -> str:
 		decoded_fragments = []
-		for fragment, charset in decode_header(raw_subject):
+		for fragment, charset in decode_header(value):
 			if isinstance(fragment, bytes):
 				charset = charset or "utf-8"
 				try:
@@ -459,14 +487,12 @@ class Email:
 					fragment = fragment.decode("utf-8", errors="replace")
 			decoded_fragments.append(fragment)
 
-		subject = "".join(decoded_fragments).strip()
-
-		# Truncate to 140 chars (can be used as a document name)
-		self.subject = subject[:140] if subject else "No Subject"
+		return "".join(decoded_fragments)
 
 	def set_from(self):
 		# gmail mailing-list compatibility
 		# use X-Original-Sender if available, as gmail sometimes modifies the 'From'
+		self.from_real_name = None
 		_from_email = self.decode_email(self.mail.get("X-Original-From") or self.mail["From"])
 		_reply_to = self.decode_email(self.mail.get("Reply-To"))
 
@@ -480,7 +506,7 @@ class Email:
 			return
 
 		if _reply_to and not frappe.db.get_value(
-			"Email Account", {"email_id": _reply_to, "enable_incoming": 1}, "email_id"
+			"Email Account", {"email_id": extract_email_id(_reply_to), "enable_incoming": 1}, "email_id"
 		):
 			self.from_email = extract_email_id(_reply_to)
 		else:
@@ -493,6 +519,7 @@ class Email:
 	def decode_email(email: bytes | str | None) -> str | None:
 		if not email:
 			return
+
 		email = frappe.as_unicode(email)
 		try:
 			parts = decode_header(email)
@@ -504,9 +531,26 @@ class Email:
 		decoded = ""
 		for part, encoding in parts:
 			if encoding:
-				decoded += part.decode(encoding, "replace")
+				try:
+					decoded += part.decode(encoding, "replace")
+				except LookupError:
+					decoded += part.decode("utf-8", "replace")
 			else:
 				decoded += safe_decode(part)
+
+		# Reject malformed address headers where decoding synthesizes a bare addr-spec.
+		# Allow valid encoded display-name forms like "=?utf-8?...?= <user@example.com>".
+		if decoded and "@" in decoded and "@" not in email:
+			decoded_addr_spec = parse_addr(decoded)[1]
+			if decoded_addr_spec and decoded.strip() == decoded_addr_spec:
+				frappe.log_error(
+					title=_("Malformed Address Header"),
+					message=_("Rejected malformed encoded address header with synthesized '@': {0}").format(
+						repr(email)
+					),
+				)
+				return None
+
 		return decoded
 
 	def set_content_and_type(self):
@@ -529,7 +573,7 @@ class Email:
 			if part.get_filename():
 				self.get_attachment(part)
 
-		elif content_type == "text/html":
+		elif content_type == "text/html" and part.get_content_disposition() != "attachment":
 			self.html_content += self.get_payload(part)
 
 		elif content_type == "message/rfc822":
@@ -546,7 +590,7 @@ class Email:
 		message = list(part.walk())[1]
 		headers = []
 		for key in ("From", "To", "Subject", "Date"):
-			value = cstr(message.get(key))
+			value = self.decode_email(message.get(key))
 			if value:
 				headers.append(f"{_(key)}: {escape(value)}")
 
@@ -591,7 +635,7 @@ class Email:
 		if fname:
 			try:
 				fname = fname.replace("\n", " ").replace("\r", "")
-				fname = cstr(decode_header(fname)[0][0])
+				fname = self.decode_header_value(fname) or get_random_filename(content_type=content_type)
 			except Exception:
 				fname = get_random_filename(content_type=content_type)
 		else:
@@ -628,7 +672,7 @@ class Email:
 						"content": attachment["fcontent"],
 					}
 				)
-				_file.save()
+				_file.save(ignore_permissions=True)
 				saved_attachments.append(_file)
 
 				if attachment["fname"] in self.cid_map:
@@ -642,6 +686,12 @@ class Email:
 			except frappe.DuplicateEntryError:
 				# same file attached twice??
 				pass
+			except frappe.ValidationError:
+				frappe.log_error(
+					_("Unable to save email attachment {0}").format(attachment["fname"]),
+					reference_doctype=doc.doctype,
+					reference_name=doc.name,
+				)
 
 		return saved_attachments
 
@@ -657,10 +707,11 @@ class Email:
 class InboundMail(Email):
 	"""Class representation of incoming mail along with mail handlers."""
 
-	def __init__(self, content, email_account, uid=None, seen_status=None, append_to=None):
+	def __init__(self, content, email_account, uid=None, seen_status=None, append_to=None, imap_folder=None):
 		self.email_account = email_account
 		self.uid = uid or -1
 		self.append_to = append_to
+		self.imap_folder = imap_folder
 		self.seen_status = seen_status or 0
 		super().__init__(content)
 
@@ -728,7 +779,10 @@ class InboundMail(Email):
 
 		# save attachments
 		communication._attachments = self.save_attachments_in_doc(communication)
-		communication.content = sanitize_html(self.replace_inline_images(communication._attachments))
+		content = self.replace_inline_images(communication._attachments)
+		communication.content = (
+			sanitize_html(content) if self.content_type == "text/html" else escape_html(content)
+		)
 		communication.save()
 		return communication
 
@@ -840,8 +894,9 @@ class InboundMail(Email):
 			reference_doctype, reference_name = parent.reference_doctype, parent.reference_name
 			reference_document = self.get_doc(reference_doctype, reference_name, ignore_error=True)
 
-		if not reference_document and self.email_account.append_to:
-			reference_document = self.match_record_by_subject_and_sender(self.email_account.append_to)
+		append_to = self.append_to if self.email_account.use_imap else self.email_account.append_to
+		if not reference_document and append_to:
+			reference_document = self.match_record_by_subject_and_sender(append_to)
 
 		if not reference_document and self.is_reply_to_system_sent_mail():
 			reference_document = parent_communication
@@ -873,10 +928,18 @@ class InboundMail(Email):
 		"""
 		name = self.get_reference_name_from_subject()
 		email_fields = self.get_email_fields(doctype)
+		sender_is_system_user = bool(self.from_email and is_system_user(self.from_email))
+
+		if email_fields.sender_field and not sender_is_system_user:
+			name = frappe.db.get_value(doctype, {"name": name, email_fields.sender_field: self.from_email})
 
 		record = self.get_doc(doctype, name, ignore_error=True) if name else None
 
 		if not record:
+			# Subject matching is only possible if the doctype declares a subject_field.
+			if not email_fields.subject_field:
+				return None
+
 			subject = self.clean_subject(self.subject)
 			filters = {
 				email_fields.subject_field: ("like", f"%{subject}%"),
@@ -884,10 +947,10 @@ class InboundMail(Email):
 			}
 
 			# Sender check is not needed incase mail is from system user.
-			if not (len(subject) > 10 and is_system_user(self.from_email)):
+			if email_fields.sender_field and not (len(subject) > 10 and sender_is_system_user):
 				filters[email_fields.sender_field] = self.from_email
 
-			name = frappe.db.get_value(self.email_account.append_to, filters=filters)
+			name = frappe.db.get_value(doctype, filters=filters)
 			record = self.get_doc(doctype, name, ignore_error=True) if name else None
 		return record
 
@@ -910,12 +973,12 @@ class InboundMail(Email):
 
 		parent.flags.ignore_mandatory = True
 
-		try:
+		with savepoint(catch=frappe.DuplicateEntryError):
 			parent.insert(ignore_permissions=True)
 			return parent.name
-		except frappe.DuplicateEntryError:
-			# try and find matching parent
-			return frappe.db.get_value(doctype, {email_fields.sender_field: self.from_email})
+
+		# try and find matching parent
+		return frappe.db.get_value(doctype, {email_fields.sender_field: self.from_email})
 
 	@staticmethod
 	def get_doc(doctype, docname, ignore_error=False):
@@ -941,7 +1004,7 @@ class InboundMail(Email):
 	def clean_subject(subject):
 		"""Remove Prefixes like 'fw', FWD', 're' etc from subject."""
 		# Match strings like "fw:", "re	:" etc.
-		regex = r"(^\s*(fw|fwd|wg)[^:]*:|\s*(re|aw)[^:]*:\s*)*"
+		regex = r"^(\s*(fw|fwd|wg)\b[^:]*:)?(\s*(re|aw)\b[^:]*:\s*)*"
 		return frappe.as_unicode(strip(re.sub(regex, "", subject, count=0, flags=re.IGNORECASE)))
 
 	@staticmethod

@@ -24,14 +24,14 @@ frappe.ui.form.on("Workflow", {
 
 		let message = `
 		<div class="flex">
-			<div class="mr-3"><img style="border-radius: var(--border-radius-md)" width="600" src="/assets/frappe/images/workflow-builder.gif"></div>
+			<div class="mr-3"><img style="border-radius: var(--radius-md)" width="600" src="/assets/frappe/images/workflow-builder.gif"></div>
 			<div>
 				<p style="font-size: var(--text-xl)">${title}</p>
 				<p>${msg}</p>
 				<p class="mb-3">${note || ""}</p>
 				<div>
 					<a class="btn btn-primary btn-sm" href="${workflow_builder_url}">
-						${__("Workflow Builder")} ${frappe.utils.icon("right", "xs")}
+						${__("Workflow Builder")} ${frappe.utils.icon("chevron-right", "xs")}
 					</a>
 				</div>
 			</div>
@@ -111,14 +111,23 @@ frappe.ui.form.on("Workflow", {
 		frappe.model.with_doctype(doc.document_type, () => {
 			const meta = frappe.get_meta(doc.document_type);
 			const is_submittable = meta.is_submittable;
-			const fieldnames = meta.fields
-				.filter((field) => !frappe.model.no_value_type.includes(field.fieldtype))
-				.map((field) => field.fieldname);
+			const value_fields = meta.fields.filter(
+				(field) => !frappe.model.no_value_type.includes(field.fieldtype)
+			);
 
 			frm.fields_dict.states.grid.update_docfield_property(
 				"update_field",
 				"options",
-				[""].concat(fieldnames)
+				[""].concat(value_fields.map((field) => field.fieldname))
+			);
+
+			frm.fields_dict.conditions.grid.update_docfield_property(
+				"field",
+				"options",
+				value_fields.map((field) => ({
+					label: `${field.label} (${field.fieldname})`,
+					value: field.fieldname,
+				}))
 			);
 
 			frm.fields_dict.states.grid.update_docfield_property(

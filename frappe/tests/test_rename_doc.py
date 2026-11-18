@@ -10,7 +10,7 @@ from unittest.mock import patch
 import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.exceptions import DoesNotExistError
-from frappe.model.base_document import get_controller
+from frappe.model.document import get_controller
 from frappe.model.rename_doc import bulk_rename, update_document_title
 from frappe.modules.utils import get_doc_path
 from frappe.tests import IntegrationTestCase
@@ -35,6 +35,33 @@ def patch_db(endpoints: list[str] | None = None):
 		for x in patched_endpoints:
 			x.stop()
 		frappe.db.rollback(save_point=savepoint)
+
+
+class TestRenameSingleDocType(IntegrationTestCase):
+	def test_rename_single_document_is_rejected(self):
+		doctype = new_doctype("Test Single Rename Rejected", issingle=1).insert()
+
+		with self.assertRaisesRegex(frappe.ValidationError, "Single DocTypes cannot be renamed"):
+			frappe.rename_doc(doctype.name, doctype.name, f"{doctype.name} New", force=True)
+
+	def test_single_doctype_disables_allow_rename(self):
+		doctype = new_doctype("Test Single Rename Disabled", issingle=1, allow_rename=1).insert()
+
+		self.assertFalse(doctype.allow_rename)
+		self.assertFalse(frappe.db.get_value("DocType", doctype.name, "allow_rename"))
+
+	def test_rename_single_doctype(self):
+		old_name = "Test Single Rename Old"
+		new_name = "Test Single Rename New"
+		new_doctype(old_name, issingle=1).insert()
+		single = frappe.get_single(old_name)
+		single.some_fieldname = "some value"
+		single.save()
+
+		self.assertEqual(new_name, frappe.rename_doc("DocType", old_name, new_name, force=True))
+		self.assertEqual(frappe.db.get_single_value(new_name, "some_fieldname"), "some value")
+		self.assertEqual(frappe.db.get_single_value(new_name, "name"), new_name)
+		self.assertEqual(frappe.db.count("Singles", {"doctype": old_name}), 0)
 
 
 class TestRenameDoc(IntegrationTestCase):
@@ -199,6 +226,19 @@ class TestRenameDoc(IntegrationTestCase):
 		new_name = "ToDo"
 		self.assertEqual(new_name, frappe.rename_doc("Renamed Doc", old_name, new_name, force=True))
 
+	def test_rename_doctype_checks_route_conflict(self):
+		doctype = new_doctype().insert()
+		same_route = doctype.name.replace(" ", "-")
+		for name in (doctype.name, same_route):
+			self.addCleanup(frappe.db.sql_ddl, f"drop table if exists `tab{name}`")
+			self.addCleanup(frappe.delete_doc_if_exists, "DocType", name)
+
+		with self.set_user("test@example.com"):
+			self.assertRaises(
+				frappe.NameError, frappe.rename_doc, "DocType", doctype.name, "Permission Manager"
+			)
+			self.assertEqual(same_route, frappe.rename_doc("DocType", doctype.name, same_route))
+
 	def test_update_document_title_api(self):
 		test_doctype = "Module Def"
 		test_doc = frappe.get_doc(
@@ -244,6 +284,14 @@ class TestRenameDoc(IntegrationTestCase):
 				"frappe.utils.global_search.rebuild_for_doctype",
 				doctype=self.test_doctype,
 			)
+
+	def test_bulk_rename_accepts_native_merge_flag(self):
+		# 3rd column as a native bool exercises sbool(row[2]); False keeps it a simple rename
+		input_data = [[x, f"{x}-native", False] for x in self.available_documents]
+
+		with patch_db(["commit", "rollback"]), patch("frappe.enqueue"):
+			message_log = bulk_rename(self.test_doctype, input_data, via_console=False)
+			self.assertEqual(len(message_log), len(self.available_documents))
 
 	def test_doc_rename_method(self):
 		name = choice(self.available_documents)

@@ -36,12 +36,22 @@ global_cache_keys = (
 	"active_modules",
 	"assignment_rule",
 	"server_script_map",
-	"wkhtmltopdf_version",
 	"domain_restricted_doctypes",
 	"domain_restricted_pages",
+	# hash of per-module sidebar bases; `on_module_content_changed` busts single fields, this
+	# is the escape hatch for anything that changed a module's contents behind doc_events' back
+	"sidebar_computed_base",
+	# Which layers the dock holds. The document's own `on_update` and `on_trash` invalidate this
+	# on every ordinary write; it is listed here for writes that never reach a document, such as
+	# a bulk insert, a restore or an import. A stale entry only costs a lookup that finds nothing,
+	# but a missing one hides a layer someone saved, so `bench clear-cache` has to reach it. The
+	# sidebar's layers need no equivalent: they are read per request for the user asking and
+	# cached nowhere.
+	"dock_layers",
 	"information_schema:counts",
 	"db_tables",
 	"server_script_autocompletion_items",
+	"flow_enabled",
 	*doctype_map_keys,
 )
 
@@ -60,6 +70,7 @@ user_cache_keys = (
 	"user_perm_can_read",
 	"has_role:Page",
 	"has_role:Report",
+	"allowed_dashboards",
 	"desk_sidebar_items",
 	"contacts",
 )
@@ -67,8 +78,7 @@ user_cache_keys = (
 doctype_cache_keys = (
 	"last_modified",
 	"linked_doctypes",
-	"workflow",
-	"data_import_column_header_map",
+	"workflows",
 )
 
 wildcard_keys = (
@@ -121,6 +131,11 @@ def clear_defaults_cache(user=None):
 def clear_doctype_cache(doctype=None):
 	clear_controller_cache(doctype)
 	frappe.client_cache.erase_persistent_caches(doctype=doctype)
+
+	if doctype:
+		frappe.local.valid_columns.pop(doctype, None)
+	else:
+		frappe.local.valid_columns = {}
 
 	_clear_doctype_cache_from_redis(doctype)
 	if hasattr(frappe.db, "after_commit"):
@@ -222,7 +237,12 @@ def build_table_count_cache():
 		table_rows = frappe.qb.Field("table_rows").as_("count")
 		information_schema = frappe.qb.Schema("information_schema")
 
-		data = (frappe.qb.from_(information_schema.tables).select(table_name, table_rows)).run(as_dict=True)
+		query = frappe.qb.from_(information_schema.tables).select(table_name, table_rows)
+		if frappe.db.db_type == "postgres":
+			query = query.where(frappe.qb.Field("schemaname") == frappe.db.db_schema)
+		else:
+			query = query.where(information_schema.tables.table_schema == frappe.db.cur_db_name)
+		data = query.run(as_dict=True)
 		counts = {d.get("name").replace("tab", "", 1): d.get("count", None) for d in data}
 		frappe.cache.set_value("information_schema:counts", counts)
 	else:
@@ -293,9 +313,11 @@ def clear_cache(user: str | None = None, doctype: str | None = None):
 		for key in frappe.get_hooks("persistent_cache_keys"):
 			keys_to_delete.difference_update(frappe.cache.get_keys(key))
 		frappe.cache.delete_value(list(keys_to_delete), make_keys=False)
+		frappe.cache.delete_value(bench_cache_keys, shared=True)
 
 		reset_metadata_version()
 		frappe.local.cache = {}
+		frappe.local.valid_columns = {}
 		frappe.local.new_doc_templates = {}
 
 		for fn in frappe.get_hooks("clear_cache"):

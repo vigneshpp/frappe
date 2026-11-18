@@ -18,6 +18,7 @@ from contextlib import contextmanager, suppress
 from csv import reader, writer
 
 import frappe
+from frappe.app_state import filter_out_disabled_doctypes
 from frappe.query_builder import DocType, Field
 from frappe.utils import cstr, get_bench_path, get_build_version, is_html, strip, strip_html_tags, unique
 from frappe.utils.caching import http_cache
@@ -138,6 +139,9 @@ def get_messages_for_boot():
 @http_cache(max_age=31536000)
 def get_boot_translations(lang: str | None = None) -> dict[str, str]:
 	"""Return all translations for the current user's language."""
+	if lang and lang not in get_all_languages():
+		lang = None
+
 	return get_all_translations(lang or frappe.local.lang)
 
 
@@ -381,7 +385,6 @@ def get_messages_from_doctype(name):
 
 
 def get_messages_from_workflow(doctype=None, app_name=None):
-	assert doctype or app_name, "doctype or app_name should be provided"
 	from frappe.gettext.extractors.utils import is_translatable
 
 	# translations for Workflows
@@ -641,23 +644,25 @@ def get_messages_from_file(path: str) -> list[tuple[str, str, str | None, int]]:
 
 def extract_messages_from_python_code(code: str) -> list[tuple[int, str, str | None]]:
 	"""Extracts translatable strings from Python code using babel."""
-	from babel.messages.extract import extract_python
+	from frappe.gettext.extractors.python import extract
 
 	messages = []
 
-	for message in extract_python(
+	for message in extract(
 		io.BytesIO(code.encode()),
-		keywords=["_", "_lt"],
+		keywords=["_", "_lt", "N_"],
 		comment_tags=(),
 		options={},
 	):
-		lineno, _func, args, _comments = message
+		lineno, func, args, _comments = message
 
-		if not args or not args[0]:
+		if func == "pgettext":
+			context, source_text = args
+		else:
+			context, source_text = None, args[0] if isinstance(args, tuple) else args
+
+		if not source_text:
 			continue
-
-		source_text = args[0] if isinstance(args, tuple) else args
-		context = args[1] if len(args) == 2 else None
 
 		messages.append((lineno, source_text, context))
 
@@ -910,11 +915,11 @@ def deduplicate_messages(messages):
 
 
 @frappe.whitelist()
-def update_translations_for_source(source: str | None = None, translation_dict: str | None = None):
+def update_translations_for_source(source: str | None = None, translation_dict: str | dict | None = None):
 	if not (source and translation_dict):
 		return
 
-	translation_dict = json.loads(translation_dict)
+	translation_dict = frappe.parse_json(translation_dict)
 
 	if is_html(source):
 		source = strip_html_tags(source)
@@ -970,7 +975,7 @@ def get_translated_doctypes():
 	custom_dts = frappe.get_all(
 		"Property Setter", {"property": "translated_doctype", "value": "1"}, pluck="doc_type"
 	)
-	return unique(dts + custom_dts)
+	return filter_out_disabled_doctypes(unique(dts + custom_dts))
 
 
 @contextmanager
@@ -984,6 +989,13 @@ def print_language(language: str):
 	    html = frappe.get_print(...)
 	```
 	"""
+	# a background job resolves its user's language on the first translation, which
+	# would undo the requested one mid-print — settle it before switching
+	job = getattr(frappe.local, "job", None)
+	if job is not None and not job.lang_resolved:
+		frappe.set_user_lang(job.user)
+		job.lang_resolved = True
+
 	if not language or language == frappe.local.lang:
 		# do nothing
 		yield
@@ -991,17 +1003,20 @@ def print_language(language: str):
 
 	# remember original values
 	_lang = frappe.local.lang
-	_jenv = frappe.local.jenv
+	_jenv_restricted = getattr(frappe.local, "jenv_restricted", None)
+	_jenv_unrestricted = getattr(frappe.local, "jenv_unrestricted", None)
 
 	# set language, empty any existing lang_full_dict and jenv
 	frappe.local.lang = language
-	frappe.local.jenv = None
+	frappe.local.jenv_restricted = None
+	frappe.local.jenv_unrestricted = None
 
-	yield
-
-	# restore original values
-	frappe.local.lang = _lang
-	frappe.local.jenv = _jenv
+	try:
+		yield
+	finally:
+		frappe.local.lang = _lang
+		frappe.local.jenv_restricted = _jenv_restricted
+		frappe.local.jenv_unrestricted = _jenv_unrestricted
 
 
 # Backward compatibility

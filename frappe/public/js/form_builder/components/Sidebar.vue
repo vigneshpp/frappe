@@ -40,13 +40,22 @@ function resize(e) {
 	<div class="sidebar-container" :style="{ width: `${sidebar_width}px` }">
 		<FieldProperties v-if="store.form.selected_field" />
 		<div class="default-state" v-else>
-			<div class="actions" v-if="store.form.layout.tabs.length == 1 && !store.read_only">
+			<!-- only a DocType needs this: a Web Form's page strip is on screen from page 1,
+			     and carries its own Add Page button -->
+			<div
+				class="actions"
+				v-if="
+					!store.is_web_form &&
+					store.form.layout.tabs.length == 1 &&
+					store.can_edit_layout
+				"
+			>
 				<button
 					class="new-tab-btn btn btn-default btn-xs"
-					:title="__('Add new tab')"
-					@click="store.add_new_tab"
+					:title="store.tab_text.add_title"
+					@click="store.add_new_tab()"
 				>
-					{{ __("Add tab") }}
+					{{ store.tab_text.add }}
 				</button>
 			</div>
 			<div class="empty-state">
@@ -81,8 +90,8 @@ function resize(e) {
 	align-items: center;
 	padding: var(--padding-sm);
 	background-color: var(--fg-color);
-	border-top-left-radius: var(--border-radius);
-	border-top-right-radius: var(--border-radius);
+	border-top-left-radius: var(--radius);
+	border-top-right-radius: var(--radius);
 
 	.tab {
 		display: flex;
@@ -91,7 +100,7 @@ function resize(e) {
 		width: 100%;
 		height: 32px;
 		background-color: var(--bg-gray);
-		border-radius: var(--border-radius-md);
+		border-radius: var(--radius-md);
 		border: 1px solid var(--dark-border-color);
 		cursor: pointer;
 

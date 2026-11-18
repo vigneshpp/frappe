@@ -10,13 +10,14 @@ from typing import Any, ClassVar, Literal
 
 import xlrd
 import xlsxwriter
-from openpyxl import load_workbook
 from xlsxwriter.format import Format
 
 import frappe
 from frappe import _
 from frappe.core.utils import html2text
 from frappe.utils import cint
+from frappe.utils.csvutils import FORMULA_TRIGGER_CHARS
+from frappe.utils.data import get_currency_precision
 from frappe.utils.html_utils import unescape_html
 
 ILLEGAL_CHARACTERS_RE = re.compile(
@@ -273,7 +274,7 @@ class XLSXStyleBuilder:
 				continue
 
 			if indent := row.get(field):
-				style_cell(row_idx, col_idx, register_indent_style(indent))
+				style_cell(row_idx, col_idx, register_indent_style(cint(indent)))
 
 		return self
 
@@ -366,7 +367,7 @@ class XLSXStyleBuilder:
 
 	@staticmethod
 	def _get_currency_symbol_info(currency: str | None) -> tuple[str, bool]:
-		if not currency or frappe.db.get_default("hide_currency_symbol") == "Yes":
+		if not currency or frappe.db.get_default("hide_currency_symbol") in ("1", "Yes"):
 			return "", False
 
 		symbol, on_right = frappe.db.get_value("Currency", currency, ["symbol", "symbol_on_right"])
@@ -403,7 +404,8 @@ class XLSXStyleBuilder:
 		precision = number_format.precision
 
 		if fieldtype == "Currency":
-			precision = cint(frappe.db.get_default("currency_precision")) or precision
+			currency_precision = get_currency_precision()
+			precision = currency_precision if currency_precision is not None else precision
 			format_str = XLSXStyleBuilder._build_number_format(thousands_sep, precision)
 			currency_symbol, symbol_on_right = XLSXStyleBuilder._get_currency_symbol_info(currency)
 			return XLSXStyleBuilder._build_currency_format(format_str, currency_symbol, symbol_on_right)
@@ -547,6 +549,15 @@ def make_xlsx(
 	def get_format(style_ids: tuple[int, ...]) -> Format:
 		return wb.add_format(resolve_style_ids(style_ids))
 
+	# time / duration values need an explicit number format, otherwise Excel shows raw day fractions
+	excel_time_format = XLSXStyleBuilder.get_time_format()
+
+	@functools.cache
+	def get_time_cell_format(style_ids: tuple[int, ...], num_format: str) -> Format:
+		style = dict(resolve_style_ids(style_ids))
+		style.setdefault("num_format", num_format)
+		return wb.add_format(style)
+
 	# set column widths
 	for i, column_width in enumerate(column_widths):
 		if column_width:
@@ -584,11 +595,14 @@ def make_xlsx(
 	illegal_chars_sub = ILLEGAL_CHARACTERS_RE.sub
 
 	write = ws.write
+	write_string = ws.write_string
 	has_cell_formats = bool(cell_formats)
 	get_cell_format = cell_formats.get
 
 	for row_idx, row in enumerate(data):
 		for col_idx, value in enumerate(row):
+			is_formula_like = False
+
 			if isinstance(value, str):
 				if handle_html_content:
 					value = handle_html(value)
@@ -596,8 +610,23 @@ def make_xlsx(
 				if illegal_chars_search(value):
 					value = illegal_chars_sub("", value)
 
+				is_formula_like = value.startswith(FORMULA_TRIGGER_CHARS)
+
 			cell_format = get_cell_format((row_idx, col_idx)) if has_cell_formats else None
-			write(row_idx, col_idx, value, cell_format)
+
+			if isinstance(value, datetime.time | datetime.timedelta):
+				cell_format = get_time_cell_format(
+					col_style_ids.get(col_idx, ())
+					+ row_style_ids.get(row_idx, ())
+					+ cell_style_ids.get((row_idx, col_idx), ()),
+					"[h]:mm:ss" if isinstance(value, datetime.timedelta) else excel_time_format,
+				)
+
+			if is_formula_like:
+				# force literal text so the cell isn't parsed as a formula
+				write_string(row_idx, col_idx, value, cell_format)
+			else:
+				write(row_idx, col_idx, value, cell_format)
 
 	if not created_wb:
 		return
@@ -628,10 +657,11 @@ def handle_html(data: str) -> str:
 	return value.replace("  \n", ", ").replace("\n", " ").replace("# ", ", ")
 
 
-def read_xlsx_file_from_attached_file(file_url=None, fcontent=None, filepath=None):
+def read_xlsx_file_from_attached_file(file_url=None, fcontent=None, filepath=None, *, read_only=False):
 	if file_url:
 		_file = frappe.get_doc("File", {"file_url": file_url})
-		filename = _file.get_full_path()
+		# read through the File, so a file on another storage driver works too
+		filename = BytesIO(_file.get_content())
 	elif fcontent:
 		filename = BytesIO(fcontent)
 	elif filepath:
@@ -639,11 +669,15 @@ def read_xlsx_file_from_attached_file(file_url=None, fcontent=None, filepath=Non
 	else:
 		return
 
+	from openpyxl import load_workbook
+
 	rows = []
-	wb1 = load_workbook(filename=filename, data_only=True)
+	wb1 = load_workbook(filename=filename, data_only=True, read_only=read_only)
 	ws1 = wb1.active
 	for row in ws1.iter_rows():
 		rows.append([cell.value for cell in row])
+	if read_only:
+		wb1.close()
 	return rows
 
 

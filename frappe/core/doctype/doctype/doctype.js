@@ -50,6 +50,7 @@ frappe.ui.form.on("DocType", {
 			frm.toggle_enable("custom", 0);
 			frm.toggle_enable("is_virtual", 0);
 			frm.toggle_enable("beta", 0);
+			frm.toggle_enable("deprecated", 0);
 		}
 
 		if (!frm.is_new() && !frm.doc.istable) {
@@ -179,4 +180,4 @@ function render_form_builder(frm) {
 	}
 }
 
-extend_cscript(cur_frm.cscript, new frappe.model.DocTypeController({ frm: cur_frm }));
+frappe.ui.form.set_controller("DocType", frappe.model.DocTypeController);

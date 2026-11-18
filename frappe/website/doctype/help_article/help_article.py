@@ -10,6 +10,8 @@ from frappe.website.website_generator import WebsiteGenerator
 
 
 class HelpArticle(WebsiteGenerator):
+	_DOCTYPE_NAME = "Help Article"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -102,7 +104,7 @@ def get_sidebar_items():
 	def _get():
 		return frappe.db.sql(
 			"""select
-				concat(category_name, " (", help_articles, ")") as title,
+				concat(category_name, ' (', help_articles, ')') as title,
 				concat('/', route) as route
 			from
 				`tabHelp Category`

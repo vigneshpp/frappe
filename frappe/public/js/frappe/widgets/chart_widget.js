@@ -4,6 +4,23 @@ frappe.provide("frappe.widget.utils");
 frappe.provide("frappe.dashboards");
 frappe.provide("frappe.dashboards.chart_sources");
 
+// An empty line chart draws this behind its message, blurred, so the card still reads as a chart.
+// A line is a thin stroke and stays out of the text's way, which bars and slices would not.
+// None of it is real data.
+const EMPTY_SAMPLE_LINE = {
+	labels: Array(6).fill(""),
+	datasets: [{ values: [30, 45, 40, 60, 55, 75] }],
+};
+
+const EMPTY_STATE_ICONS = {
+	Line: "chart-line",
+	Bar: "chart-column",
+	Pie: "chart-pie",
+	Donut: "chart-pie",
+	Percentage: "chart-bar-stacked",
+	Heatmap: "grid-3x3",
+};
+
 export default class ChartWidget extends Widget {
 	constructor(opts) {
 		opts.shadow = true;
@@ -22,7 +39,6 @@ export default class ChartWidget extends Widget {
 	}
 
 	refresh() {
-		delete this.dashboard_chart;
 		this.set_body();
 		this.make_chart();
 	}
@@ -40,9 +56,13 @@ export default class ChartWidget extends Widget {
 	}
 
 	setup_container() {
+		// The chart lives on a node inside the body, so it goes before the body does.
+		this.release_chart();
 		this.body.empty();
 
-		if (this.chart_doc.type == "Heatmap") {
+		// `type` says how desk draws a chart. An app draws an island, so a
+		// heatmap's forced full width and legend do not apply to it.
+		if (!this.island && this.chart_doc.type == "Heatmap") {
 			this.setup_heatmap_container();
 		}
 
@@ -53,15 +73,11 @@ export default class ChartWidget extends Widget {
 		);
 		this.loading.appendTo(this.body);
 
-		this.empty = $(
-			`<div class="chart-loading-state text-extra-muted" style="height: ${
-				this.height
-			}px;">${__("No Data")}</div>`
-		);
+		this.empty = $(`<div class="chart-empty-state" style="height: ${this.height}px;"></div>`);
 		this.empty.hide().appendTo(this.body);
 
 		this.error_state = $(
-			`<div class="chart-loading-state text-danger" style="height: ${this.height}px;"></div>`
+			`<div class="chart-error-state" style="height: ${this.height}px;"></div>`
 		);
 		this.error_state.hide().appendTo(this.body);
 
@@ -73,7 +89,11 @@ export default class ChartWidget extends Widget {
 	}
 
 	setup_heatmap_container() {
-		this.widget.addClass("heatmap-chart");
+		// `heatmap-chart` sizes and offsets the widget for frappe-charts' heatmap
+		this.widget.toggleClass(
+			"heatmap-chart",
+			frappe.ui.chart.is_classic({ type: "heatmap", data: {} })
+		);
 		this.widget.removeClass("full-width").addClass("full-width");
 		this.width = "Full";
 	}
@@ -94,6 +114,10 @@ export default class ChartWidget extends Widget {
 
 	make_chart() {
 		this.get_settings().then(() => {
+			// the chart's settings can arrive after the dashboard removed it
+			if (this.destroyed) return;
+			if (this.island) return this.make_island();
+
 			if (!this.settings) {
 				this.deleted = true;
 				this.widget.remove();
@@ -118,6 +142,120 @@ export default class ChartWidget extends Widget {
 				() => this.fetch_and_update_chart(),
 			]);
 		});
+	}
+
+	/**
+	 * Draws a chart an app owns. Desk keeps the frame, which is the title, the
+	 * actions and the error state. The island owns the body alone, so a workspace
+	 * still reads as a workspace.
+	 *
+	 * Nothing below this fetches chart data. Desk does not know what the island
+	 * draws, and the props came with the document.
+	 */
+	make_island() {
+		this.setup_container();
+
+		if (!this.in_customize_mode) {
+			this.action_area.empty();
+		}
+		this.prepare_island_actions([]);
+
+		// A definite height, not a floor. An island fills the element it is given.
+		// A `height: 100%` inside it resolves against auto to nothing, so a floor
+		// puts the island's header over an empty body. Desk's own chart takes the
+		// same number as a fixed height.
+		this.chart_wrapper.css("height", `${this.height}px`);
+
+		this.island_handle = frappe.ui.mount_island(this.island.name, this.chart_wrapper, {
+			...this.island.props,
+			// The island reports its actions as it loads them, and again whenever
+			// they change. It reports no title, because desk heads the widget with
+			// the chart document's own name.
+			onActions: (actions) => this.prepare_island_actions(actions),
+		});
+
+		this.island_handle.ready.then(
+			() => this.loading.hide(),
+			(error) => this.show_island_error(error)
+		);
+	}
+
+	// the error names a build step: console always, screen only in developer mode
+	show_island_error(error) {
+		console.error(`could not mount the "${this.island.name}" island`, error);
+
+		this.chart_wrapper.hide();
+		this.loading.hide();
+		this.empty.hide();
+		this.error_state.empty().append(
+			frappe.ui.empty_state({
+				icon: "package",
+				title: __("This chart has not been built"),
+				description: frappe.boot.developer_mode
+					? error.message
+					: __("Its assets are missing. Build the app that ships it."),
+			})
+		);
+		this.error_state.show();
+	}
+
+	/**
+	 * The island's own actions, then Edit. Edit is desk's, because the document
+	 * behind the chart is desk's. Every `actions` report calls this again, so the
+	 * menu says what the island says now.
+	 *
+	 * None of desk's other chart actions apply, because they drive a fetch desk
+	 * does not make. Reset Chart clears settings the island never reads. Export
+	 * writes data desk never fetched. The filters and the time interval reach
+	 * nothing. The island reports Refresh itself, if a reload means anything to it.
+	 *
+	 * An action carries either an `onClick` or an `href`. An `href` leads out of
+	 * the app, and desk opens it in a new tab.
+	 *
+	 * @param {{ label: string, icon?: string, onClick?: Function, href?: string }[]} actions
+	 */
+	prepare_island_actions(actions) {
+		// Customize mode owns the action area and puts its own controls there.
+		if (this.in_customize_mode) return;
+
+		// `set_chart_actions` appends a menu. A rebuild replaces the one it made.
+		this.chart_actions?.remove();
+
+		this.set_chart_actions([
+			...(actions || []).map((action, i) => ({
+				label: action.label,
+				action: `island-action-${i}`,
+				handler: action.href
+					? () => window.open(action.href, "_blank")
+					: () => action.onClick(),
+			})),
+			{
+				label: __("Edit"),
+				action: "action-edit",
+				handler: () => {
+					frappe.set_route("Form", "Dashboard Chart", this.chart_doc.name);
+				},
+			},
+		]);
+	}
+
+	/** Releases the island the body holds, if any. Safe to call at any time. */
+	unmount_island() {
+		this.island_handle?.unmount();
+		this.island_handle = null;
+	}
+
+	destroy() {
+		this.destroyed = true;
+		this.release_chart();
+	}
+
+	release_chart() {
+		this.unmount_island();
+		this.dashboard_chart?.destroy();
+		delete this.dashboard_chart;
+		this.empty_sample?.destroy();
+		delete this.empty_sample;
 	}
 
 	render_time_series_filters() {
@@ -296,7 +434,6 @@ export default class ChartWidget extends Widget {
 				label: __("Refresh"),
 				action: "action-refresh",
 				handler: () => {
-					delete this.dashboard_chart;
 					this.make_chart();
 				},
 			},
@@ -312,7 +449,6 @@ export default class ChartWidget extends Widget {
 				action: "action-reset",
 				handler: () => {
 					this.reset_chart();
-					delete this.dashboard_chart;
 					this.make_chart();
 				},
 			},
@@ -440,14 +576,11 @@ export default class ChartWidget extends Widget {
 		let dialog = new frappe.ui.Dialog({
 			title: __("Set Filters for {0}", [__(this.chart_doc.chart_name)]),
 			fields: fields,
-			primary_action: function () {
-				let values = this.get_values();
-				if (values) {
-					this.hide();
-					me.filters = values;
-					me.save_chart_config_for_user({ filters: me.filters });
-					me.fetch_and_update_chart();
-				}
+			primary_action: function (values) {
+				this.hide();
+				me.filters = values;
+				me.save_chart_config_for_user({ filters: me.filters });
+				me.fetch_and_update_chart();
 			},
 			primary_action_label: __("Set"),
 		});
@@ -519,9 +652,9 @@ export default class ChartWidget extends Widget {
 				${actions
 					.map(
 						(action) =>
-							`<li><a class="dropdown-item" data-action="${action.action}">${__(
-								action.label
-							)}</a></li>`
+							`<li><a class="dropdown-item" data-action="${
+								action.action
+							}">${frappe.utils.escape_html(__(action.label))}</a></li>`
 					)
 					.join("")}
 			</ul>
@@ -531,7 +664,9 @@ export default class ChartWidget extends Widget {
 
 		this.chart_actions.find("a[data-action]").each((i, o) => {
 			const action = o.dataset.action;
-			$(o).click(actions.find((a) => a.action === action));
+			// Bind the handler, not the action object. jQuery binds whatever it is
+			// given and throws on click when that is not a function.
+			$(o).click(actions.find((a) => a.action === action).handler);
 		});
 		this.chart_actions.appendTo(this.action_area);
 	}
@@ -559,16 +694,35 @@ export default class ChartWidget extends Widget {
 		}
 		return frappe.xcall(method, args, undefined, {
 			silent: true,
-			error: (err) => {
-				const message = JSON.parse(JSON.parse(err._server_messages)[0])?.message;
-				this.chart_wrapper.hide();
-				this.loading.hide();
-				this.$summary && this.$summary.hide();
-				this.empty.hide();
-				this.error_state.text(message);
-				this.error_state.show();
-			},
+			error: (err) => this.show_error(err),
 		});
+	}
+
+	// Mostly a chart that is not set up yet, like Bank Balance before an account is chosen, so it
+	// reads as a warning with the server's reason rather than a failure.
+	show_error(err) {
+		let message;
+		try {
+			message = JSON.parse(JSON.parse(err._server_messages)[0]).message;
+		} catch {
+			// a network failure carries no server message
+		}
+
+		this.chart_wrapper.hide();
+		this.loading.hide();
+		this.$summary && this.$summary.hide();
+		this.empty.hide();
+		this.error_state
+			.empty()
+			.append(
+				frappe.ui.alert({
+					theme: "yellow",
+					title: message
+						? frappe.utils.html2text(message)
+						: __("This chart couldn't load"),
+				})
+			)
+			.show();
 	}
 
 	async get_source_doctype() {
@@ -583,28 +737,36 @@ export default class ChartWidget extends Widget {
 	}
 
 	async render() {
+		if (this.destroyed) return;
 		let setup_dashboard_chart = () => {
-			const chart_args = this.get_chart_args();
+			if (this.destroyed) return;
+			const chart_args = frappe.ui.chart.with_classic_palette(
+				frappe.utils.get_chart_args(this.get_chart_args())
+			);
 
 			const is_circular_chart = ["Pie", "Donut", "Percentage"].includes(this.chart_doc.type);
 
 			if (!this.dashboard_chart) {
-				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+				this.dashboard_chart = frappe.ui.chart(this.chart_wrapper, chart_args);
 			} else if (is_circular_chart) {
+				this.dashboard_chart.destroy();
 				this.chart_wrapper.empty();
-				delete this.dashboard_chart;
-				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+				this.dashboard_chart = frappe.ui.chart(this.chart_wrapper, chart_args);
 			} else {
 				this.dashboard_chart.update(this.data);
 			}
+
+			if (this.chart_doc.type == "Heatmap" && frappe.ui.chart.is_classic(chart_args)) {
+				this.render_heatmap_legend();
+			}
 		};
 
-		if (!this.data || !this.data.labels || !Object.keys(this.data).length) {
+		if (!this.has_data()) {
 			this.chart_wrapper.hide();
 			this.loading.hide();
 			this.$summary && this.$summary.hide();
-			this.empty.show();
 			this.error_state.hide();
+			this.show_empty_state();
 		} else {
 			this.loading.hide();
 			this.empty.hide();
@@ -619,8 +781,55 @@ export default class ChartWidget extends Widget {
 			}
 
 			this.width == "Full" && this.summary && this.set_summary();
-			this.chart_doc.type == "Heatmap" && this.render_heatmap_legend();
 		}
+	}
+
+	has_data() {
+		if (!this.data || !this.data.labels || !Object.keys(this.data).length) return false;
+		if (this.chart_doc.type == "Heatmap") return true;
+		// a chart over a period with nothing in it comes back as labels with zeroes, which draws
+		// bare axes rather than an empty chart
+		return (this.data.datasets || []).some((dataset) =>
+			(dataset.values || []).some((value) => flt(value))
+		);
+	}
+
+	// Says what the chart will show once there is something to show, so a dashboard of empty
+	// charts reads as a list of what is coming rather than "No data yet" over and over.
+	show_empty_state() {
+		const message = this.chart_doc.empty_state_message;
+		this.empty_sample?.destroy();
+		delete this.empty_sample;
+		// shown before the sample is drawn, which sizes itself to the space it is given
+		this.empty.empty().show();
+
+		const sample =
+			this.chart_doc.type == "Line" &&
+			frappe.utils.get_chart_args({
+				type: "line",
+				colors: this.get_chart_colors(),
+				height: this.height,
+				animate: 0,
+				lineOptions: { regionFill: 1, hideDots: 1, spline: 1 },
+				data: EMPTY_SAMPLE_LINE,
+			});
+		// The new charts draw their axes in a shadow root, which the CSS that strips the sample
+		// to its line cannot reach.
+		if (sample && frappe.ui.chart.is_classic(sample)) {
+			const $sample = $(`<div class="chart-empty-sample" aria-hidden="true"></div>`);
+			$sample.appendTo(this.empty);
+			this.empty_sample = frappe.ui.chart(
+				$sample,
+				frappe.ui.chart.with_classic_palette(sample)
+			);
+		}
+
+		this.empty.append(
+			frappe.ui.empty_state({
+				icon: EMPTY_STATE_ICONS[this.chart_doc.type] || "chart-column",
+				description: message ? __(message) : __("No data yet"),
+			})
+		);
 	}
 
 	get_chart_args() {
@@ -643,7 +852,7 @@ export default class ChartWidget extends Widget {
 			colors: colors,
 			height: this.height,
 			maxSlices: this.chart_doc.number_of_groups || max_slices,
-			truncateLegends: 0,
+			truncateLegends: 1,
 			axisOptions: {
 				xIsSeries: this.chart_doc.timeseries,
 				shortenYAxisNumbers: 1,
@@ -671,10 +880,12 @@ export default class ChartWidget extends Widget {
 		}
 
 		if (this.chart_doc.currency) {
+			if (!this.counts_documents()) chart_args.currency = this.chart_doc.currency;
 			chart_args.tooltipOptions = {
 				formatTooltipY: (value) => format_currency(value, this.chart_doc.currency),
 			};
 		} else {
+			Object.assign(chart_args, { fieldtype, options });
 			chart_args.tooltipOptions = {
 				formatTooltipY: (value) =>
 					frappe.format(
@@ -691,13 +902,14 @@ export default class ChartWidget extends Widget {
 					this.chart_settings.heatmap_year ||
 					this.chart_doc.heatmap_year
 			);
-			chart_args.data.start = new Date(`${heatmap_year}-01-01`);
-			chart_args.data.end = new Date(`${heatmap_year + 1}-01-01`);
+			chart_args.data.start = new Date(heatmap_year, 0, 1);
+			chart_args.data.end = new Date(heatmap_year, 11, 31);
 		}
 		if (this.chart_doc.show_values_over_chart) chart_args.valuesOverPoints = true;
 		let set_options = (options) => {
 			let custom_options = JSON.parse(options);
 			for (let key in custom_options) {
+				if (key === "__proto__") continue;
 				if (
 					typeof chart_args[key] === "object" &&
 					typeof custom_options[key] === "object"
@@ -720,19 +932,25 @@ export default class ChartWidget extends Widget {
 		return chart_args;
 	}
 
+	// A count is never an amount, whatever currency the chart is set to.
+	counts_documents() {
+		const { chart_type, group_by_type } = this.chart_doc;
+		return chart_type == "Count" || (chart_type == "Group By" && group_by_type == "Count");
+	}
+
+	// One colour per series. A series without its own takes Espresso's colour for its place, and a
+	// chart that names none returns nothing, so the chart's own palette applies.
 	get_chart_colors() {
 		let colors = [];
 		if (this.chart_doc.y_axis.length) {
-			this.chart_doc.y_axis.map((field) => {
-				colors.push(field.color);
-			});
+			colors = this.chart_doc.y_axis.map((field) => field.color);
 		} else if (["Line", "Bar"].includes(this.chart_doc.type)) {
-			colors = [this.chart_doc.color || []];
-		} else if (this.chart_doc.type == "Heatmap") {
-			colors = [];
+			colors = [this.chart_doc.color];
 		}
+		if (!colors.some(Boolean)) return [];
 
-		return colors;
+		const palette = frappe.utils.get_chart_palette();
+		return colors.map((color, i) => color || palette[i % palette.length]);
 	}
 
 	render_heatmap_legend() {
@@ -840,6 +1058,13 @@ export default class ChartWidget extends Widget {
 		return frappe.model.with_doc("Dashboard Chart", this.chart_name).then((chart_doc) => {
 			if (chart_doc) {
 				this.chart_doc = chart_doc;
+
+				// An app draws this chart. When no app does, the key is absent, and
+				// desk's own renderer below runs. Read on every call, because the
+				// document may have changed.
+				this.island = chart_doc.__onload?.island;
+				if (this.island) return Promise.resolve();
+
 				if (this.chart_doc.chart_type == "Custom") {
 					// custom source
 					if (frappe.dashboards.chart_sources[this.chart_doc.source]) {

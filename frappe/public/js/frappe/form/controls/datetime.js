@@ -3,25 +3,31 @@ frappe.ui.form.ControlDatetime = class ControlDatetime extends frappe.ui.form.Co
 		if (this.timepicker_only) return;
 		if (!this.datepicker) return;
 		if (!value) {
-			this.datepicker.clear();
+			this.clear_datepicker();
+			this.datepicker.setViewDate(this.get_now_date());
 			return;
 		} else if (value.toLowerCase() === "today") {
 			value = this.get_now_date();
 		} else if (value.toLowerCase() === "now") {
 			value = frappe.datetime.now_datetime();
 		}
-		const raw_value = value;
-		let should_refresh = this.last_value && this.last_value !== value;
 		value = this.format_for_input(value);
 		this.$input && this.$input.val(value);
-		if (should_refresh) {
-			this.datepicker.selectDate(frappe.datetime.user_to_obj(value));
-		} else if (value && !this.datepicker.selectedDates.length) {
-			const date_obj = frappe.datetime.str_to_obj(raw_value);
-			this.datepicker.selectedDates = [date_obj];
-			this.datepicker.viewDate = date_obj;
-			this.datepicker.lastSelectedDate = date_obj;
+		if (value) {
+			this.sync_datepicker_state(frappe.datetime.user_to_obj(value));
 		}
+	}
+
+	sync_datepicker_state(date) {
+		const selected_date = this.datepicker.selectedDates[0];
+		if (selected_date && selected_date.getTime() === date.getTime()) return;
+		this.select_date_silently(date, { updateTime: true });
+		this.datepicker.setViewDate(date);
+	}
+
+	set_datepicker() {
+		super.set_datepicker();
+		frappe.ui.form.add_seconds_slider(this.datepicker);
 	}
 
 	get_start_date() {
@@ -38,7 +44,16 @@ frappe.ui.form.ControlDatetime = class ControlDatetime extends frappe.ui.form.Co
 			sysdefaults && sysdefaults.time_format ? sysdefaults.time_format : "HH:mm:ss";
 		$.extend(this.datepicker_options, {
 			timepicker: true,
-			timeFormat: time_format.toLowerCase().replace("mm", "ii"),
+			timeFormat: time_format.replace(":ss", ""),
+			dateFormat: (date) =>
+				frappe.datetime.obj_to_user(date) + " " + moment(date).format(time_format),
+			onBeforeSelect: ({ date, datepicker }) => {
+				const last = datepicker.lastSelectedDate;
+				if (last && date.getTime() === moment(date).startOf("day").valueOf()) {
+					date.setSeconds(last.getSeconds());
+				}
+				return true;
+			},
 		});
 	}
 	get_now_date() {
@@ -63,7 +78,9 @@ frappe.ui.form.ControlDatetime = class ControlDatetime extends frappe.ui.form.Co
 		return frappe.datetime.str_to_user(value, false);
 	}
 	set_description() {
-		const description = this.df.description;
+		const description = this.df.description
+			? __(this.df.description, null, this.df.parent)
+			: this.df.description;
 		const time_zone = this.get_user_time_zone();
 
 		if (!this.df.hide_timezone) {
@@ -73,7 +90,7 @@ frappe.ui.form.ControlDatetime = class ControlDatetime extends frappe.ui.form.Co
 			if (!description) {
 				this.df.description = time_zone;
 			} else if (!description.includes(time_zone)) {
-				this.df.description += "<br>" + time_zone;
+				this.df.description = description + "<br>" + time_zone;
 			}
 		}
 		super.set_description();
@@ -81,17 +98,6 @@ frappe.ui.form.ControlDatetime = class ControlDatetime extends frappe.ui.form.Co
 	get_user_time_zone() {
 		return frappe.boot.time_zone ? frappe.boot.time_zone.user : frappe.sys_defaults.time_zone;
 	}
-	set_datepicker() {
-		super.set_datepicker();
-		if (this.datepicker.opts.timeFormat.indexOf("s") == -1) {
-			// No seconds in time format
-			const $tp = this.datepicker.timepicker;
-			$tp.$seconds.parent().css("display", "none");
-			$tp.$secondsText.css("display", "none");
-			$tp.$secondsText.prev().css("display", "none");
-		}
-	}
-
 	get_model_value() {
 		let value = super.get_model_value();
 		if (!value && !this.doc) {

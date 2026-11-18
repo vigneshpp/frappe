@@ -8,6 +8,8 @@ from frappe.utils import cint
 
 
 class PrintSettings(Document):
+	_DOCTYPE_NAME = "Print Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -24,7 +26,9 @@ class PrintSettings(Document):
 		enable_raw_printing: DF.Check
 		font: DF.Literal["Default", "Helvetica Neue", "Arial", "Helvetica", "Inter", "Verdana", "Monospace"]
 		font_size: DF.Float
-		pdf_generator: DF.Literal["wkhtmltopdf", "chrome"]
+		max_bulk_print_docs: DF.Int
+		max_concurrent_bulk_exports: DF.Int
+		pdf_generator: DF.Literal["chrome", "PlutoPrint"]
 		pdf_page_height: DF.Float
 		pdf_page_size: DF.Literal[
 			"A0",
@@ -60,6 +64,7 @@ class PrintSettings(Document):
 			"Custom",
 		]
 		pdf_page_width: DF.Float
+		print_generated_pdf: DF.Check
 		print_style: DF.Link | None
 		repeat_header_footer: DF.Check
 		send_print_as_pdf: DF.Check

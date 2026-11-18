@@ -9,6 +9,8 @@ from frappe.model.document import Document, bulk_insert
 
 
 class Country(Document):
+	_DOCTYPE_NAME = "Country"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -83,7 +85,7 @@ def get_countries_and_currencies():
 					symbol=country.currency_symbol,
 					fraction_units=country.currency_fraction_units,
 					smallest_currency_fraction_value=country.smallest_currency_fraction_value,
-					number_format=frappe.db.escape(country.number_format)[1:-1],
+					number_format=country.number_format,
 				)
 			)
 

@@ -11,7 +11,7 @@ import frappe.share
 from frappe import _
 from frappe.contacts.doctype.contact.contact import get_default_contact
 from frappe.desk.doctype.notification_settings.notification_settings import (
-	is_email_notifications_enabled_for_type,
+	is_email_enabled_for_feature,
 )
 from frappe.desk.reportview import get_filters_cond
 from frappe.model.document import Document
@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 
 class Event(Document):
+	_DOCTYPE_NAME = "Event"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -115,11 +117,36 @@ class Event(Document):
 		if not self.sync_with_google_calendar:
 			self.add_video_conferencing = 0
 
+		if self.google_meet_link and not self.google_meet_link.startswith("https://"):
+			self.google_meet_link = ""
+
 	def before_save(self):
 		self.set_participants_email()
 
 	def on_update(self):
+		self.delete_removed_participant_communications()
 		self.sync_communication()
+
+	def delete_removed_participant_communications(self):
+		before = self.get_doc_before_save()
+		if not before:
+			return
+
+		current = {(p.reference_doctype, p.reference_docname) for p in self.event_participants}
+		for participant in before.event_participants:
+			if (participant.reference_doctype, participant.reference_docname) in current:
+				continue
+			for communication in frappe.get_all(
+				"Communication",
+				filters=[
+					["Communication", "reference_doctype", "=", self.doctype],
+					["Communication", "reference_name", "=", self.name],
+					["Communication Link", "link_doctype", "=", participant.reference_doctype],
+					["Communication Link", "link_name", "=", participant.reference_docname],
+				],
+				pluck="name",
+			):
+				frappe.delete_doc("Communication", communication, force=True, ignore_permissions=True)
 
 	def on_trash(self):
 		communications = frappe.get_all(
@@ -256,28 +283,6 @@ def update_attending_status(event_name: str, attendee: str, status: str):
 	frappe.throw(_("Attendee not found in this event."))
 
 
-@frappe.whitelist()
-def delete_communication(event: str | dict[str, Any], reference_doctype: str, reference_docname: str | int):
-	if isinstance(event, str):
-		event = json.loads(event)
-
-	deleted_participant = frappe.get_doc(reference_doctype, reference_docname)
-
-	comms = frappe.get_list(
-		"Communication",
-		filters=[
-			["Communication", "reference_doctype", "=", event.get("doctype")],
-			["Communication", "reference_name", "=", event.get("name")],
-			["Communication Link", "link_doctype", "=", deleted_participant.reference_doctype],
-			["Communication Link", "link_name", "=", deleted_participant.reference_docname],
-		],
-		pluck="name",
-	)
-
-	for comm in comms:
-		frappe.delete_doc("Communication", comm)
-
-
 def get_permission_query_conditions(user):
 	if not user:
 		user = frappe.session.user
@@ -310,7 +315,7 @@ def send_event_digest():
 	users = [
 		user
 		for user in get_enabled_system_users()
-		if is_email_notifications_enabled_for_type(user.name, "Event Reminders")
+		if is_email_enabled_for_feature(user.name, "enable_email_event_reminders")
 	]
 
 	for user in users:
@@ -337,23 +342,23 @@ def send_event_digest():
 @frappe.whitelist()
 @http_cache(max_age=5 * 60, stale_while_revalidate=60 * 60)
 def get_events(
-	start: date,
-	end: date,
+	start: str | date,
+	end: str | date,
 	user: str | None = None,
 	for_reminder: bool = False,
 	filters: str | list | dict[str, Any] | None = None,
 ) -> list[frappe._dict]:
+	start, end = getdate(start), getdate(end)
+
 	caller = frappe.session.user
 	target_user = user or caller
 
 	if user and user != caller:
-		if not frappe.has_permission("Event", ptype="read"):
-			frappe.throw(_("You are not allowed to view events for another user."), frappe.PermissionError)
+		frappe.only_for("System Manager")
 	type EventLikeDict = Event | frappe._dict
 	resolved_events: list[EventLikeDict] = []
 
-	if isinstance(filters, str):
-		filters = json.loads(filters)
+	filters = frappe.parse_json(filters)
 
 	filter_condition = get_filters_cond("Event", filters, [])
 
@@ -409,6 +414,12 @@ def get_events(
 					WHERE `tabDocShare`.share_doctype='Event'
 						AND `tabDocShare`.share_name=`tabEvent`.name
 						AND `tabDocShare`.user=%(user)s
+				)
+				OR EXISTS(
+					SELECT ep.name
+					FROM `tabEvent Participants` ep
+					WHERE ep.parent=`tabEvent`.name
+						AND ep.email=%(user)s
 				)
 			)
 		AND `tabEvent`.status='Open'

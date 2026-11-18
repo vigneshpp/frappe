@@ -1,6 +1,7 @@
 # Copyright (c) 2019, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 import os
+from contextlib import suppress
 from functools import wraps
 from os.path import join
 
@@ -13,13 +14,13 @@ from frappe.utils import cint, get_link_to_form
 def cache_source(function):
 	@wraps(function)
 	def wrapper(*args, **kwargs):
+		if kwargs.get("no_cache"):
+			return function(*args, **kwargs)
+
 		if kwargs.get("chart_name"):
 			chart = frappe.get_doc("Dashboard Chart", kwargs.get("chart_name"))
 		else:
 			chart = kwargs.get("chart")
-		no_cache = kwargs.get("no_cache")
-		if no_cache:
-			return function(chart=chart, no_cache=no_cache)
 		chart_name = frappe.parse_json(chart).name
 		cache_key = f"chart-data:{chart_name}"
 		if cint(kwargs.get("refresh")):
@@ -65,9 +66,14 @@ def generate_and_cache_results(args, function, cache_key, chart):
 			raise
 
 	if not frappe.flags.read_only:
-		frappe.db.set_value(
-			"Dashboard Chart", args.chart_name, "last_synced_on", frappe.utils.now(), update_modified=False
-		)
+		with suppress(frappe.QueryDeadlockError):
+			frappe.db.set_value(
+				"Dashboard Chart",
+				args.chart_name,
+				"last_synced_on",
+				frappe.utils.now(),
+				update_modified=False,
+			)
 	return results
 
 
@@ -87,7 +93,10 @@ def sync_dashboards(app=None):
 	apps = [app] if app else frappe.get_installed_apps()
 
 	for app_name in apps:
-		print(f"Updating Dashboard for {app_name}")
+		try:
+			print(f"Updating Dashboard for {app_name}")
+		except BrokenPipeError:
+			pass
 		for module_name in frappe.local.app_modules.get(app_name) or []:
 			frappe.flags.in_import = True
 			make_records_in_module(app_name, module_name)

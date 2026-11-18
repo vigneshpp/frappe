@@ -22,6 +22,14 @@ inputs:
   disable-socketio:
     required: false
     default: false
+  disable-workers:
+    required: false
+    description: 'Whether to disable background workers'
+    default: false
+  enable-server-scripts:
+    required: false
+    description: 'Whether to enable Server Scripts for tests that call them through the web server'
+    default: true
   db:
     required: false
     default: mariadb
@@ -60,56 +68,57 @@ runs:
   - uses: actions/setup-node@v6
     with:
       node-version: ${{ inputs.node-version }}
-      check-latest: true
+      cache: yarn
+      cache-dependency-path: |
+        frappe-src/yarn.lock
+        frappe-src/studio/frontend/yarn.lock
+        frappe-src/flow/yarn.lock
+
+  - id: os-release
+    shell: bash -e {0}
+    run: echo "version=$(lsb_release -rs)" >> "$GITHUB_OUTPUT"
 
   - uses: astral-sh/setup-uv@v6
-
-  - name: Cache pip
-    uses: actions/cache@v4
     with:
-      path: ~/.cache/pip
-      key: ${{ runner.os }}-pip-${{ hashFiles('**/*requirements.txt', '**/pyproject.toml', '**/setup.py') }}
-      restore-keys: |
-        ${{ runner.os }}-pip-
-        ${{ runner.os }}-
-
-  - id: yarn-cache-dir-path
-    shell: bash -e {0}
-    run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
-  - uses: actions/cache@v4
-    id: yarn-cache
-    with:
-      path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
-      key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
-      restore-keys: |
-        ${{ runner.os }}-yarn-
+      enable-cache: true
+      cache-suffix: ubuntu-${{ steps.os-release.outputs.version }}
+      cache-dependency-glob: |
+        **/pyproject.toml
+        **/requirements*.txt
 
   - shell: bash -e {0}
     run: |
-      # Install System Dependencies
-      start_time=$(date +%s)
-      curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-11.8.5" --skip-maxscale
+      # Add the PostgreSQL apt repository
+      # The apt cache action resolves package versions from the local package
+      # lists, so only the pgdg list needs a refresh; the runner image already
+      # has the Ubuntu lists.
+      sudo install -d /usr/share/postgresql-common/pgdg
+      sudo curl -fsSL --retry 3 --retry-all-errors -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+      echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+      sudo apt-get -qq update \
+        -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/pgdg.list \
+        -o Dir::Etc::sourceparts=- \
+        -o APT::Get::List-Cleanup=0
 
-      sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-      wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+  # the mariadb server runs as a service container; the client tools come
+  # from ubuntu's archives so CI does not depend on mariadb.com mirrors
+  - name: Install System Dependencies
+    uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+    with:
+      packages: libcups2-dev redis-server mariadb-client libmariadb-dev postgresql-client-18 libpq-dev
 
-      sudo apt -qq update
-      sudo apt -qq remove mysql-server mysql-client
-      sudo apt -qq remove -y postgresql-client postgresql-client-16 postgresql-client-common
-      sudo apt -qq install libcups2-dev redis-server mariadb-client libmariadb-dev postgresql-client-18 libpq-dev
+  - shell: bash -e {0}
+    run: |
+      # Install bench tool
+      # The cache restores files without running ldconfig.
+      sudo ldconfig
       echo "/usr/lib/postgresql/18/bin" >> $GITHUB_PATH
-
-      wget -q -O /tmp/wkhtmltox.deb https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-      sudo apt install /tmp/wkhtmltox.deb
-
-      end_time=$(date +%s)
-      echo -e "\033[33mInstall System Dependencies: $((end_time - start_time)) seconds\033[0m"
+      uv tool install frappe-bench
 
   - shell: bash -e {0}
     run: |
       # Init Bench
       start_time=$(date +%s)
-      uv tool install frappe-bench
       bench init ${GITHUB_WORKSPACE} \
         --ignore-exist \
         --frappe-path "${GITHUB_WORKSPACE}/frappe-src" \
@@ -131,17 +140,63 @@ runs:
       if [ "${{ inputs.disable-socketio }}" == "true" ]; then
         sed -i '/^socketio:/d' Procfile
       fi
+      if [ "${{ inputs.disable-workers }}" == "true" ]; then
+        sed -i '/^worker[^:]*:/d' Procfile
+      fi
+
+      # Tests declare the services they need with requires_test_service(). Derive those flags from the same inputs that trim the Procfile, so a job cannot  start a service it tells the tests is absent (or the reverse).
+      if [ "${{ inputs.disable-web }}" == "true" ]; then
+        echo "FRAPPE_TEST_WEB_SERVER=0" >> "$GITHUB_ENV"
+      else
+        echo "FRAPPE_TEST_WEB_SERVER=1" >> "$GITHUB_ENV"
+      fi
+      if [ "${{ inputs.disable-workers }}" == "true" ]; then
+        echo "FRAPPE_TEST_BACKGROUND_WORKER=0" >> "$GITHUB_ENV"
+      else
+        echo "FRAPPE_TEST_BACKGROUND_WORKER=1" >> "$GITHUB_ENV"
+      fi
 
       end_time=$(date +%s)
       echo -e "\033[33mInit Bench: $((end_time - start_time)) seconds\033[0m"
 
+  - name: Cache island toolchain
+    uses: actions/cache@v4
+    with:
+      path: ${{ github.workspace }}/apps/frappe/island-toolchain/node_modules
+      key: island-toolchain-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('frappe-src/island-toolchain/yarn.lock') }}
+
+  - name: Cache Chromium
+    uses: actions/cache@v4
+    with:
+      path: ${{ github.workspace }}/chromium
+      key: chromium-${{ runner.os }}-${{ hashFiles('frappe-src/frappe/utils/chromium/download.py') }}
+
   - shell: bash -e {0}
     run: |
-      # Install dev/test dependencies
+      # Set up the Chromium build that renders PDFs
       start_time=$(date +%s)
-      bench setup requirements --dev
+      bench setup-chrome
+      end_time=$(date +%s)
+      echo -e "\033[33mSetup Chromium: $((end_time - start_time)) seconds\033[0m"
+
+  - shell: bash -e {0}
+    run: |
+      # Install dev/test dependencies (python and node deps are independent,
+      # so install them concurrently)
+      start_time=$(date +%s)
+
+      bench setup requirements --dev &
+      dev_pid=$!
+
+      node_pid=""
       if [ "${{ inputs.build-assets }}" == "true" ]; then
-        bench setup requirements --node
+        bench setup requirements --node &
+        node_pid=$!
+      fi
+
+      wait "$dev_pid"
+      if [ -n "$node_pid" ]; then
+        wait "$node_pid"
       fi
 
       end_time=$(date +%s)
@@ -150,9 +205,13 @@ runs:
   - shell: bash -e {0}
     env:
       DB: ${{ inputs.db }}
+      BUILD_ASSETS: ${{ inputs.build-assets }}
+      ENABLE_SERVER_SCRIPTS: ${{ inputs.enable-server-scripts }}
     run: |
-      # Create Site
+      # Create Site (asset build is CPU-bound and independent of the DB, so
+      # build it in the background while the site is being created)
       start_time=$(date +%s)
+
       if [ "$DB" == "postgres" ]; then
         DB_ROOT_USER="postgres"
         DB_ROOT_PWD="travis"
@@ -161,9 +220,27 @@ runs:
         DB_ROOT_PWD="${{ inputs.db-root-password }}"
       fi
 
+      # Reduce durability for CI speed — the DB is ephemeral, so trading crash
+      # safety for fewer fsyncs is free. innodb_flush_log_at_trx_commit=0 flushes
+      # the redo log once per second instead of on every commit.
+      if [ "$DB" == "mariadb" ]; then
+        mariadb -h 127.0.0.1 -u "$DB_ROOT_USER" -p"$DB_ROOT_PWD" -e "
+          SET GLOBAL innodb_flush_log_at_trx_commit = 0;
+          SET GLOBAL sync_binlog = 0;"
+      fi
+
       bench set-config -g root_login "$DB_ROOT_USER"
       bench set-config -g root_password "$DB_ROOT_PWD"
       bench set-config -g admin_password admin
+      if [ "$ENABLE_SERVER_SCRIPTS" == "true" ]; then
+        bench set-config -g server_script_enabled 1 --parse
+      fi
+
+      build_pid=""
+      if [ "$BUILD_ASSETS" == "true" ]; then
+        CI=Yes bench build --force --production &> ${GITHUB_WORKSPACE}/build_assets.log &
+        build_pid=$!
+      fi
 
       bench new-site test_site \
         --db-type "$DB" \
@@ -172,7 +249,6 @@ runs:
         --db-password test_frappe \
         --verbose
       bench --site test_site set-config allow_tests 1 --parse
-      bench --site test_site set-config server_script_enabled 1 --parse
       bench --site test_site set-config host_name "http://test_site:8000"
       bench --site test_site set-config auto_email_id "test@example.com"
       bench --site test_site set-config mail_server localhost
@@ -186,20 +262,19 @@ runs:
         bench --site test_site set-config use_mysqlclient 1 --parse
       fi
 
+      if [ -n "$build_pid" ]; then
+        if ! wait "$build_pid"; then
+          echo "Asset build failed:"
+          cat ${GITHUB_WORKSPACE}/build_assets.log
+          exit 1
+        fi
+        cat ${GITHUB_WORKSPACE}/build_assets.log
+      fi
+
       end_time=$(date +%s)
-      echo -e "\033[33mCreate Site: $((end_time - start_time)) seconds\033[0m"
+      echo -e "\033[33mCreate Site + Build Assets: $((end_time - start_time)) seconds\033[0m"
 
   - shell: bash -e {0}
     run: |
       # Start Bench
       bench start &> ${GITHUB_WORKSPACE}/bench_start.log &
-
-  - shell: bash -e {0}
-    if: ${{ inputs.build-assets == 'true' }}
-    run: |
-      # Build Assets
-      start_time=$(date +%s)
-      CI=Yes bench build --force --production
-
-      end_time=$(date +%s)
-      echo -e "\033[33mBuild Assets: $((end_time - start_time)) seconds\033[0m"

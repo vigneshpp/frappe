@@ -18,14 +18,20 @@ from frappe.core.doctype.doctype.doctype import (
 	InvalidFieldNameError,
 	UniqueFieldnameError,
 	WrongOptionsDoctypeLinkError,
+	validate_fields,
 	validate_links_table_fieldnames,
+	validate_permissions,
 )
 from frappe.core.doctype.rq_job.test_rq_job import wait_for_completion
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+from frappe.database.schema import DBTable
 from frappe.desk.form.load import getdoc
 from frappe.model.delete_doc import delete_controllers
+from frappe.model.meta import Meta
 from frappe.model.sync import remove_orphan_doctypes
+from frappe.modules.import_file import import_doc
 from frappe.tests import IntegrationTestCase
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import get_table_name
 
 
@@ -48,8 +54,23 @@ class TestDocType(IntegrationTestCase):
 			doc = new_doctype(name).insert()
 			doc.delete()
 
+	@skipIf(frappe.conf and frappe.conf.db_type != "postgres", "Only for Postgres")
+	def test_validate_name_fits_postgres_identifier(self):
+		self.assertRaises(frappe.NameError, new_doctype("Test " + "x" * 56).insert)
+
+	@skipIf(frappe.conf and frappe.conf.db_type != "postgres", "Only for Postgres")
+	def test_import_rejects_name_longer_than_postgres_identifier(self):
+		doctype = new_doctype("Test " + "x" * 56).as_dict()
+		with patch.dict(frappe.local.flags):
+			self.assertRaises(frappe.NameError, import_doc, doctype)
+
+	@skipIf(frappe.conf and frappe.conf.db_type != "postgres", "Only for Postgres")
+	def test_table_name_check_skips_virtual_doctypes(self):
+		doctype = new_doctype("Test " + "x" * 56, is_virtual=1)
+		DBTable(doctype.name, Meta(doctype)).validate()
+
 	@skipIf(
-		frappe.conf.db_type == "sqlite",
+		frappe.conf and frappe.conf.db_type == "sqlite",
 		"Not for SQLite for now",
 	)
 	def test_making_sequence_on_change(self):
@@ -113,8 +134,9 @@ class TestDocType(IntegrationTestCase):
 		doc2.name = "two"
 
 		doc1.insert()
+		frappe.db.savepoint("before_duplicate_insert")
 		self.assertRaises(frappe.UniqueValidationError, doc2.insert)
-		frappe.db.rollback()
+		frappe.db.rollback(save_point="before_duplicate_insert")
 
 		dt.fields[0].unique = 0
 		dt.save()
@@ -122,6 +144,21 @@ class TestDocType(IntegrationTestCase):
 		doc2.insert()
 		doc1.delete()
 		doc2.delete()
+
+	def test_change_field_type_with_incompatible_values(self):
+		if frappe.db.exists("DocType", "Test Field Type Change"):
+			frappe.delete_doc("DocType", "Test Field Type Change")
+
+		dt = new_doctype("Test Field Type Change")
+		dt.insert()
+
+		doc = frappe.new_doc("Test Field Type Change")
+		doc.some_fieldname = "not a number"
+		doc.insert()
+
+		dt.fields[0].fieldtype = "Int"
+		self.assertRaises(frappe.ValidationError, dt.save)
+		frappe.db.rollback()
 
 	def test_validate_search_fields(self):
 		doc = new_doctype("Test Search Fields")
@@ -367,6 +404,23 @@ class TestDocType(IntegrationTestCase):
 
 		self.assertRaises(CannotIndexedError, doc.insert)
 
+	def test_no_value_field_resets_column_properties(self):
+		doc = new_doctype("Test No Value Field Reset")
+		field_1 = doc.append("fields", {})
+		field_1.fieldname = "some_fieldname_1"
+		field_1.fieldtype = "HTML"
+		field_1.unique = 1
+		field_1.search_index = 1
+		field_1.not_nullable = 1
+
+		doc.insert()  # would raise NonUniqueError before the reset
+
+		self.assertFalse(field_1.unique)
+		self.assertFalse(field_1.search_index)
+		self.assertFalse(field_1.not_nullable)
+
+		doc.delete()
+
 	def test_cancel_link_doctype(self):
 		import json
 
@@ -554,6 +608,40 @@ class TestDocType(IntegrationTestCase):
 		self.assertIn(("User", "first_name"), link_tuples)
 		self.assertIn(("Role", "name"), link_tuples)
 
+	def test_if_owner_cleared_for_high_permlevel(self):
+		"""`if_owner` is only honoured at permlevel 0; it is cleared at higher levels."""
+		doc = new_doctype(
+			"Test If Owner Permlevel",
+			permissions=[
+				{"role": "All", "permlevel": 0, "read": 1, "write": 1, "if_owner": 1},
+				{"role": "All", "permlevel": 1, "read": 1, "write": 1, "if_owner": 1},
+			],
+		)
+
+		validate_permissions(doc)
+
+		perms = {p.permlevel: p for p in doc.permissions}
+		self.assertEqual(perms[0].if_owner, 1)
+		self.assertEqual(perms[1].if_owner, 0)
+
+	def test_if_owner_at_high_permlevel_does_not_duplicate(self):
+		"""Clearing if_owner must not leave a duplicate of an existing rule at the same level."""
+		doc = new_doctype(
+			"Test If Owner Duplicate",
+			permissions=[
+				{"role": "All", "permlevel": 0, "read": 1, "write": 1},
+				{"role": "All", "permlevel": 1, "read": 1, "write": 1},
+				{"role": "All", "permlevel": 1, "read": 1, "write": 1, "if_owner": 1},
+			],
+		)
+
+		validate_permissions(doc)
+
+		level1 = [p for p in doc.permissions if p.permlevel == 1]
+		self.assertEqual(len(level1), 1)
+		self.assertFalse(level1[0].if_owner)
+		self.assertEqual(level1[0].write, 1)
+
 	def test_create_virtual_doctype(self):
 		"""Test virtual DocType."""
 		virtual_doc = new_doctype("Test Virtual Doctype")
@@ -664,6 +752,136 @@ class TestDocType(IntegrationTestCase):
 
 		self.assertEqual(test_json.test_json_field["hello"], "world")
 
+	def test_link_filters_must_be_valid_json(self):
+		doctype = new_doctype(
+			fields=[
+				{
+					"label": "User",
+					"fieldname": "user",
+					"fieldtype": "Link",
+					"options": "User",
+					"link_filters": "not valid json",
+				}
+			]
+		)
+
+		self.assertRaises(frappe.ValidationError, doctype.insert)
+
+	def test_link_filters_must_be_list_of_filters(self):
+		doctype = new_doctype(
+			fields=[
+				{
+					"label": "User",
+					"fieldname": "user",
+					"fieldtype": "Link",
+					"options": "User",
+					"link_filters": '{"name": "Administrator"}',
+				}
+			]
+		)
+
+		self.assertRaises(frappe.ValidationError, doctype.insert)
+
+	def test_attachment_gallery_filters_must_target_file(self):
+		doctype = new_doctype(
+			fields=[
+				{
+					"label": "Attachments",
+					"fieldname": "attachments",
+					"fieldtype": "Attachment Gallery",
+					"link_filters": '[["User", "name", "=", "Administrator"]]',
+				}
+			]
+		)
+
+		self.assertRaises(frappe.ValidationError, doctype.insert)
+
+	def test_vue_component_options_must_name_an_island_on_this_site(self):
+		def new_vue_component_doctype(island):
+			return new_doctype(
+				fields=[
+					{
+						"label": "Summary",
+						"fieldname": "summary",
+						"fieldtype": "Vue Component",
+						"options": island,
+					}
+				]
+			)
+
+		with patch("frappe.utils.island.get_ui_islands", return_value=["frappe.summary"]):
+			self.assertRaises(frappe.ValidationError, new_vue_component_doctype("frappe.missing").insert)
+			self.assertRaises(frappe.ValidationError, new_vue_component_doctype("").insert)
+			new_vue_component_doctype("frappe.summary").insert()
+
+	def test_a_normal_user_saves_and_loads_a_doc_with_a_vue_component_field(self):
+		role = "Vue Component Tester"
+		if not frappe.db.exists("Role", role):
+			frappe.get_doc(doctype="Role", role_name=role, desk_access=1).insert()
+		email = "vue-component-user@example.com"
+		if not frappe.db.exists("User", email):
+			frappe.get_doc(doctype="User", email=email, first_name="Vue", send_welcome_email=0).insert()
+		frappe.get_doc("User", email).add_roles(role)
+
+		with patch("frappe.utils.island.get_ui_islands", return_value=["frappe.summary"]):
+			doctype = new_doctype(
+				fields=[
+					{"label": "Title", "fieldname": "title", "fieldtype": "Data"},
+					{"fieldname": "summary", "fieldtype": "Vue Component", "options": "frappe.summary"},
+				],
+				permissions=[{"role": role, "read": 1, "write": 1, "create": 1}],
+			).insert()
+
+		with self.set_user(email):
+			doc = frappe.get_doc(
+				doctype=doctype.name, title="Invoice at a glance", summary="not stored"
+			).insert()
+			getdoc(doctype.name, doc.name)
+			loaded = frappe.response.docs[0]
+
+		self.assertEqual(loaded.title, "Invoice at a glance")
+		self.assertIsNone(loaded.get("summary"))
+		self.assertFalse(frappe.db.has_column(doctype.name, "summary"))
+		self.assertEqual(frappe.get_meta(doctype.name).get_field("summary").options, "frappe.summary")
+
+	def test_missing_link_filters_field_is_allowed(self):
+		doctype = new_doctype()
+		doctype.fields[0].__dict__.pop("link_filters", None)
+
+		validate_fields(doctype)
+
+	def test_custom_field_validates_link_filters(self):
+		custom_field = frappe.get_doc(
+			{
+				"doctype": "Custom Field",
+				"dt": "ToDo",
+				"fieldname": "invalid_link_filters",
+				"label": "Invalid Link Filters",
+				"fieldtype": "Link",
+				"options": "User",
+				"link_filters": '[["User", "name", "="]]',
+			}
+		)
+
+		self.assertRaises(frappe.ValidationError, custom_field.insert)
+		frappe.db.rollback()
+		frappe.clear_cache(doctype="ToDo")
+
+	def test_property_setter_validates_link_filters(self):
+		self.assertRaises(
+			frappe.ValidationError,
+			frappe.make_property_setter,
+			{
+				"doctype": "ToDo",
+				"fieldname": "allocated_to",
+				"property": "link_filters",
+				"value": '["not a filter row"]',
+				"property_type": "JSON",
+			},
+		)
+		frappe.db.rollback()
+		frappe.clear_cache(doctype="ToDo")
+
 	def test_no_delete_doc(self):
 		self.assertRaises(frappe.ValidationError, frappe.delete_doc, "DocType", "Address")
 
@@ -711,6 +929,28 @@ class TestDocType(IntegrationTestCase):
 				if controller_folder:
 					shutil.rmtree(controller_folder, ignore_errors=True)
 				frappe.local.request = previous_request
+
+	def test_warn_on_module_change(self):
+		doc = frappe.new_doc("DocType")
+		doc.name = "Test Module Change Warning"
+		doc.module = "Custom"
+
+		messages = []
+		with patch.object(frappe, "msgprint", side_effect=lambda msg, **kwargs: messages.append(msg)):
+			doc.get_doc_before_save = lambda: frappe._dict(module="Core")
+			doc.warn_on_module_change()
+			self.assertEqual(len(messages), 1)
+			self.assertIn("Custom", messages[0])
+
+			messages.clear()
+			doc.get_doc_before_save = lambda: frappe._dict(module="Custom")
+			doc.warn_on_module_change()
+			self.assertEqual(messages, [])
+
+			messages.clear()
+			doc.get_doc_before_save = lambda: frappe._dict(module="Does Not Exist")
+			doc.warn_on_module_change()
+			self.assertEqual(messages, [])
 
 	@unittest.skipUnless(
 		os.access(frappe.get_app_path("frappe"), os.W_OK), "Only run if frappe app paths is writable"
@@ -812,6 +1052,7 @@ class TestDocType(IntegrationTestCase):
 		os.access(frappe.get_app_path("frappe"), os.W_OK), "Only run if frappe app paths is writable"
 	)
 	@patch.dict(frappe.conf, {"developer_mode": 1})
+	@requires_test_service(TestService.BACKGROUND_WORKER)
 	def test_delete_orphaned_doctypes(self):
 		doctype = new_doctype(custom=0).insert()
 		frappe.db.commit()

@@ -9,6 +9,8 @@ not_allowed_fieldtype_change = ["naming_series"]
 
 
 class PropertySetter(Document):
+	_DOCTYPE_NAME = "Property Setter"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -23,6 +25,7 @@ class PropertySetter(Document):
 			"", "DocField", "DocType", "DocType Link", "DocType Action", "DocType State"
 		]
 		field_name: DF.Data | None
+		is_app_disabled: DF.Check
 		is_system_generated: DF.Check
 		module: DF.Link | None
 		property: DF.Data

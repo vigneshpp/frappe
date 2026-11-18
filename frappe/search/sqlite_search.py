@@ -13,11 +13,38 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from bs4 import BeautifulSoup
-
 import frappe
+from frappe.database.sqlite import DEFAULT_BUSY_TIMEOUT_SECONDS
 from frappe.model.document import Document
-from frappe.utils import update_progress_bar
+from frappe.utils import convert_utc_to_system_timezone, get_datetime, now_datetime, update_progress_bar
+from frappe.utils.file_lock import LockTimeoutError
+from frappe.utils.synchronization import filelock
+
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def strip_surrogates(value):
+	"""Repair or drop Unicode surrogate code points so a value can be encoded as UTF-8.
+
+	Inbound data (for example e-mail bodies that were mis-decoded from UTF-16) can
+	carry paired or lone surrogate code points inside Python ``str`` objects.
+	SQLite encodes bound parameters as strict UTF-8, which raises
+	``UnicodeEncodeError: ... surrogates not allowed`` for any surrogate code
+	point and aborts the whole ``cursor.executemany()`` call during indexing.
+
+	A round-trip through UTF-16 (with ``surrogatepass``) re-pairs valid surrogate
+	pairs into their real astral character (so a mis-encoded emoji survives), and
+	the following UTF-8 ``ignore`` pass drops any remaining lone surrogate.
+	Non-``str`` and surrogate-free values are returned unchanged.
+	"""
+	if not isinstance(value, str) or not SURROGATE_RE.search(value):
+		return value
+	return (
+		value.encode("utf-16-le", "surrogatepass")
+		.decode("utf-16-le", "surrogatepass")
+		.encode("utf-8", "ignore")
+		.decode("utf-8")
+	)
 
 
 class WarningType(Enum):
@@ -88,6 +115,12 @@ class SQLiteSearch(ABC):
 	- Ranking tracking (original BM25 vs modified scores)
 	- Filtering by user-defined criteria
 	- Permission-aware search results via query-level filtering
+	"""
+
+	BUILD_VOCABULARY = True
+	"""Whether to build the vocabulary behind spelling correction in search().
+
+	A second pass over everything indexed. Turn it off where search() is never called.
 	"""
 
 	@staticmethod
@@ -349,6 +382,7 @@ class SQLiteSearch(ABC):
 
 			# Get current progress
 			progress = self._get_index_progress()
+			started_at = self._build_started_at(is_continuation, progress)
 
 			# Check if indexing is already complete
 			if self._is_indexing_complete():
@@ -404,12 +438,15 @@ class SQLiteSearch(ABC):
 					if documents:
 						self._index_documents(documents)
 
-						# Update progress with last processed document cursor
-						last_doc_modified = docs[-1].get(progress_field) or docs[-1].get("modified")
-						last_doc_name = docs[-1]["name"]
-						self._update_index_progress(doctype, last_doc_name, last_doc_modified, len(documents))
-						last_indexed_modified = last_doc_modified
-						last_indexed_name = last_doc_name
+					# Advance the cursor even when nothing in this batch was indexable: these
+					# rows have been consumed either way. Advancing only when `documents` was
+					# non-empty meant a batch whose documents all failed prepare_document()
+					# was fetched again forever, so build_index() never returned.
+					last_doc_modified = docs[-1].get(progress_field) or docs[-1].get("modified")
+					last_doc_name = docs[-1]["name"]
+					self._update_index_progress(doctype, last_doc_name, last_doc_modified, len(documents))
+					last_indexed_modified = last_doc_modified
+					last_indexed_name = last_doc_name
 
 					batch_count += 1
 
@@ -428,10 +465,12 @@ class SQLiteSearch(ABC):
 
 			# Check if all doctypes are indexed before building vocabulary
 			if not self._is_vocabulary_built_needed():
-				self._update_progress("All documents indexed, building vocabulary", 80, 100, absolute=True)
+				if self.BUILD_VOCABULARY:
+					self._update_progress(
+						"All documents indexed, building vocabulary", 80, 100, absolute=True
+					)
+					self._build_vocabulary_incremental()
 
-				# Build vocabulary incrementally
-				self._build_vocabulary_incremental()
 				self._mark_vocabulary_built()
 
 			# Final atomic replacement if this was a fresh build
@@ -456,6 +495,84 @@ class SQLiteSearch(ABC):
 			# Restore original database path
 			if temp_db_path:
 				self.db_path = original_db_path
+
+		self.index_documents_changed_during_build(started_at)
+
+	def _build_started_at(self, is_continuation: bool, progress: dict):
+		"""When this build began, carried across a resumed one.
+
+		A continuation skips what the earlier run indexed, so a fresh timestamp would miss every
+		edit between the two runs. Takes the caller's progress, in UTC: a fresh build writes those
+		rows into the temporary database.
+		"""
+		if is_continuation:
+			stamps = [row["started_at"] for row in progress.values() if row.get("started_at")]
+			if stamps:
+				return convert_utc_to_system_timezone(get_datetime(min(stamps))).replace(tzinfo=None)
+
+		return now_datetime()
+
+	def index_documents_changed_during_build(self, started_at, batch_size=1000):
+		"""Index documents saved while the build was running.
+
+		update_doc_index is inert for the whole of a build, so a document saved after its row was
+		read carries stale text. Indexed here rather than queued, which drains thirty rows every
+		five minutes. Filters on the real `modified`: the config's mapped field may be immutable.
+		"""
+		if not self.index_exists():
+			return
+
+		for doctype, config in self.doc_configs.items():
+			filters = dict(config.get("filters") or {})
+			filters["modified"] = (">=", started_at)
+			names = frappe.get_all(doctype, filters=filters, pluck="name")
+
+			for start in range(0, len(names), batch_size):
+				self.index_documents_by_name(doctype, names[start : start + batch_size])
+
+			self.remove_documents_deleted_during_build(doctype, started_at)
+
+	def index_documents_by_name(self, doctype, names: list[str]):
+		"""Read and index one batch of named documents, the way a build batch is read."""
+		if not names:
+			return
+
+		config = self.doc_configs[doctype]
+		fields = list(config["fields"])
+		for required in ("name", "modified"):
+			if required not in fields:
+				fields.append(required)
+
+		docs = frappe.qb.get_query(doctype, fields=fields, filters={"name": ("in", names)}).run(as_dict=True)
+
+		documents = []
+		for doc in docs:
+			doc.doctype = doctype
+			if config["modified_field"] != "modified":
+				doc.modified = getattr(doc, config["modified_field"], None) or doc.modified
+
+			document = self.prepare_document(doc)
+			if document:
+				documents.append(document)
+
+		if documents:
+			self._index_documents(documents)
+
+	def remove_documents_deleted_during_build(self, doctype, started_at):
+		"""Drop documents deleted while the build was running.
+
+		delete_doc_index is inert during a build, so the index can hold rows for documents already
+		gone. Reads Deleted Document; a delete_permanently=True deletion writes no such row, so its
+		indexed record can remain until the next full build.
+		"""
+		deleted = frappe.get_all(
+			"Deleted Document",
+			filters={"deleted_doctype": doctype, "creation": (">=", started_at)},
+			pluck="deleted_name",
+		)
+
+		for name in deleted:
+			self.remove_doc(doctype, name)
 
 	def _get_incomplete_count(self, where_clause):
 		"""Get count of incomplete records from search_index_progress table.
@@ -709,9 +826,9 @@ class SQLiteSearch(ABC):
 					"""
 					INSERT INTO search_index_progress
 					(doctype, total_docs, indexed_docs, batch_size, is_complete, started_at, updated_at, vocabulary_built, last_indexed_modified)
-					VALUES (?, ?, 0, 1000, 0, datetime('now'), datetime('now'), 0, 0)
+					VALUES (?, ?, 0, 1000, 0, datetime('now'), datetime('now'), 0, ?)
 				""",
-					(doctype, total_count),
+					(doctype, total_count, "1970-01-01 00:00:00"),
 				)
 
 		self._with_connection(init_progress)
@@ -1202,7 +1319,7 @@ class SQLiteSearch(ABC):
 
 	def _set_pragmas(self, cursor, is_read=False):
 		"""Set SQLite performance pragmas."""
-		cursor.execute("PRAGMA busy_timeout = 5000;")  # Wait up to 5 seconds if the database is locked
+		cursor.execute(f"PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_SECONDS * 1000};")
 		cursor.execute("PRAGMA journal_mode = WAL;")  # Write-Ahead Logging for concurrency
 		cursor.execute("PRAGMA synchronous = NORMAL;")  # Better performance vs FULL
 		cursor.execute("PRAGMA cache_size = -8192;")  # 8MB cache
@@ -1356,7 +1473,7 @@ class SQLiteSearch(ABC):
 							doc_id = doc.get("id") or f"{doc.get('doctype', '')}:{doc.get('name', '')}"
 							values.append(doc_id)
 						else:
-							values.append(doc.get(field, ""))
+							values.append(strip_surrogates(doc.get(field, "")))
 
 					doc_ids_to_delete.append(doc_id)
 
@@ -1585,6 +1702,8 @@ class SQLiteSearch(ABC):
 		if not content:
 			return ""
 
+		from bs4 import BeautifulSoup
+
 		# Convert to string in case it's a Mock object or other type
 		content = str(content)
 
@@ -1601,6 +1720,7 @@ class SQLiteSearch(ABC):
 		text = soup.get_text(separator=" ").strip()  # remove tags
 		text = re.sub(r"https?://[^\s]+", "[link]", text)  # replace standalone links
 		text = re.sub(r"\s+", " ", text).strip()  # normalize whitespace
+		text = strip_surrogates(text)  # drop/repair UTF-16 surrogate code points
 		return text
 
 	def _generate_trigrams(self, word):
@@ -1782,13 +1902,22 @@ def build_index(
 	if search.index_exists() and not force:
 		return
 
-	# For continuation jobs, always proceed regardless of existing index
-	if is_continuation or force:
-		if is_continuation:
-			print(f"{SearchClass.__name__}: Continuing incremental index build...")
-		else:
-			print(f"{SearchClass.__name__}: Index does not exist or force=True, building...")
-		search.build_index(is_continuation=is_continuation)
+	if is_continuation:
+		print(f"{SearchClass.__name__}: Continuing incremental index build...")
+	else:
+		print(f"{SearchClass.__name__}: Index does not exist or force=True, building...")
+
+	try:
+		with filelock(_build_lock_name(SearchClass), timeout=0):
+			search.build_index(is_continuation=is_continuation)
+	except LockTimeoutError:
+		print(f"{SearchClass.__name__}: another build is already running, skipping.")
+
+
+def _build_lock_name(SearchClass: type[SQLiteSearch]) -> str:
+	"""One lock per search class. A fresh build deletes any temporary database it finds, so two
+	of them on one class would delete each other's work."""
+	return f"search_index_{SearchClass.__module__}.{SearchClass.__name__}"
 
 
 def _enqueue_index_job(search_class_path: str, is_continuation: bool = False):
@@ -1850,7 +1979,7 @@ def update_doc_index(doc: Document, method=None):
 		search = SearchClass()
 
 		if not (search.is_search_enabled() and search.index_exists()):
-			return
+			continue
 
 		for doctype, config in search.doc_configs.items():
 			if doc.doctype == doctype:
@@ -1876,7 +2005,7 @@ def delete_doc_index(doc: Document, method=None):
 		search = SearchClass()
 
 		if not (search.is_search_enabled() and search.index_exists()):
-			return
+			continue
 
 		for doctype, config in search.doc_configs.items():
 			if doc.doctype == doctype:

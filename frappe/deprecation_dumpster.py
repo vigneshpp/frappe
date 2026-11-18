@@ -564,7 +564,7 @@ def get_tests_CompatFrappeTestCase():
 	from contextlib import contextmanager
 
 	import frappe
-	from frappe.model.base_document import BaseDocument
+	from frappe.model.document import Document
 	from frappe.utils import cint
 
 	datetime_like_types = (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)
@@ -645,7 +645,7 @@ def get_tests_CompatFrappeTestCase():
 		def assertDocumentEqual(self, expected, actual):
 			"""Compare a (partial) expected document with actual Document."""
 
-			if isinstance(expected, BaseDocument):
+			if isinstance(expected, Document):
 				expected = expected.as_dict()
 
 			for field, value in expected.items():
@@ -657,7 +657,7 @@ def get_tests_CompatFrappeTestCase():
 				else:
 					self._compare_field(value, actual.get(field), actual, field)
 
-		def _compare_field(self, expected, actual, doc: BaseDocument, field: str):
+		def _compare_field(self, expected, actual, doc: Document, field: str):
 			msg = f"{field} should be same."
 
 			if isinstance(expected, float):
@@ -724,7 +724,10 @@ def get_tests_CompatFrappeTestCase():
 
 			def _sql_with_count(*args, **kwargs):
 				ret = orig_sql(*args, **kwargs)
-				queries.append(args[0].last_query)
+				# `last_query` is a lazy wrapper on every driver except MariaDB
+				# (LazyMogrify on SQLite, LazyDecode on Postgres); the join below
+				# needs real strings. Matches IntegrationTestCase.assertQueryCount.
+				queries.append(str(args[0].last_query))
 				return ret
 
 			try:
@@ -775,7 +778,8 @@ def get_tests_CompatFrappeTestCase():
 				yield
 				self.assertLessEqual(rows_read, count, msg="Queries read more rows than expected")
 			finally:
-				frappe.db.sql = orig_sql
+				# assigning the original back would keep `sql` on the instance and hide patches on the class
+				vars(frappe.db).pop("sql", None)
 
 		@classmethod
 		def enable_safe_exec(cls) -> None:
@@ -1014,3 +1018,40 @@ def boilerplate_modules_txt(dest, app_name, app_title):
 
 	with open(os.path.join(dest, app_name, app_name, "modules.txt"), "w") as f:
 		f.write(frappe.as_unicode(app_title))
+
+
+@deprecated(
+	"frappe.utils.has_gravatar",
+	"2026-06-13",
+	"v17",
+	"Gravatar integration has been removed. Always returns empty string.",
+)
+def has_gravatar(email: str) -> str:
+	return ""
+
+
+@deprecated(
+	"frappe.utils.get_gravatar_url",
+	"2026-06-13",
+	"v17",
+	"Gravatar integration has been removed. Always returns empty string. Use get_identicon instead.",
+)
+def get_gravatar_url(email: str, default: str = "mm") -> str:
+	return ""
+
+
+@deprecated(
+	"frappe.utils.get_gravatar",
+	"2026-06-13",
+	"v17",
+	"Gravatar integration has been removed. Now always returns an identicon. Use get_identicon instead.",
+)
+def get_gravatar(email: str) -> str:
+	from frappe.utils import get_identicon
+
+	return get_identicon(email)
+
+
+@deprecated("frappe.desk.page.setup_wizard.install_fixtures._", "2026-07-16", "v17", "Use N_ instead")
+def _(x, *args, **kwargs):
+	return x

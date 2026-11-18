@@ -7,6 +7,8 @@ from frappe.model.document import Document
 
 
 class NetworkPrinterSettings(Document):
+	_DOCTYPE_NAME = "Network Printer Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -22,6 +24,7 @@ class NetworkPrinterSettings(Document):
 
 	@frappe.whitelist()
 	def get_printers_list(self):
+		self.check_permission("write")
 		printer_list = []
 		try:
 			import cups

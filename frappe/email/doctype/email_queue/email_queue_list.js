@@ -3,9 +3,9 @@ frappe.listview_settings["Email Queue"] = {
 		var colour = {
 			Sent: "green",
 			Sending: "blue",
-			"Not Sent": "grey",
+			"Not Sent": "gray",
 			Error: "red",
-			Expired: "orange",
+			Expired: "amber",
 		};
 		return [__(doc.status), colour[doc.status], "status,=," + doc.status];
 	},
@@ -23,7 +23,7 @@ frappe.listview_settings["Email Queue"] = {
 function show_toggle_sending_button(list_view) {
 	if (!has_common(frappe.user_roles, ["Administrator", "System Manager"])) return;
 
-	const sending_disabled = cint(frappe.sys_defaults.suspend_email_queue);
+	const sending_disabled = frappe.defaults.is_enabled("suspend_email_queue");
 	const label = sending_disabled ? __("Resume Sending") : __("Suspend Sending");
 
 	list_view.page.add_inner_button(label, async () => {
@@ -44,7 +44,7 @@ function show_toggle_sending_button(list_view) {
 }
 
 function add_bulk_retry_button_to_actions(list_view) {
-	list_view.page.add_actions_menu_item(__("Retry Sending"), () => {
+	const retry = () => {
 		frappe.msgprint(
 			__(
 				"Updating Email Queue Statuses. The emails will be picked up in the next scheduled run."
@@ -63,5 +63,6 @@ function add_bulk_retry_button_to_actions(list_view) {
 				}
 			},
 		});
-	});
+	};
+	list_view.page.add_actions_menu_item(__("Retry Sending"), retry, false, null, "rotate-cw");
 }

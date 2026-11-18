@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class IMAPFolder(Document):
+	_DOCTYPE_NAME = "IMAP Folder"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,6 +21,7 @@ class IMAPFolder(Document):
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data
+		sync_from_uid: DF.Int
 		uidnext: DF.Data | None
 		uidvalidity: DF.Data | None
 	# end: auto-generated types

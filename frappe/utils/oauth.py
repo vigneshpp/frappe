@@ -1,9 +1,10 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 
-import base64
+import hmac
 import json
 from collections.abc import Callable
+from functools import lru_cache
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -19,6 +20,61 @@ if TYPE_CHECKING:
 
 
 class SignupDisabledError(frappe.PermissionError): ...
+
+
+# Microsoft signs Office 365 id_tokens (both v1.0 and v2.0) with keys published here,
+# regardless of which tenant issued the token.
+OFFICE_365_JWKS_URI = "https://login.microsoftonline.com/common/discovery/keys"
+
+
+@lru_cache(maxsize=1)
+def _get_office_365_jwks_client():
+	from jwt import PyJWKClient
+
+	return PyJWKClient(OFFICE_365_JWKS_URI, cache_keys=True)
+
+
+def get_verified_office_365_claims(token: str, client_id: str) -> dict:
+	"""Decode an Office 365 id_token, verifying its Microsoft-issued signature and audience.
+
+	Unlike a same-tenant assumption, this does NOT verify that the token came from any
+	particular organization's Entra tenant, since the token could legitimately come from any
+	tenant (the /common endpoint is inherently multi-tenant). Tenant restriction is enforced
+	separately, by checking the returned "tid" claim against the Social Login Key's
+	configured Tenant ID.
+	"""
+	import jwt
+
+	signing_key = _get_office_365_jwks_client().get_signing_key_from_jwt(token)
+	return jwt.decode(token, signing_key.key, algorithms=["RS256"], audience=client_id)
+
+
+def enforce_office_365_tenant(info: dict, provider: str) -> None:
+	"""Reject the login unless it comes from a tenant this Social Login Key trusts.
+
+	Office 365's default endpoint (/common) is multi-tenant: a validly-signed token can
+	legitimately come from any Entra tenant, not just this organization's. The token's
+	signature and audience don't distinguish one tenant from another, so the "tid" claim
+	is checked separately against the Social Login Key's configured Tenant ID.
+	"""
+	tenant_id, trust_any_tenant = frappe.db.get_value(
+		"Social Login Key", provider, ["tenant_id", "trust_any_tenant"]
+	)
+
+	if trust_any_tenant:
+		return
+
+	if not tenant_id:
+		frappe.throw(
+			_(
+				"This Office 365 Social Login Key is not restricted to a specific tenant. "
+				"Set a Tenant ID, or enable 'Trust Any Tenant' if you intend to allow sign-in "
+				"from any organization."
+			)
+		)
+
+	if info.get("tid") != tenant_id:
+		frappe.throw(_("This Microsoft account does not belong to the expected organization."))
 
 
 def build_oauth_url(base_url: str, url: str | None = None) -> str:
@@ -93,25 +149,115 @@ def get_oauth_keys(provider: str) -> dict[str, str]:
 	}
 
 
+OAUTH_LOGIN_FLOW_CACHE_PREFIX = "frappe_oauth_login"
+OAUTH_LOGIN_BINDING_COOKIE = "oauth_login_binding"
+
+
+def _set_oauth_binding_cookie(binding_secret: str, cross_site: bool = False) -> None:
+	frappe.local.cookie_manager.set_cookie(
+		OAUTH_LOGIN_BINDING_COOKIE,
+		binding_secret,
+		max_age=600,
+		httponly=True,
+		# a form_post callback is a cross-site POST, which a Lax cookie is not sent on;
+		# SameSite=None is only accepted by browsers together with Secure
+		samesite="None" if cross_site and frappe.local.request.scheme == "https" else "Lax",
+	)
+
+
+def _get_or_create_oauth_binding_secret(cross_site: bool = False) -> str:
+	"""Return the browser-binding secret for this login attempt, minting one if needed.
+
+	Reuses an already-issued secret rather than replacing it, so that concurrent login
+	attempts from one browser stay redeemable:
+
+	- one already set earlier in this request: `/login` renders a button per enabled
+	  Social Login Key and each calls `create_oauth_state`, so minting per call would
+	  leave only the last provider's button working;
+	- one the browser already holds: re-rendering `/login` (a refresh, a second tab)
+	  would otherwise orphan the states from the earlier render.
+	"""
+	pending = frappe.local.cookie_manager.cookies.get(OAUTH_LOGIN_BINDING_COOKIE)
+	if pending and not cross_site:
+		return pending["value"]
+
+	# Re-set a held cookie so it keeps outliving the states minted against it. A provider
+	# that needs it cross-site upgrades one already queued by another button on this page.
+	binding_secret = (
+		pending["value"]
+		if pending
+		else frappe.local.request.cookies.get(OAUTH_LOGIN_BINDING_COOKIE) or frappe.generate_hash(length=32)
+	)
+	_set_oauth_binding_cookie(binding_secret, cross_site)
+	return binding_secret
+
+
+def create_oauth_state(redirect_to: str | None, cross_site: bool = False) -> str:
+	"""Create a single-use token referencing this login attempt's `redirect_to`.
+
+	The returned token is what gets sent to the OAuth provider as `state`. This request's
+	browser-binding secret is handed to the browser as an HttpOnly cookie and only its hash
+	is kept server-side, so `consume_oauth_state` can later tell whether the browser
+	completing the callback is the same one that started this login attempt.
+	"""
+	state = frappe.generate_hash(length=32)
+	binding_hash = frappe.utils.sha256_hash(_get_or_create_oauth_binding_secret(cross_site))
+
+	frappe.cache.set_value(
+		f"{OAUTH_LOGIN_FLOW_CACHE_PREFIX}:{state}",
+		{"redirect_to": redirect_to or "", "binding_hash": binding_hash},
+		expires_in_sec=600,
+	)
+	return state
+
+
+def consume_oauth_state(state: str) -> str | None:
+	"""Look up and invalidate the redirect_to stored for this login attempt.
+
+	Returns None if `state` doesn't reference a known, unused login attempt, or if the
+	request completing the callback doesn't carry the binding cookie set for it -
+	i.e. it isn't the browser that started this login attempt.
+
+	Single use belongs to the state, which is deleted here. The binding cookie is
+	deliberately not: it identifies the browser rather than one attempt, is shared by
+	every attempt that browser has in flight, and expires on its own.
+	"""
+	if not state:
+		return None
+	key = f"{OAUTH_LOGIN_FLOW_CACHE_PREFIX}:{state}"
+	data = frappe.cache.get_value(key)
+	frappe.cache.delete_value(key)
+
+	# A state minted before this binding shipped is a plain `redirect_to` string, and can
+	# still be in flight for its 600s lifetime across an upgrade. Treat it as expired
+	# rather than indexing a string and raising.
+	if not isinstance(data, dict):
+		return None
+
+	presented_secret = frappe.local.request.cookies.get(OAUTH_LOGIN_BINDING_COOKIE, "")
+	if not presented_secret or not hmac.compare_digest(
+		frappe.utils.sha256_hash(presented_secret), data.get("binding_hash") or ""
+	):
+		return None
+
+	return data.get("redirect_to")
+
+
 def get_oauth2_authorize_url(provider: str, redirect_to: str) -> str:
 	flow = get_oauth2_flow(provider)
 
-	state = {
-		"site": frappe.utils.get_url(),
-		"token": frappe.generate_hash(),
-		"redirect_to": redirect_to,
-	}
+	oauth2_providers = get_oauth2_providers()
+	auth_url_data = oauth2_providers[provider].get("auth_url_data", {})
 
-	# relative to absolute url
+	state = create_oauth_state(redirect_to, cross_site=auth_url_data.get("response_mode") == "form_post")
+
 	data = {
 		"redirect_uri": get_redirect_uri(provider),
-		"state": base64.b64encode(bytes(json.dumps(state).encode("utf-8"))),
+		"state": state,
 	}
 
-	oauth2_providers = get_oauth2_providers()
-
 	# additional data if any
-	data.update(oauth2_providers[provider].get("auth_url_data", {}))
+	data.update(auth_url_data)
 
 	return flow.get_authorize_url(**data)
 
@@ -158,6 +304,9 @@ def login_via_oauth2_id_token(provider: str, code: str, state: str, decoder: Cal
 def get_info_via_oauth(provider: str, code: str, decoder: Callable | None = None, id_token: bool = False):
 	import jwt
 
+	if not frappe.db.get_value("Social Login Key", provider, "enable_social_login"):
+		frappe.throw(_("Login with {0} is not enabled").format(provider.title()), frappe.PermissionError)
+
 	flow = get_oauth2_flow(provider)
 	oauth2_providers = get_oauth2_providers()
 
@@ -177,19 +326,55 @@ def get_info_via_oauth(provider: str, code: str, decoder: Callable | None = None
 	if id_token:
 		parsed_access = json.loads(session.access_token_response.text)
 		token = parsed_access["id_token"]
-		info = jwt.decode(token, flow.client_secret, options={"verify_signature": False})
+
+		if provider == "office_365":
+			client_id = get_oauth_keys(provider)["client_id"]
+			info = get_verified_office_365_claims(token, client_id)
+			enforce_office_365_tenant(info, provider)
+
+			if "email_verified" not in info:
+				# Azure AD's id_token doesn't emit this claim; having verified the signature
+				# and pinned the issuing tenant above, this organization's own directory data
+				# is trusted.
+				info["email_verified"] = True
+		else:
+			info = jwt.decode(token, flow.client_secret, options={"verify_signature": False})
 
 	else:
 		api_endpoint = oauth2_providers[provider].get("api_endpoint")
 		api_endpoint_args = oauth2_providers[provider].get("api_endpoint_args")
 		info = session.get(api_endpoint, params=api_endpoint_args).json()
 
-		if provider == "github" and not info.get("email"):
-			emails = session.get("/user/emails", params=api_endpoint_args).json()
-			email_dict = next(filter(lambda x: x.get("primary"), emails))
-			info["email"] = email_dict.get("email")
+		if provider == "github":
+			if info.get("email"):
+				# GitHub only allows a verified address to be set as the public profile email.
+				info["email_verified"] = True
+			else:
+				emails = session.get("/user/emails", params=api_endpoint_args).json()
+				email_dict = next(filter(lambda x: x.get("primary"), emails), None)
+				if email_dict:
+					info["email"] = email_dict.get("email")
+					info["email_verified"] = email_dict.get("verified", False)
 
-	if not (info.get("email_verified") or get_email(info)):
+		if provider == "google" and "verified_email" in info:
+			info["email_verified"] = info.get("verified_email")
+
+		if provider == "facebook" and info.get("email"):
+			# Facebook only returns "email" once the user has confirmed it, and the
+			# per-user "verified" field is deprecated/unreliable, so trust presence directly.
+			info["email_verified"] = True
+
+	provider_trusts_unverified_email = frappe.db.get_value(
+		"Social Login Key", provider, "trust_email_without_verified_claim"
+	)
+	if not (
+		get_email(info)
+		and (
+			info.get("email_verified")
+			# never override an explicit "email_verified": false, only its absence
+			or ("email_verified" not in info and provider_trusts_unverified_email)
+		)
+	):
 		frappe.throw(_("Email not verified with {0}").format(provider.title()))
 
 	return info
@@ -199,19 +384,19 @@ def login_oauth_user(
 	data: dict | str,
 	*,
 	provider: str | None = None,
-	state: dict | str,
+	state: str,
 	generate_login_token: bool = False,
 ):
-	# json.loads data and state
 	if isinstance(data, str):
 		data = json.loads(data)
 
-	if isinstance(state, str):
-		state = base64.b64decode(state)
-		state = json.loads(state.decode("utf-8"))
-
-	if not (state and state["token"]):
-		frappe.respond_as_web_page(_("Invalid Request"), _("Token is missing"), http_status_code=417)
+	redirect_to = consume_oauth_state(state)
+	if redirect_to is None:
+		frappe.respond_as_web_page(
+			_("Invalid Request"),
+			_("Your login attempt is invalid or has expired. Please try again."),
+			http_status_code=417,
+		)
 		return
 
 	# All user emails are stored as lowercase, but OAuth provider could have it in mixed case.
@@ -236,6 +421,9 @@ def login_oauth_user(
 			http_status_code=403,
 		)
 
+	for method in frappe.get_hooks("on_social_login"):
+		frappe.get_attr(method)(user=user, provider=provider, claims=data)
+
 	frappe.local.login_manager.login_as(user)
 
 	# because of a GET request!
@@ -248,10 +436,9 @@ def login_oauth_user(
 		frappe.response["login_token"] = login_token
 
 	else:
-		redirect_to = state.get("redirect_to")
 		redirect_post_login(
 			desk_user=frappe.local.response.get("message") == "Logged In",
-			redirect_to=redirect_to,
+			redirect_to=redirect_to or None,
 			provider=provider,
 		)
 

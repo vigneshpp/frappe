@@ -2,29 +2,42 @@
 # License: MIT. See LICENSE
 import datetime
 import json
+import math
 import threading
 
 import frappe
 from frappe import _, scrub
 from frappe.core.doctype.custom_role.custom_role import get_custom_allowed_roles
 from frappe.core.doctype.page.page import delete_custom_role
-from frappe.desk.query_report import run
-from frappe.desk.reportview import append_totals_row
+from frappe.desk.query_report import _run
+from frappe.desk.reportview import (
+	DEFAULT_AGGREGATE_FIELDNAME,
+	append_totals_row,
+	get_aggregate_field_info,
+	get_aggregate_fieldname,
+	normalize_group_by_settings,
+)
+from frappe.model.create_new import get_static_default_value
 from frappe.model.document import Document
 from frappe.modules import make_boilerplate
 from frappe.modules.export_file import export_to_files
-from frappe.utils import cint, cstr
+from frappe.utils import cast, cint, cstr, get_datetime, get_timedelta, now, nowtime, sbool
 from frappe.utils.safe_exec import check_safe_sql_query, safe_exec
-from frappe.utils.xlsxutils import XLSXMetadata, XLSXStyleBuilder
+from frappe.utils.xlsxutils import XLSXMetadata
+
+FRAMEWORK_FILTER_KEYS = ("translate_data", "prepared_report_name")
 
 
 class Report(Document):
+	_DOCTYPE_NAME = "Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
 	from typing import TYPE_CHECKING
 
 	if TYPE_CHECKING:
+		from frappe.core.doctype.doctype_to_sync.doctype_to_sync import DoctypeToSync
 		from frappe.core.doctype.has_role.has_role import HasRole
 		from frappe.core.doctype.report_column.report_column import ReportColumn
 		from frappe.core.doctype.report_filter.report_filter import ReportFilter
@@ -35,8 +48,12 @@ class Report(Document):
 		columns: DF.Table[ReportColumn]
 		default_letter_head: DF.Link | None
 		default_print_format: DF.Link | None
+		disable_prepared_report_automation: DF.Check
 		disabled: DF.Check
+		doctype_to_sync: DF.Table[DoctypeToSync]
+		documentation_url: DF.Data | None
 		filters: DF.Table[ReportFilter]
+		generate_csv: DF.Check
 		is_standard: DF.Literal["No", "Yes"]
 		javascript: DF.Code | None
 		json: DF.Code | None
@@ -49,7 +66,10 @@ class Report(Document):
 		report_script: DF.Code | None
 		report_type: DF.Literal["Report Builder", "Query Report", "Script Report", "Custom Report"]
 		roles: DF.Table[HasRole]
+		site_print_defaults: DF.Check
+		snapshot_report: DF.Check
 		timeout: DF.Int
+		validate_filters: DF.Check
 	# end: auto-generated types
 
 	def validate(self):
@@ -82,8 +102,40 @@ class Report(Document):
 		if self.default_print_format and self.has_value_changed("default_print_format"):
 			self.validate_default_print_format()
 
-		if self.default_letter_head and self.has_value_changed("letter_head"):
+		if self.default_letter_head and self.has_value_changed("default_letter_head"):
 			self.validate_default_letter_head()
+
+		if self.validate_filters:
+			self.validate_filter_rows()
+		else:
+			self.validate_list_filter_types()
+
+	def validate_filter_rows(self):
+		for row in self.filters:
+			if row.fieldtype == "Link" and not row.options:
+				frappe.throw(
+					_("Row #{0}: Link filter {1} needs a DocType in Options").format(
+						row.idx, frappe.bold(_(row.label))
+					),
+					title=_("Invalid Filters"),
+				)
+			if row.wildcard_filter and row.fieldtype in ("MultiSelectList", "DateRange"):
+				frappe.throw(
+					_("Row #{0}: Wildcard Filter does not work for filter type {1}").format(
+						row.idx, _(row.fieldtype)
+					),
+					title=_("Invalid Filters"),
+				)
+
+	def validate_list_filter_types(self):
+		for row in self.filters:
+			if row.fieldtype in ("MultiSelectList", "DateRange"):
+				frappe.throw(
+					_("Row #{0}: Filter type {1} needs {2} to be enabled").format(
+						row.idx, _(row.fieldtype), frappe.bold(_("Validate Filters"))
+					),
+					title=_("Invalid Filters"),
+				)
 
 	def before_insert(self):
 		self.set_doctype_roles()
@@ -93,6 +145,7 @@ class Report(Document):
 
 	def before_export(self, doc):
 		doc.prepared_report = 0
+		doc.site_print_defaults = 0
 
 	def on_trash(self):
 		if self.is_standard == "Yes":
@@ -109,7 +162,11 @@ class Report(Document):
 		delete_custom_role("report", self.name)
 
 	def clear_cache(self):
+		from frappe.desk.doctype.sidebar.sidebar import clear_computed_base_for
+
 		self.update_report_cache()
+		# a module with no `Sidebar` has its sidebar computed from reports like this one
+		clear_computed_base_for(self)
 		return super().clear_cache()
 
 	def update_report_cache(self):
@@ -134,7 +191,7 @@ class Report(Document):
 				roles = [{"role": d.role} for d in meta.permissions if d.permlevel == 0]
 				self.set("roles", roles)
 
-	def is_permitted(self):
+	def is_permitted(self, user=None):
 		"""Return True if `Has Role` is not set or the user is allowed."""
 		from frappe.utils import has_common
 
@@ -148,7 +205,7 @@ class Report(Document):
 		if not allowed:
 			return True
 
-		if has_common(frappe.get_roles(), allowed):
+		if has_common(frappe.get_roles(user), allowed):
 			return True
 
 	def update_report_json(self):
@@ -176,9 +233,12 @@ class Report(Document):
 		check_safe_sql_query(self.query)
 
 		frappe.db.begin(read_only=True)
-		result = [list(t) for t in frappe.db.sql(self.query, filters)]
-		columns = self.get_columns() or [cstr(c[0]) for c in frappe.db.get_description()]
-		frappe.db.rollback()
+		try:
+			result = [list(t) for t in frappe.db.sql(self.query, filters)]
+			columns = self.get_columns() or [cstr(c[0]) for c in frappe.db.get_description()]
+		finally:
+			# a raised query would leave the transaction open, blocking every later write
+			frappe.db.rollback()
 
 		return [columns, result]
 
@@ -186,20 +246,25 @@ class Report(Document):
 		# save the timestamp to automatically set to prepared
 		threshold = 15
 
+		executed_report = self.get("custom_report") or self.name
+
 		start_time = datetime.datetime.now()
 		prepared_report_watcher = None
-		if not self.prepared_report:
+		if not self.prepared_report and not self.disable_prepared_report_automation:
 			prepared_report_watcher = threading.Timer(
 				interval=threshold,
 				function=enable_prepared_report,
-				kwargs={"report": self.name, "site": frappe.local.site},
+				kwargs={"report": executed_report, "site": frappe.local.site},
 			)
 			prepared_report_watcher.start()
 
 		# The JOB
 		try:
 			if self.is_standard == "Yes":
-				res = self.execute_module(filters)
+				if self.snapshot_report:
+					res = self.execute_snapshot_report(filters)
+				else:
+					res = self.execute_module(filters)
 			else:
 				res = self.execute_script(filters)
 		finally:
@@ -207,11 +272,14 @@ class Report(Document):
 
 		execution_time = (datetime.datetime.now() - start_time).total_seconds()
 
-		frappe.cache.hset("report_execution_time", self.name, execution_time)
+		frappe.cache.hset("report_execution_time", executed_report, execution_time)
 
 		return res
 
 	def get_module_method(self, method):
+		if method not in ("execute", "execute_snapshot_report", "get_xlsx_styles", "formatter"):
+			raise Exception("Unknown report method")
+
 		module = self.module or frappe.db.get_value("DocType", self.ref_doctype, "module")
 		method_path = get_report_module_dotted_path(module, self.name) + "." + method
 		return frappe.get_attr(method_path)
@@ -228,6 +296,13 @@ class Report(Document):
 			return loc["data"]
 		else:
 			return self.get_columns(), loc["result"]
+
+	def execute_snapshot_report(self, filters):
+		try:
+			execute_snapshot_report = self.get_module_method("execute_snapshot_report")
+		except AttributeError:
+			return [], []
+		return execute_snapshot_report(frappe._dict(filters))
 
 	def get_data(
 		self,
@@ -254,8 +329,8 @@ class Report(Document):
 		self, filters=None, user=None, ignore_prepared_report=False, are_default_filters=True
 	):
 		columns, result = [], []
-		data = run(
-			self.name,
+		data = _run(
+			report_name=self.name,
 			filters=filters,
 			user=user,
 			ignore_prepared_report=ignore_prepared_report,
@@ -289,16 +364,15 @@ class Report(Document):
 		params = json.loads(self.json)
 		columns = self.get_standard_report_columns(params)
 		result = []
-		order_by, group_by, group_by_args = self.get_standard_report_order_by(params)
+		order_by, group_by, aggregate_fields = self.get_standard_report_order_by(params)
 
+		fields = [
+			aggregate_fields.get(fieldname) or Report._format([doctype, fieldname])
+			for fieldname, doctype in columns
+		]
 		_result = frappe.get_list(
 			self.ref_doctype,
-			fields=[
-				get_group_by_field(group_by_args, c[1])
-				if c[0] == "_aggregate_column" and group_by_args
-				else Report._format([c[1], c[0]])
-				for c in columns
-			],
+			fields=fields,
 			filters=self.get_standard_report_filters(params, filters),
 			order_by=order_by,
 			group_by=group_by,
@@ -307,12 +381,12 @@ class Report(Document):
 			user=user,
 		)
 
-		columns = self.build_standard_report_columns(columns, group_by_args)
+		columns = self.build_standard_report_columns(columns, aggregate_fields, group_by)
 
 		result = result + [list(d) for d in _result]
 
 		if params.get("add_totals_row"):
-			result = append_totals_row(result)
+			result = append_totals_row(result, fields)
 
 		return columns, result
 
@@ -321,7 +395,10 @@ class Report(Document):
 		# sort by is saved as DocType.fieldname, covert it to sql
 		return "`tab{}`.`{}`".format(*parts)
 
-	def get_standard_report_columns(self, params):
+	def get_standard_report_columns(self, params) -> list[list[str, str]]:
+		"""
+		Return [[fieldname, doctype], ...] for standard report based on the fields/columns.
+		"""
 		if params.get("fields"):
 			columns = params.get("fields")
 		elif params.get("columns"):
@@ -348,7 +425,7 @@ class Report(Document):
 		return _filters
 
 	def get_standard_report_order_by(self, params):
-		group_by_args = None
+		aggregate_fields = {}
 		if params.get("sort_by"):
 			order_by = Report._format(params.get("sort_by").split(".")) + " " + params.get("sort_order")
 
@@ -367,13 +444,17 @@ class Report(Document):
 
 		group_by = None
 		if params.get("group_by"):
-			group_by_args = frappe._dict(params["group_by"])
-			group_by = group_by_args["group_by"]
-			order_by = "_aggregate_column desc"
+			group_by_settings = normalize_group_by_settings(params["group_by"])
+			group_by = ", ".join(group_by_settings["group_by"])
+			aggregate_fields = {
+				get_aggregate_fieldname(i): get_group_by_field(aggregate, get_aggregate_fieldname(i))
+				for i, aggregate in enumerate(group_by_settings["aggregates"])
+			}
+			order_by = f"{DEFAULT_AGGREGATE_FIELDNAME} desc"
 
-		return order_by, group_by, group_by_args
+		return order_by, group_by, aggregate_fields
 
-	def build_standard_report_columns(self, columns, group_by_args):
+	def build_standard_report_columns(self, columns, aggregate_fields, group_by):
 		from frappe.model.meta import get_default_df
 
 		report_columns = []
@@ -388,21 +469,20 @@ class Report(Document):
 
 				if not column.get("label"):
 					column.label = meta.get_label(fieldname)
-			else:
-				label = (
-					get_group_by_column_label(group_by_args, meta)
-					if fieldname == "_aggregate_column"
-					else meta.get_label(fieldname)
-				)
 
-				column = frappe._dict(
-					{
-						"fieldname": fieldname,
-						"label": label,
-						"fieldtype": "Link" if fieldname == "name" else "Data",
-						"options": doctype if fieldname == "name" else None,
-					}
-				)
+				# since name is the primary key for a document, it will always be a Link datatype
+				if fieldname == "name":
+					column.fieldtype = "Link"
+					column.options = doctype
+			else:
+				if fieldname in aggregate_fields:
+					column = get_aggregate_field_info(aggregate_fields[fieldname], doctype, group_by)
+				else:
+					column = frappe._dict(
+						fieldname=fieldname,
+						label=_(frappe.unscrub(fieldname)),
+						fieldtype="Data",
+					)
 
 			report_columns.append(column)
 
@@ -430,23 +510,20 @@ class Report(Document):
 			frappe.throw(_("Standard reports can only be created in developer mode."))
 
 	def validate_default_print_format(self):
+		if not self.default_print_format:
+			return
+
 		pf = frappe.db.get_value(
 			"Print Format",
 			self.default_print_format,
-			["report", "print_format_for", "print_format_type", "disabled"],
+			["report", "print_format_for", "disabled"],
 			as_dict=True,
 		)
 
-		if (
-			not pf
-			or pf.report != self.name
-			or pf.print_format_for != "Report"
-			or pf.print_format_type != "JS"
-			or pf.disabled
-		):
+		if not pf or pf.report != self.name or pf.print_format_for != "Report" or pf.disabled:
 			frappe.throw(_("Selected Print Format is invalid for this Report."))
 
-	def validate_default_letter_head(self):
+	def validate_default_letter_head(self, standard_only: bool = True) -> None:
 		if not self.default_letter_head:
 			return
 
@@ -460,7 +537,7 @@ class Report(Document):
 		if (
 			not letter_head
 			or letter_head.letter_head_for != "Report"
-			or (self.is_standard == "Yes" and letter_head.standard != "Yes")
+			or (standard_only and self.is_standard == "Yes" and letter_head.standard != "Yes")
 			or letter_head.disabled
 		):
 			frappe.throw(
@@ -470,11 +547,66 @@ class Report(Document):
 			)
 
 	@frappe.whitelist()
-	def toggle_disable(self, disable: bool):
+	def set_print_defaults(self, print_format: str | None = None, letter_head: str | None = None) -> None:
 		if not self.has_permission("write"):
 			frappe.throw(_("You are not allowed to edit the report."))
 
+		self.default_print_format = print_format
+		self.default_letter_head = letter_head
+		self.validate_default_print_format()
+		self.validate_default_letter_head(standard_only=False)
+		self.db_set(
+			{
+				"default_print_format": print_format,
+				"default_letter_head": letter_head,
+				"site_print_defaults": 1,
+			},
+			update_modified=False,
+		)
+
+	@frappe.whitelist()
+	def toggle_disable(self, disable: bool):
+		if not frappe.has_permission(self.doctype, "write", doc=self):
+			frappe.throw(_("You are not allowed to edit the report."))
+
 		self.db_set("disabled", cint(disable))
+
+	def get_validated_filters(self, filters: dict, user: str) -> frappe._dict:
+		"""Return the filter values with defaults applied, checked against the Report Filter rows and cast to their fieldtypes."""
+		if not isinstance(filters, dict):
+			frappe.throw(_("Filters must be an object of field names and values"), title=_("Invalid Filters"))
+
+		rows_by_fieldname = {row.fieldname: row for row in self.filters}
+		allowed_keys = set(rows_by_fieldname) | set(FRAMEWORK_FILTER_KEYS)
+		if unknown_keys := set(filters) - allowed_keys:
+			frappe.throw(
+				_("Unknown filters: {0}").format(", ".join(sorted(unknown_keys))), title=_("Invalid Filters")
+			)
+
+		validated = frappe._dict({key: filters[key] for key in FRAMEWORK_FILTER_KEYS if key in filters})
+		for row in sorted(self.filters, key=lambda row: row.options in rows_by_fieldname):
+			value = filters[row.fieldname] if row.fieldname in filters else get_filter_default(row, user)
+			if value in (None, "", []):
+				if row.mandatory:
+					frappe.throw(
+						_("{0} is mandatory").format(frappe.bold(_(row.label))), title=_("Missing Filters")
+					)
+				continue
+
+			if row.fieldtype == "MultiSelectList" and row.options in rows_by_fieldname:
+				doctype_row = rows_by_fieldname[row.options]
+				if not validated.get(doctype_row.fieldname):
+					frappe.throw(
+						_("{0} needs a value for {1}").format(
+							frappe.bold(_(row.label)), frappe.bold(_(doctype_row.label))
+						),
+						title=_("Missing Filters"),
+					)
+				row = frappe._dict(row.as_dict(), options=validated[doctype_row.fieldname])
+
+			validated[row.fieldname] = get_validated_value(row, value, user)
+
+		return validated
 
 	def get_xlsx_styles_from_module(self, metadata: XLSXMetadata) -> dict:
 		if self.is_standard != "Yes" or self.report_type not in ("Query Report", "Script Report"):
@@ -482,11 +614,166 @@ class Report(Document):
 
 		try:
 			method = self.get_module_method("get_xlsx_styles")
-		except AttributeError:
+		except (AttributeError, ModuleNotFoundError):
 			# Ignore if hook(method) is not defined
 			return
 
 		return method(metadata)
+
+	def get_formatter_from_module(self):
+		"""Return the module's `formatter(value, column, data, default_formatter)`, used by PDFs built on the server."""
+		if self.is_standard != "Yes" or self.report_type != "Script Report":
+			return
+
+		try:
+			return self.get_module_method("formatter")
+		except AttributeError:
+			return
+
+
+def get_filter_default(row, user):
+	if row.default == "__user":
+		default = user
+	elif not row.default and row.fieldtype == "Link" and row.options != "User":
+		default = get_link_user_default(row, user)
+	elif row.fieldtype == "Datetime" and cstr(row.default).lower() == "now":
+		default = now()
+	elif row.fieldtype == "Time" and cstr(row.default).lower() == "now":
+		default = nowtime()
+	else:
+		default = get_static_default_value(row, [], [])
+
+	if default and row.fieldtype == "MultiSelectList":
+		return [default]
+	if default and row.fieldtype == "DateRange":
+		start, _sep, end = default.partition(",")
+		return [start, end or start]
+	return default
+
+
+def get_link_user_default(row, user):
+	user_default = frappe.defaults.get_user_default(row.fieldname, user)
+	if (
+		user_default
+		and frappe.db.exists(row.options, user_default)
+		and has_link_permission(row.options, user_default, user)
+	):
+		return user_default
+
+
+def get_validated_value(row, value, user):
+	if row.fieldtype in ("MultiSelectList", "DateRange"):
+		item_type = str | datetime.date if row.fieldtype == "DateRange" else str
+		if not isinstance(value, list | tuple) or not all(isinstance(item, item_type) for item in value):
+			frappe.throw(
+				_("{0} must be a list of values").format(frappe.bold(_(row.label))),
+				title=_("Invalid Filters"),
+			)
+
+		if row.fieldtype == "DateRange":
+			if len(value) != 2 or not all(value):
+				frappe.throw(
+					_("{0} must have a start and an end date").format(frappe.bold(_(row.label))),
+					title=_("Invalid Filters"),
+				)
+			start, end = (get_validated_date(row, "Date", item) for item in value)
+			if start > end:
+				frappe.throw(
+					_("{0} must not start after its end date").format(frappe.bold(_(row.label))),
+					title=_("Invalid Filters"),
+				)
+			return [start, end]
+
+		if row.options:
+			for item in value:
+				validate_link_value(row.options, item, user)
+		return list(value)
+
+	if row.fieldtype in ("Date", "Datetime", "Time"):
+		return get_validated_date(row, row.fieldtype, value)
+
+	if not isinstance(value, str | int | float):
+		frappe.throw(
+			_("{0} must be a single value").format(frappe.bold(_(row.label))),
+			title=_("Invalid Filters"),
+		)
+
+	if row.fieldtype == "Select" and cstr(value) not in (options := (row.options or "").split("\n")):
+		frappe.throw(
+			_('Filter {0} cannot be "{1}". It should be one of "{2}"').format(
+				frappe.bold(_(row.label)), value, '", "'.join(_(option) for option in options)
+			),
+			title=_("Invalid Filters"),
+		)
+
+	if row.fieldtype in ("Int", "Float", "Currency"):
+		return get_validated_number(row, value)
+
+	if row.fieldtype == "Check" and sbool(value) not in (0, 1):
+		frappe.throw(
+			_("{0} must be 0 or 1").format(frappe.bold(_(row.label))),
+			title=_("Invalid Filters"),
+		)
+
+	if row.fieldtype == "Link" and not row.wildcard_filter:
+		validate_link_value(row.options, cstr(value), user)
+
+	return cast(row.fieldtype, value)
+
+
+def get_validated_number(row, value):
+	try:
+		number = float(value)
+	except ValueError:
+		number = math.nan
+
+	if not math.isfinite(number) or (row.fieldtype == "Int" and not number.is_integer()):
+		frappe.throw(
+			_("{0} must be a valid {1}").format(frappe.bold(_(row.label)), _(row.fieldtype)),
+			title=_("Invalid Filters"),
+		)
+
+	return int(number) if row.fieldtype == "Int" else number
+
+
+def get_validated_date(row, fieldtype, value):
+	native_type = datetime.timedelta if fieldtype == "Time" else datetime.date
+	parsed = None
+	if isinstance(value, str | native_type):
+		try:
+			parsed = get_timedelta(value) if fieldtype == "Time" else get_datetime(value)
+		except (ValueError, OverflowError):
+			pass
+
+	if parsed is None:
+		frappe.throw(
+			_("{0} must be a valid {1}").format(frappe.bold(_(row.label)), _(fieldtype)),
+			title=_("Invalid Filters"),
+		)
+
+	return parsed.date() if fieldtype == "Date" else parsed
+
+
+def validate_link_value(doctype, value, user):
+	if not frappe.db.exists(doctype, value):
+		frappe.throw(
+			_("{0} {1} not found").format(_(doctype), value),
+			frappe.LinkValidationError,
+			title=_("Invalid Filters"),
+		)
+
+	if not has_link_permission(doctype, value, user):
+		frappe.throw(
+			_("You do not have permission to access {0}: {1}.").format(_(doctype), value),
+			frappe.PermissionError,
+			title=_("Invalid Filters"),
+		)
+
+
+def has_link_permission(doctype, value, user):
+	return frappe.has_permission(doctype, "read", value, user=user) or frappe.has_permission(
+		doctype, "select", value, user=user
+	)
 
 
 def is_prepared_report_enabled(report):
@@ -505,24 +792,14 @@ def get_report_module_dotted_path(module, report_name):
 	)
 
 
-def get_group_by_field(args, doctype):
-	if args["aggregate_function"] == "count":
-		group_by_field = {"COUNT": "*", "as": "_aggregate_column"}
-	else:
-		func_name = args["aggregate_function"].upper()
-		group_by_field = {func_name: args["aggregate_on"], "as": "_aggregate_column"}
+def get_group_by_field(group_by_args: dict, fieldname: str = DEFAULT_AGGREGATE_FIELDNAME) -> dict:
+	"""
+	Build the group by field based on the aggregate function and aggregate on field.
+	"""
+	func_name = group_by_args["aggregate_function"].upper()
+	aggregate_on = "*" if func_name == "COUNT" else group_by_args["aggregate_on"]
 
-	return group_by_field
-
-
-def get_group_by_column_label(args, meta):
-	if args["aggregate_function"] == "count":
-		label = "Count"
-	else:
-		sql_fn_map = {"avg": "Average", "sum": "Sum"}
-		aggregate_on_label = meta.get_label(args.aggregate_on)
-		label = _("{0} of {1}").format(_(sql_fn_map[args.aggregate_function]), _(aggregate_on_label))
-	return label
+	return {func_name: aggregate_on, "as": fieldname}
 
 
 def enable_prepared_report(report: str, site: str):
@@ -531,3 +808,72 @@ def enable_prepared_report(report: str, site: str):
 	frappe.db.set_value("Report", report, "prepared_report", 1)
 	frappe.db.commit()
 	frappe.destroy()
+
+
+def get_permission_query_conditions(user=None):
+	"""Hide reports whose Has Role table is set but does not include any role held by the
+	current user — mirroring the gate applied on the run path by get_report_doc()."""
+	user = user or frappe.session.user
+	user_roles = frappe.get_roles(user)
+	escaped_roles = ", ".join(frappe.db.escape(r) for r in user_roles)
+
+	if frappe.db.db_type == "postgres":
+		role_condition = f"""(
+			EXISTS (
+				SELECT 1 FROM "tabCustom Role" cr
+				JOIN "tabHas Role" hr ON hr.parent = cr.name AND hr.parenttype = 'Custom Role'
+				WHERE cr.report = "tabReport"."name" AND hr.role IN ({escaped_roles})
+			)
+			OR (
+				NOT EXISTS (
+					SELECT 1 FROM "tabCustom Role" cr
+					JOIN "tabHas Role" hr ON hr.parent = cr.name AND hr.parenttype = 'Custom Role'
+					WHERE cr.report = "tabReport"."name"
+				)
+				AND (
+					NOT EXISTS (
+						SELECT 1 FROM "tabHas Role"
+						WHERE "parenttype" = 'Report' AND "parent" = "tabReport"."name"
+					)
+					OR EXISTS (
+						SELECT 1 FROM "tabHas Role"
+						WHERE "parenttype" = 'Report' AND "parent" = "tabReport"."name"
+						AND "role" IN ({escaped_roles})
+					)
+				)
+			)
+		)"""
+		return role_condition
+
+	role_condition = f"""(
+		EXISTS (
+			SELECT 1 FROM `tabCustom Role` cr
+			JOIN `tabHas Role` hr ON hr.parent = cr.name AND hr.parenttype = 'Custom Role'
+			WHERE cr.report = `tabReport`.`name` AND hr.role IN ({escaped_roles})
+		)
+		OR (
+			NOT EXISTS (
+				SELECT 1 FROM `tabCustom Role` cr
+				JOIN `tabHas Role` hr ON hr.parent = cr.name AND hr.parenttype = 'Custom Role'
+				WHERE cr.report = `tabReport`.`name`
+			)
+			AND (
+				NOT EXISTS (
+					SELECT 1 FROM `tabHas Role`
+					WHERE `parenttype` = 'Report' AND `parent` = `tabReport`.`name`
+				)
+				OR EXISTS (
+					SELECT 1 FROM `tabHas Role`
+					WHERE `parenttype` = 'Report' AND `parent` = `tabReport`.`name`
+					AND `role` IN ({escaped_roles})
+				)
+			)
+		)
+	)"""
+	return role_condition
+
+
+def has_permission(doc, ptype=None, user=None, debug=False):
+	if ptype in ("read", "report") and not doc.is_permitted(user):
+		return False
+	return True

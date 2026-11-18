@@ -31,10 +31,16 @@ def get_page_info_from_web_page_with_dynamic_routes(path):
 
 def get_page_info_from_web_form(path):
 	"""Query published web forms and evaluate if the route matches"""
+	from frappe.app_state import get_disabled_modules
 	from frappe.website.doctype.web_form.web_form import get_published_web_forms
+
+	disabled_modules = get_disabled_modules()
 
 	for d in get_published_web_forms():
 		if not (path.startswith(f"{d.route}") or path.startswith(f"/{d.route}")):
+			continue
+
+		if d.module in disabled_modules:
 			continue
 
 		rules = []
@@ -63,7 +69,10 @@ def evaluate_dynamic_routes(rules, path):
 	Use Werkzeug routing to evaluate dynamic routes like /project/<name>
 	https://werkzeug.palletsprojects.com/en/1.0.x/routing/
 	"""
-	route_map = Map(rules)
+	return match_route_map(Map(rules), path)
+
+
+def match_route_map(route_map: Map, path: str):
 	endpoint = None
 
 	if hasattr(frappe.local, "request") and frappe.local.request.environ:
@@ -89,7 +98,7 @@ def get_pages(app=None):
 		if app:
 			apps = [app]
 		else:
-			apps = frappe.get_installed_apps()
+			apps = frappe.get_active_apps()
 
 		for app in apps:
 			app_path = frappe.get_app_path(app)
@@ -290,13 +299,13 @@ def get_doctypes_with_web_view():
 	"""Return doctypes with Has Web View or set via hooks"""
 
 	def _get():
-		installed_apps = frappe.get_installed_apps()
+		installed_apps = frappe.get_active_apps()
 		doctypes = frappe.get_hooks("website_generators")
 		doctypes_with_web_view = frappe.get_all(
 			"DocType", fields=["name", "module"], filters=dict(has_web_view=1)
 		)
 		module_app_map = frappe.local.module_app
-		doctypes += [
+		doctypes = doctypes + [
 			d.name
 			for d in doctypes_with_web_view
 			if module_app_map.get(frappe.scrub(d.module)) in installed_apps

@@ -14,10 +14,10 @@ import frappe
 from frappe import _
 from frappe.database.utils import dangerously_reconnect_on_connection_abort
 from frappe.desk.form.load import get_attachments
-from frappe.desk.query_report import generate_report_result
+from frappe.desk.query_report import generate_report_result, get_reference_report, get_user_facing_error
 from frappe.model.document import Document
 from frappe.monitor import add_data_to_monitor
-from frappe.utils import add_to_date, now
+from frappe.utils import add_to_date, get_url_to_report_with_filters, now
 from frappe.utils.background_jobs import enqueue, get_redis_conn
 
 # If prepared report runs for longer than this time it's automatically considered as failed
@@ -26,6 +26,8 @@ REPORT_TIMEOUT = 25 * 60
 
 
 class PreparedReport(Document):
+	_DOCTYPE_NAME = "Prepared Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -34,15 +36,13 @@ class PreparedReport(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
-		error_message: DF.Text | None
+		error_message: DF.Code | None
 		filters: DF.SmallText | None
 		job_id: DF.Data | None
 		peak_memory_usage: DF.Int
-		queued_at: DF.Datetime | None
-		queued_by: DF.Data | None
 		report_end_time: DF.Datetime | None
 		report_name: DF.Data
-		status: DF.Literal["Error", "Queued", "Completed", "Started"]
+		status: DF.Literal["Error", "Queued", "Completed", "Started", "Cancelled"]
 	# end: auto-generated types
 
 	@property
@@ -77,31 +77,47 @@ class PreparedReport(Document):
 
 	def after_insert(self):
 		timeout = frappe.get_value("Report", self.report_name, "timeout")
-		enqueue(
-			generate_report,
-			queue="long",
+		frappe.enqueue_task(
+			method="frappe.core.doctype.prepared_report.prepared_report.generate_report",
 			prepared_report=self.name,
+			task_name=self.report_name,
+			ref_doctype=self.doctype,
+			ref_docname=self.name,
 			timeout=timeout or REPORT_TIMEOUT,
+			show_progress_bar=False,
 			enqueue_after_commit=True,
 			at_front_when_starved=True,
+			queue="long",
 		)
 
-	def get_prepared_data(self, with_file_name=False):
+	def get_prepared_data(self, with_file_name=False, format="json"):
 		attachments = get_attachments(self.doctype, self.name)
 		if not attachments:
 			frappe.throw(_("No attachment found for the prepared report"), title=_("Attachment Not Found"))
 
 		attachment = None
+		is_format_json = format == "json"
+
+		def check_attachment_condition(f, is_format_json=is_format_json):
+			if is_format_json:
+				return f.file_name.endswith(".gz")
+			return f.file_name.startswith("csv_") and f.file_name.endswith(".csv")
+
 		for f in attachments or []:
-			if f.file_url.endswith(".gz"):
+			if check_attachment_condition(f, is_format_json):
 				attachment = f
 				break
 
 		attached_file = frappe.get_doc("File", attachment.name)
+		file_to_send = None
+		if is_format_json:
+			file_to_send = gzip.decompress(attached_file.get_content())
+		else:
+			file_to_send = attached_file.get_content()
 
 		if with_file_name:
-			return (gzip.decompress(attached_file.get_content()), attachment.file_name)
-		return gzip.decompress(attached_file.get_content())
+			return (file_to_send, attachment.file_name)
+		return file_to_send
 
 
 def generate_report(prepared_report):
@@ -117,34 +133,32 @@ def generate_report(prepared_report):
 
 		if report.report_type == "Custom Report":
 			custom_report_doc = report
-			reference_report = custom_report_doc.reference_report
-			report = frappe.get_doc("Report", reference_report)
+			report = get_reference_report(custom_report_doc)
+			report.custom_report = instance.report_name
+			report.prepared_report = custom_report_doc.prepared_report
+			report.disable_prepared_report_automation = custom_report_doc.disable_prepared_report_automation
 			if custom_report_doc.json:
 				data = json.loads(custom_report_doc.json)
 				if data:
 					report.custom_columns = data["columns"]
 
 		result = generate_report_result(report=report, filters=instance.filters, user=instance.owner)
+
 		create_json_gz_file(result, instance.doctype, instance.name, instance.report_name)
+
+		if report.generate_csv:
+			_enqueue_json_to_csv_conversion(prepared_report)
 
 		instance.status = "Completed"
 
-		frappe.get_doc(
-			{
-				"doctype": "Notification Log",
-				"subject": f"{instance.report_name} report is ready.",
-				"for_user": frappe.session.user,
-				"type": "Alert",
-				"document_type": "Report",
-				"document_name": report.name,
-				"link": f"/desk/query-report/{report.name}?prepared_report_name={instance.name}",
-			}
-		).insert(ignore_permissions=True)
-
 	except Exception:
+		frappe.db.rollback()
 		# we need to ensure that error gets stored
 		_save_error(instance, error=frappe.get_traceback(with_context=True))
-		return
+		notify_report_status(instance)
+		# reraise so 'Background Task' can capture
+		frappe.db.commit()
+		raise
 
 	instance.reload()
 	instance.status = "Completed"
@@ -153,10 +167,40 @@ def generate_report(prepared_report):
 	add_data_to_monitor(peak_memory_usage=instance.peak_memory_usage)
 	instance.save(ignore_permissions=True)
 
+	notify_report_status(instance)
+
+
+def notify_report_status(instance: PreparedReport):
+	"""Notify the owner that the report is done, successfully or not."""
+
+	if instance.status not in ("Completed", "Error"):
+		return
+
+	if instance.status == "Completed":
+		subject = _("Report {0} is ready.").format(frappe.bold(instance.report_name))
+	else:
+		subject = _("Report {0} failed to generate.").format(frappe.bold(instance.report_name))
+		if error := get_user_facing_error(instance.error_message):
+			subject = _("{0} Error: {1}", context="Prepared Report Notification").format(subject, error)
+
+	link = get_url_to_report_with_filters(instance.report_name, f"prepared_report_name={instance.name}")
+
+	frappe.get_doc(
+		{
+			"doctype": "Notification Log",
+			"subject": subject,
+			"for_user": instance.owner,
+			"document_type": "Report",
+			"document_name": instance.report_name,
+			"link": link,
+		}
+	).insert(ignore_permissions=True)
+
 	frappe.publish_realtime(
-		"report_generated",
+		"report_processed",
 		{"report_name": instance.report_name, "name": instance.name},
-		user=frappe.session.user,
+		user=instance.owner,
+		after_commit=True,
 	)
 
 
@@ -165,6 +209,7 @@ def _save_error(instance, error):
 	instance.reload()
 	instance.status = "Error"
 	instance.error_message = error
+	instance.report_end_time = frappe.utils.now()
 	instance.save(ignore_permissions=True)
 
 
@@ -186,6 +231,9 @@ def update_job_id(prepared_report):
 @frappe.whitelist()
 def make_prepared_report(report_name: str, filters: dict[str, Any] | str | list | None = None):
 	"""run reports in background"""
+	from frappe.desk.query_report import get_report_doc as validate_report_permission
+
+	validate_report_permission(report_name)
 	prepared_report = frappe.get_doc(
 		{
 			"doctype": "Prepared Report",
@@ -200,23 +248,43 @@ def make_prepared_report(report_name: str, filters: dict[str, Any] | str | list 
 @frappe.whitelist()
 def stop_prepared_report(report_name: str):
 	"""Stop a running Prepared Report job."""
+	from rq.job import Job, JobStatus
+
 	prepared_report = frappe.get_doc("Prepared Report", report_name)
 	prepared_report.check_permission("write")
 
-	job_id = prepared_report.job_id
-	if not job_id.startswith(frappe.local.site):
-		frappe.throw(f"Invalid job_id: must start with {frappe.local.site}")
+	if prepared_report.owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 
-	try:
-		send_stop_job_command(connection=get_redis_conn(), job_id=job_id)
+	job_id = prepared_report.job_id
+	if job_id:
+		if not job_id.startswith(f"{frappe.local.site}||"):
+			frappe.throw(f"Invalid job_id: must start with {frappe.local.site}")
+
+		conn = get_redis_conn()
+		job = Job.fetch(job_id, connection=conn)
+		if job.get_status(refresh=True) == JobStatus.STARTED:
+			send_stop_job_command(connection=conn, job_id=job_id)
+
+	if prepared_report.status != "Completed":
 		frappe.db.set_value(
 			"Prepared Report",
 			prepared_report.name,
 			{"status": "Cancelled"},
 		)
-		frappe.msgprint(_("Job stopped successfully"), alert=True, indicator="green")
-	except InvalidJobOperation:
-		frappe.msgprint(_("Job is not running."), title=_("Invalid Operation"))
+		if tasks := frappe.db.get_all(
+			"Background Task",
+			{
+				"ref_doctype": "Prepared Report",
+				"ref_docname": report_name,
+				"status": ["in", ["Queued", "Running"]],
+			},
+			pluck="name",
+		):
+			frappe.db.set_value("Background Task", {"name": ["in", tasks]}, "status", "Cancelled")
+			for task in tasks:
+				task_doc = frappe.get_doc("Background Task", task)
+				task_doc._publish({"task_id": task_doc.task_id, "status": "Cancelled"})
 
 
 def process_filters_for_prepared_report(filters: dict[str, Any] | str) -> str:
@@ -243,31 +311,50 @@ def get_reports_in_queued_state(report_name: str, filters: dict[str, Any] | str 
 	)
 
 
-def get_completed_prepared_report(filters, user, report_name):
+def get_last_processed_prepared_report(filters, user, report_name):
 	return frappe.db.get_value(
 		"Prepared Report",
 		filters={
-			"status": "Completed",
+			"status": ("in", ("Completed", "Error")),
 			"filters": process_filters_for_prepared_report(filters),
 			"owner": user,
 			"report_name": report_name,
 		},
+		order_by="creation desc",
 	)
 
 
 def expire_stalled_report():
-	frappe.db.set_value(
+	stalled_reports = frappe.get_all(
 		"Prepared Report",
-		{
+		filters={
 			"status": "Started",
 			"creation": ("<", add_to_date(now(), seconds=-FAILURE_THRESHOLD, as_datetime=True)),
 		},
+		fields=["name", "report_name", "owner"],
+	)
+
+	if not stalled_reports:
+		return
+
+	status = "Error"
+	error_message = _("Report timed out.")
+
+	frappe.db.set_value(
+		"Prepared Report",
+		{"name": ("in", [instance.name for instance in stalled_reports])},
 		{
-			"status": "Failed",
-			"error_message": frappe._("Report timed out."),
+			"status": status,
+			"error_message": error_message,
+			"report_end_time": now(),
 		},
 		update_modified=False,
 	)
+
+	for instance in stalled_reports:
+		instance.status = status
+		instance.error_message = error_message
+		notify_report_status(instance)
 
 
 @frappe.whitelist()
@@ -275,8 +362,8 @@ def delete_prepared_reports(reports: str | list[dict[str, Any]]):
 	reports = frappe.parse_json(reports)
 	for report in reports:
 		prepared_report = frappe.get_doc("Prepared Report", report["name"])
-		if prepared_report.has_permission():
-			prepared_report.delete(ignore_permissions=True, delete_permanently=True)
+		prepared_report.check_permission("read")
+		prepared_report.delete(ignore_permissions=True, delete_permanently=True)
 
 
 def create_json_gz_file(data, dt, dn, report_name):
@@ -303,12 +390,10 @@ def create_json_gz_file(data, dt, dn, report_name):
 
 
 @frappe.whitelist()
-def download_attachment(dn: str):
-	pr = frappe.get_doc("Prepared Report", dn)
-	if not pr.has_permission("read"):
-		frappe.throw(frappe._("Cannot Download Report due to insufficient permissions"))
+def download_attachment(dn: str, format: str):
+	pr = frappe.read_doc("Prepared Report", dn)
 
-	data, file_name = pr.get_prepared_data(with_file_name=True)
+	data, file_name = pr.get_prepared_data(with_file_name=True, format=format)
 	frappe.local.response.filename = file_name[:-3]
 	frappe.local.response.filecontent = data
 	frappe.local.response.type = "binary"
@@ -322,14 +407,17 @@ def get_permission_query_condition(user):
 
 	from frappe.utils.user import UserPermissions
 
-	user = UserPermissions(user)
+	user_perms = UserPermissions(user)
 
-	if "System Manager" in user.roles:
+	if "System Manager" in user_perms.roles:
 		return None
 
-	reports = [frappe.db.escape(report) for report in user.get_all_reports().keys()]
+	reports = [frappe.db.escape(report) for report in user_perms.get_all_reports().keys()]
 
-	return """`tabPrepared Report`.report_name in ({reports})""".format(reports=",".join(reports))
+	reports = ",".join(reports)
+	owner = frappe.db.escape(user)
+
+	return f"""`tabPrepared Report`.report_name in ({reports}) and `tabPrepared Report`.owner = {owner}"""
 
 
 def has_permission(doc, user):
@@ -345,12 +433,17 @@ def has_permission(doc, user):
 	if "System Manager" in user.roles:
 		return True
 
-	return doc.report_name in user.get_all_reports().keys()
+	return doc.report_name in user.get_all_reports().keys() and doc.owner == user.name
 
 
 @frappe.whitelist()
 def enqueue_json_to_csv_conversion(prepared_report_name: str):
 	"""Call this to enqueue the conversion in background."""
+	frappe.read_doc("Prepared Report", prepared_report_name)
+	_enqueue_json_to_csv_conversion(prepared_report_name)
+
+
+def _enqueue_json_to_csv_conversion(prepared_report_name: str):
 	enqueue(method=convert_json_to_csv, queue="long", prepared_report_name=prepared_report_name)
 
 
@@ -407,7 +500,6 @@ def convert_json_to_csv(prepared_report_name):
 			"subject": "Your CSV file is ready for download",
 			"email_content": f'Click <a href="{_file.file_url}" target="_blank">here</a> to download the file.',
 			"for_user": frappe.session.user,
-			"type": "Alert",
 			"document_type": "File",
 			"document_name": _file.name,
 			"link": _file.file_url,

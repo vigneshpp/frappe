@@ -5,6 +5,8 @@ from frappe.model.document import Document
 
 
 class CustomizeFormField(Document):
+	_DOCTYPE_NAME = "Customize Form Field"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -32,6 +34,7 @@ class CustomizeFormField(Document):
 			"Autocomplete",
 			"Attach",
 			"Attach Image",
+			"Attachment Gallery",
 			"Barcode",
 			"Button",
 			"Check",
@@ -72,12 +75,14 @@ class CustomizeFormField(Document):
 			"Text",
 			"Text Editor",
 			"Time",
+			"Vue Component",
 		]
 		hidden: DF.Check
 		hide_border: DF.Check
 		hide_days: DF.Check
 		hide_seconds: DF.Check
 		ignore_user_permissions: DF.Check
+		ignore_versioning: DF.Check
 		ignore_xss_filter: DF.Check
 		in_filter: DF.Check
 		in_global_search: DF.Check
@@ -91,8 +96,11 @@ class CustomizeFormField(Document):
 		label: DF.Data | None
 		length: DF.Int
 		link_filters: DF.JSON | None
+		make_attachment_public: DF.Check
 		mandatory_depends_on: DF.Code | None
 		mask: DF.Check
+		max_value: DF.Float
+		min_value: DF.Float
 		no_copy: DF.Check
 		non_negative: DF.Check
 		options: DF.SmallText | None

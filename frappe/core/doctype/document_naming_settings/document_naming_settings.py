@@ -15,6 +15,8 @@ class NamingSeriesNotSetError(frappe.ValidationError):
 
 
 class DocumentNamingSettings(Document):
+	_DOCTYPE_NAME = "Document Naming Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -116,7 +118,7 @@ class DocumentNamingSettings(Document):
 		)
 
 	def validate_set_series(self):
-		if self.transaction_type and not self.naming_series_options:
+		if self.transaction_type and not (self.naming_series_options or "").strip():
 			frappe.throw(_("Please set the series to be used."))
 
 	def set_series_options_in_meta(self, doctype: str, options: str) -> None:
@@ -133,19 +135,29 @@ class DocumentNamingSettings(Document):
 
 		option_string = "\n".join(options)
 
-		# Erase default first, it might not be in new options.
-		self.update_naming_series_property_setter(doctype, "default", "")
-		self.update_naming_series_property_setter(doctype, "options", option_string)
+		# Validate options and default together, without invalidating hidden mandatory fields in between.
+		self.update_naming_series_property_setter(
+			doctype, "options", option_string, validate_fields_for_doctype=False
+		)
 		self.update_naming_series_property_setter(doctype, "default", default)
 
 		self.naming_series_options = option_string
 
 		frappe.clear_cache(doctype=doctype)
 
-	def update_naming_series_property_setter(self, doctype, property, value):
+	def update_naming_series_property_setter(
+		self, doctype, property, value, validate_fields_for_doctype=True
+	):
 		from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 
-		make_property_setter(doctype, "naming_series", property, value, "Text")
+		make_property_setter(
+			doctype,
+			"naming_series",
+			property,
+			value,
+			"Text",
+			validate_fields_for_doctype=validate_fields_for_doctype,
+		)
 
 	def check_duplicate(self):
 		def stripped_series(s: str) -> str:

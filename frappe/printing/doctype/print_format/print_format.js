@@ -4,11 +4,36 @@
 frappe.ui.form.on("Print Format", "onload", function (frm) {
 	frm.add_fetch("doc_type", "module", "module");
 	frm.add_fetch("report", "module", "module");
+
+	if (frm.is_new() && !frm.doc.custom_format) {
+		frm.set_value("print_format_builder_beta", 1);
+	}
 });
 
 frappe.ui.form.on("Print Format", {
+	after_delete: function (frm) {
+		const [page, name] = frappe.get_prev_route();
+		if (page && (page !== "print-format-builder" || name !== frm.docname)) return;
+		frappe.route_flags.replace_route = true;
+		frappe.set_route("List", "Print Format");
+	},
+	before_save: function (frm) {
+		frm._created_this_save = frm.is_new();
+	},
+	after_save: function (frm) {
+		// A brand-new builder format has nothing to do on the form — take the
+		// user straight to the builder. Custom/Report formats stay here.
+		if (
+			frm._created_this_save &&
+			frm.doc.print_format_builder_beta &&
+			!frm.doc.custom_format &&
+			frm.doc.print_format_for !== "Report"
+		) {
+			frappe.set_route("print-format-builder", frm.doc.name);
+		}
+		frm._created_this_save = false;
+	},
 	refresh: function (frm) {
-		frm.set_intro("");
 		frm.toggle_enable(["html", "doc_type", "module"], false);
 		if (frappe.session.user === "Administrator" || frm.doc.standard === "No") {
 			frm.toggle_enable(["html", "doc_type", "module"], true);
@@ -18,24 +43,20 @@ frappe.ui.form.on("Print Format", {
 		if (frm.doc.standard === "Yes" && frappe.session.user !== "Administrator") {
 			frm.set_intro(__("Please duplicate this to make changes"));
 		}
-		frm.trigger("render_buttons");
+		frm.trigger("render_buttons").then(() => frm.trigger("render_convert_button"));
 		frm.toggle_display("standard", frappe.boot.developer_mode);
 		frm.trigger("hide_absolute_value_field");
 	},
 	render_buttons: function (frm) {
 		frm.page.clear_inner_toolbar();
 		if (!frm.is_new() && frm.doc.print_format_for === "DocType") {
-			if (!frm.doc.custom_format) {
+			if (!frm.doc.custom_format && !frm.doc.__onload?.renders_from_file) {
 				frm.add_custom_button(__("Edit Format"), function () {
 					if (!frm.doc.doc_type) {
 						frappe.msgprint(__("Please select DocType first"));
 						return;
 					}
-					if (frm.doc.print_format_builder_beta) {
-						frappe.set_route("print-format-builder-beta", frm.doc.name);
-					} else {
-						frappe.set_route("print-format-builder", frm.doc.name);
-					}
+					frappe.set_route("print-format-builder", frm.doc.name);
 				});
 			}
 			if (frappe.model.can_write("Customize Form")) {
@@ -60,15 +81,43 @@ frappe.ui.form.on("Print Format", {
 			}
 		}
 	},
+	render_convert_button: function (frm) {
+		if (frm.is_new() || !frm.doc.print_designer || !frappe.user.has_role("System Manager")) {
+			return;
+		}
+		frm.add_custom_button(__("Convert to Editor Format"), () =>
+			frappe.set_route("print-designer-migration", frm.doc.name)
+		);
+	},
 	custom_format: function (frm) {
 		var value = frm.doc.custom_format ? 0 : 1;
 		frm.set_value("align_labels_right", value);
 		frm.set_value("show_section_headings", value);
 		frm.set_value("line_breaks", value);
-		frm.trigger("render_buttons");
+		// Custom HTML formats can't use the builder — clear the flag
+		if (frm.doc.custom_format) {
+			frm.set_value("print_format_builder_beta", 0);
+		}
+		frm.trigger("render_buttons").then(() => frm.trigger("render_convert_button"));
 	},
 	doc_type: function (frm) {
 		frm.trigger("hide_absolute_value_field");
+	},
+	disabled: function (frm) {
+		if (!frm.doc.disabled || !frm.doc.doc_type) return;
+
+		frappe.model.with_doctype(frm.doc.doc_type, () => {
+			if (frappe.get_meta(frm.doc.doc_type).default_print_format !== frm.doc.name) return;
+
+			frappe.confirm(
+				__(
+					"{0} is the default print format for {1}. Disabling it will remove it as the default. Do you want to continue?",
+					[frm.doc.name.bold(), frm.doc.doc_type.bold()]
+				),
+				null,
+				() => frm.set_value("disabled", 0)
+			);
+		});
 	},
 	print_format_for: function (frm) {
 		if (frm.doc.print_format_for === "Report") {

@@ -6,90 +6,114 @@ authors = [
 description = "Metadata driven, full-stack low code web framework"
 requires-python = ">=3.14,<3.15"
 readme = "README.md"
+license = "MIT"
 dynamic = ["version"]
 dependencies = [
     # core dependencies
-    "Babel~=2.16.0",
-    "Click~=8.3.1",
-    "filelock~=3.20.1",
+    "Babel~=2.18.0",
+    "Click~=8.5.0",
+    "filelock~=4.2.4",
     "filetype~=1.2.0",
-    "GitPython~=3.1.45",
+    "GitPython~=3.2.0",
     "Jinja2~=3.1.6",
-    "Pillow~=12.2.0",
-    "PyJWT~=2.12.1",
+    "Pillow~=13.0.0",
+    "plutoprint~=0.22.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64') or sys_platform == 'win32'",
+    "PyJWT~=2.15.1",
+    "duckdb~=1.4.3",
+    "pyarrow~=26.0.0",
     # We depend on internal attributes,
     # do NOT add loose requirements on PyMySQL versions.
     "PyMySQL==1.1.2",
-    "pypdf==6.10.2",
-    "PyPika @ git+https://github.com/frappe/pypika@2c50e6142b2d61d2d243e466fdd5dc03b3d918f2",
-    "mysqlclient==2.2.7",
+    "pypdf==6.21.4",
+    "PyPika @ git+https://github.com/frappe/pypika@054ffb18a0a60f3c3f472dcce86116fd86db1188",
+    "mysqlclient==2.3.0",
     "PyQRCode~=1.2.1",
+    "python-barcode~=0.16.1",
     "PyYAML~=6.0.3",
-    "RestrictedPython~=8.1",
-    "WeasyPrint==68.0",
-    "pydyf==0.12.1",
-    "Werkzeug==3.1.6",
-    "Whoosh~=2.7.4",
-    "beautifulsoup4~=4.13.5",
+    "RestrictedPython~=8.5",
+    "packaging>=24.2",
+    "Werkzeug==3.1.9",
+    "beautifulsoup4~=4.15.0",
     "bleach-allowlist~=1.0.3",
-    "chardet~=5.2.0",
-    "croniter~=6.0.0",
-    "cryptography~=46.0.3",
-    "cssutils~=2.11.1",
+    "chardet~=7.6.0",
+    "croniter~=6.2.4",
+    "cryptography~=50.0.2",
+    "cssutils~=2.15.0",
     "email-reply-parser~=0.5.12",
-    "Faker~=18.10.1",
-    "gunicorn @ git+https://github.com/frappe/gunicorn@bb554053bb87218120d76ab6676af7015680e8b6",
+    "Faker~=40.43.0",
+    "gunicorn @ git+https://github.com/frappe/gunicorn@f189de0ec3143581d8826f707343fa36c3fb0184",
     "html5lib~=1.1",
-    "ipython~=8.37.0",
+    "ipython~=9.17.1",
     "ldap3~=2.9.1",
-    "markdown2~=2.5.4",
-    "MarkupSafe~=3.0.3",
-    "nh3~=0.3.2",
+    "markdown2~=2.5.5",
+    "MarkupSafe~=3.0.4",
+    "nh3~=0.3.7",
     "num2words~=0.5.14",
-    "oauthlib~=3.3.1",
+    "oauthlib~=4.0.0",
     "openpyxl~=3.1.5",
     "xlsxwriter~=3.2.9",
-    "orjson~=3.11.5",
+    "orjson~=3.13.0",
     "passlib~=1.7.4",
-    "pdfkit~=1.0.0",
-    "phonenumbers~=9.0.21",
+    "phonenumbers~=9.0.41",
     "premailer~=3.10.0",
-    "psutil~=7.0.0",
-    "psycopg2-binary~=2.9.11",
-    "pyOpenSSL~=26.0.0",
-    "pydantic~=2.12.5",
-    "pyotp~=2.9.0",
+    "psutil~=7.2.2",
+    "psycopg[binary]~=3.3.6",
+    "pyOpenSSL~=26.4.0",
+    "pydantic~=2.14.1",
+    "pyotp~=2.10.0",
     "python-dateutil~=2.9.0.post0",
-    "pytz==2025.2",
+    "pytz==2026.5",
     "rauth~=0.7.3",
-    "redis~=7.1.0",
-    "hiredis~=3.3.0",
+    "redis~=7.4.1",
+    "hiredis~=3.4.2",
     "requests-oauthlib~=2.0.0",
-    "requests~=2.33.0",
+    "requests~=2.34.2",
     # We depend on internal attributes of RQ.
     # Do NOT add loose requirements on RQ versions.
     # Audit the code changes w.r.t. background_jobs.py before updating.
     "rq==2.6.1",
     "rsa~=4.9.1",
     "semantic-version~=2.10.0",
-    "sentry-sdk~=2.60.0",
-    "sqlparse~=0.5.5",
-    "sql_metadata~=2.19.0",
-    "tenacity~=9.1.2",
+    "sentry-sdk~=2.72.0",
+    "sqlglot~=30.22.0",
+    "sqlparse~=0.6.0",
+    "sql_metadata~=3.0.1",
+    "tenacity~=9.2.1",
     "terminaltables~=3.1.10",
     "traceback-with-variables~=2.2.1",
+    "typst~=0.15.0",
     "typing_extensions>=4.15.0,<5",
+    "tzdata~=2026.5",
     "xlrd~=2.0.2",
     "zxcvbn~=4.5.0",
-    "markdownify~=1.2.2",
+    "markdownify~=1.2.3",
+    # studio
+    "litellm==1.103.2",
+    "json_repair~=0.59",
+    # flow
+    "frappe-flow==0.1.28",
+    "onnxruntime~=1.27",
+    "pdfplumber~=0.11",
+    "python-docx~=1.1",
+    "rapidocr~=3.0",
+    "sqlite-vec~=0.1.9",
     # integration dependencies
-    "google-api-python-client~=2.188.0",
-    "google-auth-oauthlib~=1.2.4",
-    "google-auth~=2.48.0",
-    "posthog~=5.0.0",
+    "google-api-python-client~=2.201.0",
+    "google-auth-oauthlib~=1.5.0",
+    "google-auth~=2.62.0",
     "vobject~=0.9.9",
-    "pycountry~=24.6.1",
-    "websockets~=15.0.1",
+    "pycountry~=26.2.16",
+    "websockets~=17.2",
+    # realtime (Python Socket.IO server) — speaks Socket.IO v5 / Engine.IO v4,
+    # wire-compatible with the browser's socket.io-client ^4.7.1.
+    # Pin exact versions after a manual handshake check (polling + websocket upgrade).
+    "python-socketio~=5.17.0",
+    "python-engineio~=4.14.0",
+    # ASGI server for the realtime process.
+    "uvicorn~=0.54.0",
+    "a2wsgi~=1.10.10",
+    # async HTTP client for the realtime connect/auth path.
+    "httpx~=0.28.1",
 ]
 
 [project.urls]
@@ -100,9 +124,10 @@ Documentation = "https://docs.frappe.io/framework"
 
 [project.optional-dependencies]
 dev = [
-    "pyngrok~=7.5.0",
+    "pyperf==2.10.0",
+    "pyngrok~=8.1.2",
     "watchdog~=6.0.0",
-    "responses==0.23.1",
+    "responses==0.26.3",
     # typechecking
     "basedmypy",
     "types-PyMySQL",
@@ -118,24 +143,22 @@ dev = [
     "types-openpyxl",
     "types-passlib",
     "types-psutil",
-    "types-psycopg2",
     "types-python-dateutil",
     "types-pytz",
     "types-requests",
     "types-six",
     "types-vobject",
     "types-zxcvbn",
-    "pypika-stubs",  # contributed
 ]
 test = [
-    "unittest-xml-reporting~=3.2.0",
-    "coverage~=7.13.5",
-    "hypothesis~=6.77.0",
+    "unittest-xml-reporting~=4.0.0",
+    "coverage~=7.14.1",
+    "hypothesis~=6.155.2",
     "freezegun~=1.5.1",
 ]
 
 [build-system]
-requires = ["flit_core >=3.4,<4"]
+requires = ["flit_core >=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [tool.frappe.testing.function_type_validation]
@@ -146,17 +169,27 @@ skip_namespaces = [
 ]
 
 [tool.bench.dev-dependencies]
-coverage = "~=7.13.5"
-pyngrok = "~=7.5.0"
-unittest-xml-reporting = "~=3.2.0"
+coverage = "~=7.14.1"
+pyperf = "==2.8.1"
+pyngrok = "~=8.1.2"
+unittest-xml-reporting = "~=4.0.0"
 watchdog = "~=6.0.0"
-hypothesis = "~=6.77.0"
+hypothesis = "~=6.155.2"
 responses = "==0.23.1"
 freezegun = "~=1.5.5"
+spdx-tools = "~=0.8.5"
+
+# flow: for OpenCV, which rapidocr installs
+[deploy.dependencies.apt]
+packages = ["libgl1", "libglib2.0-0"]
+
+[tool.pilot.processes.flow_server]
+frappe_command = ["flow-server", "serve"]
+env = { FLOW_SERVER_MANAGER = "supervisor" }
 
 [tool.ruff]
 line-length = 110
-target-version = "py314"
+target-version = "py313"
 exclude = [
     "**/doctype/*/boilerplate/*.py" # boilerplate are template strings, not valid python
 ]
@@ -203,7 +236,6 @@ docstring-code-format = true
 nixpkgs-deps = [
     "mariadb",
     "restic",
-    "wkhtmltopdf-bin",
     "which",
     "gzip",
     "bash",
@@ -211,6 +243,14 @@ nixpkgs-deps = [
     "nodejs_20",
     "python312",
 ]
+
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { pypdf = false, filelock = false } # drop pypdf after 2026-11-04, filelock after 2026-11-10
+
+[tool.uv.sources]
+# Installs through uv (bench, Pilot) take the harness from this checkout, so it ships with frappe. pip installs and frappe's wheel still take the PyPI pin above.
+frappe-flow = { path = "flow/harness", editable = true }
 
 [tool.mypy]
 strict = false
@@ -259,17 +299,9 @@ module = [
     "google.oauth2",
     "google.oauth2.credentials",
     "markdown2",
-    "markdownify",
     "num2words",
-    "pdfkit",
     "premailer",
     "pyngrok",
-    "pypika",
-    "pypika.dialects",
-    "pypika.functions",
-    "pypika.queries",
-    "pypika.terms",
-    "pypika.utils",
     "pyqrcode",
     "rauth",
     "requests_oauthlib",
@@ -277,16 +309,8 @@ module = [
     "RestrictedPython.Guards",
     "RestrictedPython.transformer",
     "semantic_version",
-    "sql_metadata",
-    "sqlparse",
     "terminaltables",
     "traceback_with_variables",
-    "weasyprint",
-    "whoosh.fields",
-    "whoosh.index",
-    "whoosh.qparser",
-    "whoosh.query",
-    "whoosh.writing",
     "xlrd",
     "xmlrunner",
 ]

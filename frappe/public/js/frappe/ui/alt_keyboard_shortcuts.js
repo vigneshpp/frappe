@@ -1,3 +1,5 @@
+import { is_input, key_target } from "./keyboard";
+
 frappe.provide("frappe.ui.keys");
 
 let shortcut_groups = new WeakMap();
@@ -36,6 +38,9 @@ frappe.ui.keys.bind_shortcut_group_event = () => {
 	}
 
 	$(document).on("keydown", (e) => {
+		// on macOS, Option+letter types a character (ß, ż, @) into the field
+		if (frappe.utils.is_mac() && is_input(key_target(e))) return;
+
 		let key = (frappe.ui.keys.key_map[e.which] || "").toLowerCase();
 
 		if (key === "alt") {
@@ -95,21 +100,18 @@ function get_shortcut_for_key(key) {
 frappe.ui.keys.AltShortcutGroup = class AltShortcutGroup {
 	constructor() {
 		this.shortcuts_dict = {};
+		this.blacklisted_letters = [];
 
-		const locale = new Intl.Locale(navigator.language);
+		let language;
+		try {
+			language = new Intl.Locale(navigator.language).language;
+		} catch {
+			language = null;
+		}
+
 		// Skip certain Keys for different Languages on different Platforms
-		switch (locale.language) {
-			case "de":
-				if (frappe.utils.is_mac()) {
-					this.blacklisted_letters = ["e", "l"];
-				} else {
-					this.blacklisted_letters = ["q"];
-				}
-
-				break;
-			default:
-				this.blacklisted_letters = [];
-				break;
+		if (language === "de" && !frappe.utils.is_mac()) {
+			this.blacklisted_letters = ["q"];
 		}
 
 		$current_dropdown = null;

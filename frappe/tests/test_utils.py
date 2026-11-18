@@ -10,6 +10,7 @@ from decimal import ROUND_HALF_UP, Decimal, localcontext
 from enum import Enum
 from io import StringIO
 from mimetypes import guess_type
+from typing import Literal
 from unittest.mock import patch
 
 from hypothesis import given
@@ -20,7 +21,6 @@ import frappe
 from frappe.installer import parse_app_name
 from frappe.model.document import Document
 from frappe.tests import IntegrationTestCase, MockedRequestTestCase, UnitTestCase
-from frappe.tests.utils import toggle_test_mode
 from frappe.utils import (
 	ceil,
 	dict_to_str,
@@ -30,7 +30,7 @@ from frappe.utils import (
 	format_timedelta,
 	get_bench_path,
 	get_file_timestamp,
-	get_gravatar,
+	get_identicon,
 	get_link_to_report,
 	get_safe_filters,
 	get_site_info,
@@ -50,8 +50,10 @@ from frappe.utils import (
 	validate_url,
 )
 from frappe.utils.change_log import (
+	check_for_update,
 	get_source_url,
 	parse_github_url,
+	parse_latest_non_beta_release,
 )
 from frappe.utils.data import (
 	add_to_date,
@@ -69,6 +71,7 @@ from frappe.utils.data import (
 	format_duration,
 	get_datetime,
 	get_first_day_of_week,
+	get_image_thumbnail_uri,
 	get_time,
 	get_timedelta,
 	get_timespan_date_range,
@@ -79,6 +82,7 @@ from frappe.utils.data import (
 	map_trackers,
 	now_datetime,
 	nowtime,
+	orjson_dumps,
 	pretty_date,
 	rounded,
 	sha256_hash,
@@ -241,6 +245,47 @@ class TestFilters(IntegrationTestCase):
 		}
 		self.assertFalse(evaluate_filters(doc, [("last_password_reset_date", "Timespan", "today")]))
 
+	def test_between_operator(self):
+		"""Test 'between' operator for inclusive range checks."""
+		# Numbers
+		self.assertTrue(compare(5, "between", [1, 10]))
+		self.assertTrue(compare(1, "between", [1, 10]))
+		self.assertTrue(compare(10, "between", [1, 10]))
+		self.assertFalse(compare(0, "between", [1, 10]))
+		self.assertFalse(compare(11, "between", [1, 10]))
+		self.assertFalse(compare(None, "between", [1, 10]))
+
+		# Numbers with fieldtype casting
+		self.assertTrue(compare("5", "between", ["1", "10"], "Int"))
+		self.assertFalse(compare("0", "between", ["1", "10"], "Int"))
+
+		# Dates
+		self.assertTrue(compare("2024-06-15", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertTrue(compare("2024-01-01", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertTrue(compare("2024-12-31", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertFalse(compare("2023-12-31", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertFalse(compare(None, "between", ["2024-01-01", "2024-12-31"], "Date"))
+
+		# Datetime: date-only upper bound includes the full final day (matches DB between)
+		self.assertTrue(compare("2024-12-31 15:30:00", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		self.assertTrue(compare("2024-12-31 23:59:59", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		self.assertFalse(compare("2025-01-01 00:00:00", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		# Explicit datetime upper bound is not expanded to end-of-day
+		self.assertFalse(
+			compare(
+				"2024-12-31 15:30:00",
+				"between",
+				["2024-01-01 00:00:00", "2024-12-31 12:00:00"],
+				"Datetime",
+			)
+		)
+
+		# evaluate_filters: API lowercase and UI capitalized form
+		doc = {"doctype": "User", "birth_date": "2024-06-15"}
+		self.assertTrue(evaluate_filters(doc, [("birth_date", "between", ["2024-01-01", "2024-12-31"])]))
+		self.assertTrue(evaluate_filters(doc, [("birth_date", "Between", ["2024-01-01", "2024-12-31"])]))
+		self.assertFalse(evaluate_filters(doc, [("birth_date", "between", ["2025-01-01", "2025-12-31"])]))
+
 	def test_is_operator(self):
 		"""Test 'is' operator for checking if values are set or not set."""
 		# Test "is set" with different fieldtypes and values
@@ -401,6 +446,12 @@ class TestMoney(IntegrationTestCase):
 				(0, "MRO Zero only."),
 				("Fail", ""),
 			],
+			"USD": [
+				(0.29, "Twenty Nine Cent only."),
+				(0.57, "Fifty Seven Cent only."),
+				(0.58, "Fifty Eight Cent only."),
+				(1.57, "USD One and Fifty Seven Cent only."),
+			],
 		}
 
 		for currency, cases in test_cases.items():
@@ -540,6 +591,75 @@ class TestHTMLUtils(IntegrationTestCase):
 		self.assertIn("ordered", clean)
 		self.assertNotIn("xyz", clean)
 
+		# content that happens to parse as JSON is still sanitized when it carries tags
+		self.assertNotIn("<script>", sanitize_html('"<script>alert(1)</script>"'))
+		self.assertNotIn("<script>", sanitize_html('["<script>alert(1)</script>"]'))
+		self.assertNotIn("<script>", sanitize_html('{"x": "<script>alert(1)</script>"}'))
+
+		# tag-free content (including JSON) is returned unchanged
+		self.assertEqual(sanitize_html('[["name", "=", "x"]]'), '[["name", "=", "x"]]')
+		self.assertEqual(sanitize_html("plain text"), "plain text")
+
+	def test_sanitize_html_payload(self):
+		import json
+
+		from frappe.utils.html_utils import sanitize_html, sanitize_html_payload
+
+		# a web form submission: the Text Editor value carries a quoted attribute, and
+		# sanitizing the serialized payload would rewrite that quote as `&quot;` and
+		# leave the JSON unparseable
+		payload = json.dumps({"requirement": '<div class="ql-editor read-mode"><p>Hi</p></div>'})
+		self.assertEqual(sanitize_html_payload(payload), payload)
+		self.assertEqual(json.loads(sanitize_html_payload(payload)), json.loads(payload))
+
+		# markup inside a payload is still sanitized, at every depth
+		for unsafe in (
+			'"<script>alert(1)</script>"',
+			'["<script>alert(1)</script>"]',
+			'{"x": "<script>alert(1)</script>"}',
+			'{"a": {"b": ["<img src=x onerror=alert(1)>"]}}',
+		):
+			clean = sanitize_html_payload(unsafe)
+			self.assertNotIn("<script>", clean)
+			self.assertNotIn("onerror", clean)
+
+		# a payload nested inside another payload is handled too
+		nested = json.dumps({"args": json.dumps({"desc": "<script>alert(1)</script>"})})
+		self.assertNotIn("<script>", sanitize_html_payload(nested))
+		self.assertEqual(json.loads(json.loads(sanitize_html_payload(nested))["args"])["desc"], "")
+
+		# tag-free content is returned unchanged
+		for untouched in ('[["name", "=", "x"]]', "plain text", "1-10", "", "null"):
+			self.assertEqual(sanitize_html_payload(untouched), untouched)
+
+		# content that is not JSON is sanitized exactly as before
+		html = "<script>alert(1)</script><p>hi</p>"
+		self.assertEqual(sanitize_html_payload(html), sanitize_html(html))
+
+		# non-strings are left alone
+		self.assertEqual(sanitize_html_payload(None), None)
+
+		# a guest can post arbitrarily nested JSON cheaply (two bytes a level), so the
+		# walk is bounded; past the bound it sanitizes the text as one blob instead of
+		# running the interpreter out of stack
+		self.assertEqual(sanitize_html_payload("[" * 5000 + "]" * 5000), "[" * 5000 + "]" * 5000)
+		buried = json.dumps(json.loads("[" * 800 + '"<script>alert(1)</script>"' + "]" * 800))
+		self.assertNotIn("<script>", sanitize_html_payload(buried))
+
+		# a payload at a realistic depth is still walked, not treated as one blob
+		nested_doc = json.dumps({"doc": {"items": [{"description": '<div class="x"><p>hi</p></div>'}]}})
+		self.assertEqual(sanitize_html_payload(nested_doc), nested_doc)
+
+	def test_sanitize_svg(self):
+		from frappe.utils.html_utils import sanitize_svg
+
+		clean = sanitize_svg('<svg onload="alert(1)"><script>alert(1)</script><circle r="4"/></svg>')
+		self.assertIn("<circle", clean)
+		self.assertNotIn("script", clean)
+		self.assertNotIn("onload", clean)
+
+		self.assertIsNone(sanitize_svg(None))
+
 
 class TestValidationUtils(IntegrationTestCase):
 	def test_valid_url(self):
@@ -633,6 +753,53 @@ class TestValidationUtils(IntegrationTestCase):
 			validate_email_address("test@example.com, undisclosed-recipients:;"), "test@example.com"
 		)
 
+		# Recover valid addresses from a list that contains malformed entries.
+		# Previously a single bad entry (here: `foo@bar.baz@baz`) caused strict
+		# mode to drop the whole list including the valid `bar@bar.baz`.
+		self.assertEqual(
+			validate_email_address("invalid, foo@bar.baz@baz, bar@bar.baz"),
+			"bar@bar.baz",
+		)
+
+		# Quoted display name preserved on the slow path: one entry is bad
+		# (`bad@@email`), but the valid `john@example.com` must still be
+		# recovered without the quoted comma in the display name corrupting
+		# the split.
+		self.assertEqual(
+			validate_email_address('"Smith, John" <john@example.com>, bad@@email'),
+			"john@example.com",
+		)
+
+		# Silently-truncated inputs must be rejected, not sanitized.
+		# `alice@example.com)` should NOT become `alice@example.com` just
+		# because the parser can extract a clean prefix.
+		self.assertFalse(validate_email_address("alice@example.com)"))
+		self.assertFalse(validate_email_address("alice@example.com (unclosed comment"))
+		self.assertFalse(validate_email_address("alice@[192.168.0.1"))
+
+		# Trailing garbage after a valid prefix must be rejected. The parser
+		# returns these addrs as-is (with the trailing chars attached); only a
+		# full-string regex anchor catches them. `re.match` would have accepted
+		# the valid prefix and ignored the tail.
+		self.assertFalse(validate_email_address("alice@example.com."))
+		self.assertFalse(validate_email_address("alice@example.com.."))
+		self.assertFalse(validate_email_address("alice@example.com#fragment"))
+		self.assertFalse(validate_email_address("alice@example.com\x00"))
+
+		# CRLF separator (Windows-style line endings)
+		self.assertEqual(
+			validate_email_address("test1@example.com\r\ntest2@example.com"),
+			"test1@example.com, test2@example.com",
+		)
+
+		# Throw mode rejects silently-truncated input
+		self.assertRaises(
+			frappe.InvalidEmailAddressError,
+			validate_email_address,
+			"alice@example.com)",
+			throw=True,
+		)
+
 	def test_valid_phone(self):
 		valid_phones = ["+91 1234567890", ""]
 
@@ -674,6 +841,22 @@ class TestValidationUtils(IntegrationTestCase):
 		for not_iban in invalid_ibans:
 			self.assertFalse(is_valid_iban(not_iban))
 
+	def test_parse_json_passthrough_and_decode(self):
+		from frappe.utils.data import parse_json
+
+		# already-native values pass through untouched (the new JSON request-body path)
+		self.assertEqual(parse_json({"a": 1}), {"a": 1})
+		self.assertEqual(parse_json([1, 2]), [1, 2])
+		self.assertEqual(parse_json(None), None)
+		self.assertEqual(parse_json(1), 1)
+
+		# strings still decode (legacy form-encoded path)
+		self.assertEqual(parse_json('{"a": 1}'), {"a": 1})
+		self.assertEqual(parse_json("[1, 2]"), [1, 2])
+
+		# decoded dicts become frappe._dict (attribute access)
+		self.assertEqual(parse_json('{"a": 1}').a, 1)
+
 
 class TestImage(IntegrationTestCase):
 	def test_strip_exif_data(self):
@@ -689,6 +872,36 @@ class TestImage(IntegrationTestCase):
 		self.assertEqual(new_image._getexif(), None)
 		self.assertNotEqual(original_image._getexif(), new_image._getexif())
 
+		# Testing idempotency of strip_exif_data()
+		restripped_image_content = strip_exif_data(new_image_content, "image/jpeg")
+		self.assertEqual(restripped_image_content, new_image_content)
+
+	def test_image_thumbnail_does_not_read_outside_public_or_private(self):
+		sample = frappe.get_app_path("frappe", "tests", "data", "exif_sample_image.jpg")
+		secret = frappe.get_site_path("private", "files", "thumbnail_traversal_secret.jpg")
+		os.makedirs(os.path.dirname(secret), exist_ok=True)
+		with open(sample, "rb") as src, open(secret, "wb") as dst:
+			dst.write(src.read())
+		self.addCleanup(os.remove, secret)
+
+		frappe.local._print_thumbnail_cache = {}
+		url = "/../private/files/thumbnail_traversal_secret.jpg"
+		self.assertEqual(get_image_thumbnail_uri(url), url)
+
+		link = frappe.get_site_path("public", "files", "thumbnail_traversal_link.jpg")
+		os.symlink(os.path.abspath(secret), link)
+		self.addCleanup(os.remove, link)
+		self.assertEqual(
+			get_image_thumbnail_uri("/files/thumbnail_traversal_link.jpg"),
+			"/files/thumbnail_traversal_link.jpg",
+		)
+
+		public = frappe.get_site_path("public", "files", "thumbnail_public.jpg")
+		with open(sample, "rb") as src, open(public, "wb") as dst:
+			dst.write(src.read())
+		self.addCleanup(os.remove, public)
+		self.assertTrue(get_image_thumbnail_uri("/files/thumbnail_public.jpg").startswith("data:image/"))
+
 	def test_optimize_image(self):
 		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
 		content_type = guess_type(image_file_path)[0]
@@ -701,6 +914,289 @@ class TestImage(IntegrationTestCase):
 		self.assertLessEqual(width, 500)
 		self.assertLessEqual(height, 500)
 		self.assertLess(len(optimized_content), len(original_content))
+
+	def test_optimize_image_fills_transparency_with_white(self):
+		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
+		image = Image.open(image_file_path).convert("RGBA")
+		image.paste((0, 0, 0, 0), (0, 0, image.width // 2, image.height))
+		content = io.BytesIO()
+		image.save(content, format="PNG")
+
+		with self.set_user("test@example.com"):
+			optimized_content = optimize_image(content.getvalue(), "image/jpeg")
+
+		self.assertEqual(Image.open(io.BytesIO(optimized_content)).getpixel((10, 10)), (255, 255, 255))
+
+	def test_optimize_pdf(self):
+		from pypdf import PdfReader
+
+		from frappe.utils.pdf import optimize_pdf
+
+		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
+		image = Image.open(image_file_path)
+
+		buf = io.BytesIO()
+		image.save(buf, format="PDF")
+		original_content = buf.getvalue()
+
+		optimized_content = optimize_pdf(original_content)
+
+		self.assertLess(len(optimized_content), len(original_content))
+		# still a valid, readable PDF with the image intact
+		reader = PdfReader(io.BytesIO(optimized_content))
+		images = list(reader.pages[0].images)
+		self.assertEqual(len(images), 1)
+
+	@staticmethod
+	def _count_image_objects(content: bytes) -> int:
+		"""Count distinct indirect objects with /Subtype /Image."""
+		from pypdf import PdfReader
+
+		reader = PdfReader(io.BytesIO(content))
+		count = 0
+		for i in range(1, reader.trailer["/Size"]):
+			obj = reader.get_object(i)
+			if obj is not None and hasattr(obj, "get") and obj.get("/Subtype") == "/Image":
+				count += 1
+		return count
+
+	def test_optimize_pdf_deduplicates_repeated_objects(self):
+		from pypdf import PdfReader, PdfWriter
+
+		from frappe.utils.pdf import optimize_pdf
+
+		image = Image.new("RGB", (800, 800), (20, 150, 90))
+		buf = io.BytesIO()
+		image.save(buf, format="PDF")
+		single_page_pdf = buf.getvalue()
+
+		writer = PdfWriter()
+		for _ in range(4):
+			writer.append(PdfReader(io.BytesIO(single_page_pdf)))
+		out = io.BytesIO()
+		writer.write(out)
+		duplicated_content = out.getvalue()
+
+		self.assertEqual(self._count_image_objects(duplicated_content), 4)
+
+		optimized_content = optimize_pdf(duplicated_content)
+
+		# the precise signal that dedup (not just quality recompression) ran:
+		# 4 duplicate image objects merged into 1 shared object
+		self.assertEqual(self._count_image_objects(optimized_content), 1)
+		self.assertLess(len(optimized_content), len(duplicated_content))
+		reader = PdfReader(io.BytesIO(optimized_content))
+		self.assertEqual(len(reader.pages), 4)
+		self.assertEqual(next(iter(reader.pages[0].images)).image.size, (800, 800))
+
+	def test_optimize_pdf_encodes_an_image_shared_by_every_page_once(self):
+		from pypdf import PdfReader, PdfWriter
+		from pypdf._page import ImageFile
+
+		from frappe.utils.pdf import optimize_pdf
+
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		buf = io.BytesIO()
+		Image.new("RGB", (800, 800), (20, 150, 90)).save(buf, format="PDF")
+		page = PdfReader(buf).pages[0]
+		writer = PdfWriter()
+		for _ in range(4):
+			writer.add_page(page)
+		out = io.BytesIO()
+		writer.write(out)
+
+		with patch.object(ImageFile, "replace", autospec=True, side_effect=ImageFile.replace) as replace:
+			optimize_pdf(out.getvalue())
+
+		replace.assert_called_once()
+
+	def test_optimize_pdf_skips_unprocessable_image_but_optimizes_rest(self):
+		from pypdf import PdfReader, PdfWriter
+
+		from frappe.utils.pdf import optimize_pdf
+
+		# a 1-bit bilevel image (common for pure B&W text scans) is embedded via
+		# CCITT/TIFF, not JPEG, and raises ValueError when passed quality/optimize
+		# kwargs -- that must not abort optimizing the rest of the document
+		large_image = Image.new("RGB", (2200, 1600), (30, 90, 180))
+		rgb_buf = io.BytesIO()
+		large_image.save(rgb_buf, format="PDF")
+
+		bilevel_buf = io.BytesIO()
+		large_image.convert("1").save(bilevel_buf, format="PDF")
+
+		writer = PdfWriter()
+		writer.append(PdfReader(io.BytesIO(rgb_buf.getvalue())))
+		writer.append(PdfReader(io.BytesIO(bilevel_buf.getvalue())))
+		out = io.BytesIO()
+		writer.write(out)
+		mixed_content = out.getvalue()
+
+		optimized_content = optimize_pdf(mixed_content)
+
+		self.assertLess(len(optimized_content), len(mixed_content))
+		reader = PdfReader(io.BytesIO(optimized_content))
+		self.assertEqual(len(reader.pages), 2)
+
+		rgb_result = next(iter(reader.pages[0].images)).image
+		self.assertLessEqual(max(rgb_result.size), 1600)
+
+		bilevel_result = next(iter(reader.pages[1].images)).image
+		self.assertEqual(bilevel_result.size, (2200, 1600))
+		self.assertEqual(bilevel_result.mode, "1")
+
+	def test_optimize_pdf_skips_oversized_image(self):
+		from pypdf import PdfReader, PdfWriter
+		from pypdf.generic import NameObject, NumberObject
+
+		from frappe.utils.pdf import optimize_pdf
+
+		small_image = Image.new("RGB", (10, 10), (10, 90, 200))
+		buf = io.BytesIO()
+		small_image.save(buf, format="PDF")
+
+		reader = PdfReader(buf)
+		writer = PdfWriter(clone_from=reader)
+		xobjects = writer.pages[0]["/Resources"]["/XObject"]
+		for xobj in xobjects.values():
+			xobj = xobj.get_object()
+			if xobj.get("/Subtype") == "/Image":
+				xobj[NameObject("/Width")] = NumberObject(12000)
+				xobj[NameObject("/Height")] = NumberObject(12000)
+
+		out = io.BytesIO()
+		writer.write(out)
+		oversized_pdf = out.getvalue()
+
+		self.assertEqual(optimize_pdf(oversized_pdf), oversized_pdf)
+
+	def test_optimize_pdf_falls_back_on_failure(self):
+		from frappe.utils.pdf import optimize_pdf
+
+		garbage_content = b"not a real pdf"
+
+		with patch("frappe.msgprint") as mock_msgprint:
+			result = optimize_pdf(garbage_content)
+
+		self.assertEqual(result, garbage_content)
+		mock_msgprint.assert_called_once()
+		self.assertIn("Failed to optimize PDF", mock_msgprint.call_args[0][0])
+
+	def test_optimize_pdf_does_not_log_expected_failures(self):
+		from frappe.utils.pdf import optimize_pdf
+
+		# malformed/untrusted PDF content is a routine failure mode, not a bug --
+		# must not spam Error Log for every bad upload
+		with patch("frappe.log_error") as mock_log_error:
+			result = optimize_pdf(b"not a real pdf")
+
+		self.assertEqual(result, b"not a real pdf")
+		mock_log_error.assert_not_called()
+
+	def test_optimize_pdf_logs_unexpected_errors(self):
+		from frappe.utils.pdf import optimize_pdf
+
+		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
+		buf = io.BytesIO()
+		Image.open(image_file_path).save(buf, format="PDF")
+		original_content = buf.getvalue()
+
+		with patch("pypdf.PdfWriter.compress_identical_objects", side_effect=TypeError("simulated bug")):
+			with patch("frappe.log_error") as mock_log_error:
+				result = optimize_pdf(original_content)
+
+		self.assertEqual(result, original_content)
+		mock_log_error.assert_called_once()
+
+	@staticmethod
+	def _build_signed_pdf() -> bytes:
+		"""Build a PDF with a structurally valid (cryptographically fake) signature field."""
+		from pypdf import PdfReader, PdfWriter
+		from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject, TextStringObject
+
+		buf = io.BytesIO()
+		Image.new("RGB", (300, 300), (0, 120, 255)).save(buf, format="PDF")
+		reader = PdfReader(io.BytesIO(buf.getvalue()))
+		writer = PdfWriter(clone_from=reader)
+		page = writer.pages[0]
+
+		sig_dict = DictionaryObject()
+		sig_dict.update(
+			{
+				NameObject("/Type"): NameObject("/Sig"),
+				NameObject("/ByteRange"): ArrayObject(
+					[NumberObject(0), NumberObject(10), NumberObject(20), NumberObject(30)]
+				),
+				NameObject("/Contents"): TextStringObject("fakebytes"),
+			}
+		)
+		sig_ref = writer._add_object(sig_dict)
+
+		field = DictionaryObject()
+		field.update(
+			{
+				NameObject("/FT"): NameObject("/Sig"),
+				NameObject("/T"): TextStringObject("Signature1"),
+				NameObject("/V"): sig_ref,
+				NameObject("/Rect"): ArrayObject(
+					[NumberObject(0), NumberObject(0), NumberObject(100), NumberObject(20)]
+				),
+				NameObject("/Subtype"): NameObject("/Widget"),
+				NameObject("/Type"): NameObject("/Annot"),
+				NameObject("/P"): page.indirect_reference,
+			}
+		)
+		field_ref = writer._add_object(field)
+		page[NameObject("/Annots")] = ArrayObject([field_ref])
+
+		acroform = DictionaryObject()
+		acroform.update(
+			{NameObject("/Fields"): ArrayObject([field_ref]), NameObject("/SigFlags"): NumberObject(3)}
+		)
+		acroform_ref = writer._add_object(acroform)
+		writer._root_object[NameObject("/AcroForm")] = acroform_ref
+
+		out = io.BytesIO()
+		writer.write(out)
+		return out.getvalue()
+
+	def test_reader_has_signature(self):
+		from pypdf import PdfReader
+
+		from frappe.utils.pdf import _reader_has_signature
+
+		signed_pdf = self._build_signed_pdf()
+		self.assertTrue(_reader_has_signature(PdfReader(io.BytesIO(signed_pdf))))
+
+		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
+		unsigned_buf = io.BytesIO()
+		Image.open(image_file_path).save(unsigned_buf, format="PDF")
+		self.assertFalse(_reader_has_signature(PdfReader(io.BytesIO(unsigned_buf.getvalue()))))
+
+	def test_reader_has_signature_fails_safe_for_encrypted_pdf(self):
+		from pypdf import PdfReader, PdfWriter
+
+		from frappe.utils.pdf import _reader_has_signature
+
+		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
+		buf = io.BytesIO()
+		Image.open(image_file_path).save(buf, format="PDF")
+
+		reader = PdfReader(io.BytesIO(buf.getvalue()))
+		writer = PdfWriter(clone_from=reader)
+		writer.encrypt("secret123")
+		out = io.BytesIO()
+		writer.write(out)
+		encrypted_content = out.getvalue()
+		encrypted_reader = PdfReader(io.BytesIO(encrypted_content))
+		self.assertTrue(_reader_has_signature(encrypted_reader))
+
+	def test_optimize_pdf_skips_signed_pdf(self):
+		from frappe.utils.pdf import optimize_pdf
+
+		signed_pdf = self._build_signed_pdf()
+		self.assertEqual(optimize_pdf(signed_pdf), signed_pdf)
 
 
 class TestPythonExpressions(IntegrationTestCase):
@@ -809,6 +1305,11 @@ class TestDateUtils(IntegrationTestCase):
 		self.assertEqual(frappe.utils.is_last_day_of_the_month("2020-12-24"), False)
 		self.assertEqual(frappe.utils.is_last_day_of_the_month("2020-12-31"), True)
 
+	def test_get_timezone_utc_offset(self):
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("UTC"), "+00:00")
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("Asia/Kolkata"), "+05:30")
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("Pacific/Marquesas"), "-09:30")
+
 	def test_get_time(self):
 		datetime_input = now_datetime()
 		timedelta_input = get_timedelta()
@@ -913,7 +1414,8 @@ class TestDateUtils(IntegrationTestCase):
 		if is_invalid_date_string(str(original)):
 			return
 		parsed = get_datetime(str(original))
-		self.assertEqual(parsed, original)
+		self.assertEqual(parsed.replace(tzinfo=None), original.replace(tzinfo=None))
+		self.assertEqual(parsed.utcoffset(), original.utcoffset())
 
 	def test_pretty_date(self):
 		from frappe import _
@@ -1044,6 +1546,123 @@ class TestXlsxUtils(IntegrationTestCase):
 		self.assertIn("html data >", val)
 		self.assertEqual("abc", handle_html("abc"))
 
+	def test_formula_like_strings_are_not_written_as_formulas(self):
+		"""A leading =, +, -, @ etc must not cause the cell to be written as a real formula."""
+		from openpyxl import load_workbook
+
+		from frappe.utils.xlsxutils import make_xlsx
+
+		data = [
+			["notes", "amount", "phone"],
+			["=1+1", 1500.5, "+1-555-0100"],
+			["+91-1234567890", -5, "555-1234"],
+			["normal text", 10, "@handle-as-text"],
+		]
+		xlsx_file = make_xlsx(data, "Test Sheet")
+		wb = load_workbook(xlsx_file, data_only=False)
+		ws = wb.active
+
+		rows = list(ws.iter_rows(values_only=False))
+
+		# formula-trigger strings must be forced to string type, value unchanged
+		for coord, expected_value in (
+			((1, 0), "=1+1"),
+			((1, 2), "+1-555-0100"),
+			((2, 0), "+91-1234567890"),
+			((2, 2), "555-1234"),
+			((3, 2), "@handle-as-text"),
+		):
+			row_idx, col_idx = coord
+			cell = rows[row_idx][col_idx]
+			self.assertEqual(cell.data_type, "s")
+			self.assertEqual(cell.value, expected_value)
+
+		# real numeric values must keep their native type, not get stringified
+		self.assertEqual(rows[1][1].data_type, "n")
+		self.assertEqual(rows[1][1].value, 1500.5)
+		self.assertEqual(rows[2][1].data_type, "n")
+		self.assertEqual(rows[2][1].value, -5)
+
+	def test_time_values_get_number_format(self):
+		"""time / timedelta values must not be written as raw day fractions."""
+		from openpyxl import load_workbook
+
+		from frappe.utils.xlsxutils import XLSXStyleBuilder, make_xlsx
+
+		data = [
+			["in_time", "duration"],
+			[time(8, 0), timedelta(hours=9, minutes=30)],
+		]
+		wb = load_workbook(make_xlsx(data, "Test Sheet"))
+		ws = wb.active
+
+		self.assertEqual(ws["A2"].number_format, XLSXStyleBuilder.get_time_format())
+		self.assertEqual(ws["B2"].number_format, "[h]:mm:ss")
+
+
+class TestCsvUtils(IntegrationTestCase):
+	def test_escape_formula_injection_prefixes_trigger_chars(self):
+		from frappe.utils.csvutils import FORMULA_TRIGGER_CHARS, escape_formula_injection
+
+		for char in FORMULA_TRIGGER_CHARS:
+			value = f"{char}1+1"
+			self.assertEqual(escape_formula_injection(value), "'" + value)
+
+	def test_escape_formula_injection_leaves_normal_values_untouched(self):
+		from frappe.utils.csvutils import escape_formula_injection
+
+		self.assertEqual(escape_formula_injection("normal text"), "normal text")
+		self.assertEqual(escape_formula_injection("555-1234"), "555-1234")
+		self.assertEqual(escape_formula_injection(100), 100)
+		self.assertEqual(escape_formula_injection(None), None)
+
+	def test_unescape_reverses_escape(self):
+		from frappe.utils.csvutils import (
+			FORMULA_TRIGGER_CHARS,
+			escape_formula_injection,
+			unescape_formula_injection,
+		)
+
+		for char in FORMULA_TRIGGER_CHARS:
+			original = f"{char}1+1"
+			self.assertEqual(unescape_formula_injection(escape_formula_injection(original)), original)
+
+	def test_unescape_does_not_strip_literal_leading_quote(self):
+		"""A user-typed apostrophe not followed by a trigger char must survive untouched."""
+		from frappe.utils.csvutils import unescape_formula_injection
+
+		self.assertEqual(unescape_formula_injection("'hello"), "'hello")
+		self.assertEqual(unescape_formula_injection("'"), "'")
+
+	def test_to_csv_escapes_formula_like_values(self):
+		from frappe.utils.csvutils import to_csv
+
+		out = to_csv([["notes", "amount"], ["=1+1", "10"]])
+		self.assertIn("'=1+1", out)
+		self.assertNotIn('"=1+1"', out)
+
+	def test_export_reimport_round_trip_preserves_legit_data(self):
+		"""Export followed by reimport must not corrupt values that start with trigger chars."""
+		from frappe.utils.csvutils import read_csv_content, to_csv
+
+		rows = [
+			["name", "notes", "phone", "qty_text"],
+			["REC-001", "=1+1", "+1-555-0100", "-5"],
+			["REC-002", "normal text", "555-1234", "10"],
+		]
+
+		exported = to_csv(rows)
+		# a formula-like value must round-trip through escape_formula_injection
+		self.assertIn("'=1+1", exported)
+
+		reimported = read_csv_content(exported)
+		self.assertEqual(reimported, rows)
+
+		# a second export/import cycle must not accumulate extra quote markers
+		reexported = to_csv(reimported)
+		self.assertEqual(reexported, exported)
+		self.assertEqual(read_csv_content(reexported), rows)
+
 
 class TestLinkTitle(IntegrationTestCase):
 	def test_link_title_doctypes_in_boot_info(self):
@@ -1135,6 +1754,71 @@ class TestLinkTitle(IntegrationTestCase):
 		user.delete()
 		prop_setter.delete()
 
+	def test_link_title_of_missing_document(self):
+		"""
+		Test that a link value with no target returns the docname without raising
+		"""
+		prop_setter = frappe.get_doc(
+			{
+				"doctype": "Property Setter",
+				"doc_type": "User",
+				"property": "show_title_field_in_link",
+				"property_type": "Check",
+				"doctype_or_field": "DocType",
+				"value": "1",
+			}
+		).insert()
+
+		from frappe.desk.search import get_link_title
+
+		frappe.clear_messages()
+		self.assertEqual(get_link_title("User", "meera.iyer@example.com"), "meera.iyer@example.com")
+		self.assertEqual(frappe.get_message_log(), [])
+
+		prop_setter.delete()
+
+	def test_link_title_without_read_permission(self):
+		"""
+		Test that a link to a document the user cannot read returns the docname without raising
+		"""
+		prop_setter = frappe.get_doc(
+			{
+				"doctype": "Property Setter",
+				"doc_type": "ToDo",
+				"property": "show_title_field_in_link",
+				"property_type": "Check",
+				"doctype_or_field": "DocType",
+				"value": "1",
+			}
+		).insert()
+
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"user_type": "Website User",
+				"email": "arjun.nair@example.com",
+				"send_welcome_email": 0,
+				"first_name": "Arjun",
+			}
+		).insert(ignore_permissions=True)
+
+		todo = frappe.get_doc(
+			{"doctype": "ToDo", "description": "Renew the Contoso support contract"}
+		).insert()
+
+		from frappe.desk.search import get_link_title
+
+		self.assertEqual(get_link_title("ToDo", todo.name), todo.description)
+
+		frappe.clear_messages()
+		with self.set_user(user.name):
+			self.assertEqual(get_link_title("ToDo", todo.name), todo.name)
+		self.assertEqual(frappe.get_message_log(), [])
+
+		todo.delete()
+		user.delete()
+		prop_setter.delete()
+
 
 class TestAppParser(MockedRequestTestCase):
 	def test_app_name_parser(self):
@@ -1205,18 +1889,14 @@ class TestLazyLoader(IntegrationTestCase):
 
 
 class TestIdenticon(IntegrationTestCase):
-	def test_get_gravatar(self):
-		# developers@frappe.io has a gravatar linked so str URL will be returned
-		toggle_test_mode(False)
-		gravatar_url = get_gravatar("developers@frappe.io")
-		toggle_test_mode(True)
-		self.assertIsInstance(gravatar_url, str)
-		self.assertTrue(gravatar_url.startswith("http"))
+	def test_get_identicon(self):
+		identicon_url = get_identicon("developers@frappe.io")
+		self.assertIsInstance(identicon_url, str)
+		self.assertTrue(identicon_url.startswith("data:image/png;base64,"))
 
-		# random email will require Identicon to be generated, which will be a base64 string
-		gravatar_url = get_gravatar(f"developers{random_string(6)}@frappe.io")
-		self.assertIsInstance(gravatar_url, str)
-		self.assertTrue(gravatar_url.startswith("data:image/png;base64,"))
+		identicon_url = get_identicon(f"developers{random_string(6)}@frappe.io")
+		self.assertIsInstance(identicon_url, str)
+		self.assertTrue(identicon_url.startswith("data:image/png;base64,"))
 
 	def test_generate_identicon(self):
 		identicon = Identicon(random_string(6))
@@ -1277,6 +1957,24 @@ class TestMiscUtils(IntegrationTestCase):
 	def test_get_url_to_form(self):
 		self.assertTrue(get_url_to_form("System Settings").endswith("/desk/system-settings"))
 		self.assertTrue(get_url_to_form("User", "Test User").endswith("/desk/user/Test%20User"))
+
+	@patch.dict(
+		frappe.conf,
+		{
+			"host_name": None,
+			"hostname": None,
+			"http_port": None,
+			"webserver_port": 8000,
+			"developer_mode": 0,
+			"restart_supervisor_on_update": 1,
+		},
+	)
+	def test_get_url_dev(self):
+		self.assertNotIn(":8000", get_url("/desk", allow_header_override=False))
+		self.assertEqual(
+			get_url("/desk", allow_header_override=False, for_dev_server=True),
+			f"http://{frappe.local.site}:8000/desk",
+		)
 
 	def test_safe_json_load(self):
 		self.assertEqual(safe_json_loads("{}"), {})
@@ -1356,175 +2054,225 @@ class TestTypingValidations(IntegrationTestCase):
 
 		func(1)  # should run without error
 
+	def test_whitelisted_http_methods_are_stored_as_tuple(self):
+		def default_methods():
+			pass
+
+		def list_methods():
+			pass
+
+		def tuple_methods():
+			pass
+
+		def string_method():
+			pass
+
+		default_methods = frappe.whitelist()(default_methods)
+		list_methods = frappe.whitelist(methods=["GET", "POST"])(list_methods)
+		tuple_methods = frappe.whitelist(methods=("PUT", "DELETE"))(tuple_methods)
+		string_method = frappe.whitelist(methods="GET")(string_method)
+
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[default_methods],
+			("GET", "POST", "PUT", "DELETE", "QUERY"),
+		)
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[list_methods], ("GET", "POST", "QUERY")
+		)
+		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[tuple_methods], ("PUT", "DELETE"))
+		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[string_method], ("GET", "QUERY"))
+
 
 class TestTBSanitization(IntegrationTestCase):
-	def test_traceback_sanitzation(self):
+	def test_traceback_sanitization(self):
+		handle = io.BufferedWriter(io.BytesIO())
 		try:
-			password = "42"  # noqa: F841
-			args = {"password": "42", "pwd": "42", "safe": "safe_value"}
-			args = frappe._dict({"password": "42", "pwd": "42", "safe": "safe_value"})  # noqa: F841
+			password = "424242"  # noqa: F841
+			values = {"password": "424242", "pwd": "424242", "safe": "safe_value", "handle": handle}
+			args = frappe._dict(values)  # noqa: F841
 			raise Exception
 		except Exception:
-			traceback = frappe.get_traceback(with_context=True)
-			self.assertNotIn("42", traceback)
-			self.assertIn("********", traceback)
-			self.assertIn("password =", traceback)
-			self.assertIn("safe_value", traceback)
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+		finally:
+			handle.close()
+
+		self.assertNotIn("424242", traceback)
+		self.assertNotIn("cannot pickle", traceback)
+		self.assertIn("********", traceback)
+		self.assertIn("password =", traceback)
+		self.assertIn("safe_value", traceback)
+
+	def test_sanitization_catches_keys_not_matching_blocklist_exactly(self):
+		try:
+			headers = {"Authorization": "Token super-secret-value"}  # noqa: F841
+			config = frappe._dict({"stripe_secret_key": "sk_live_should_not_leak", "other": "val"})  # noqa: F841
+			raise Exception
+		except Exception:
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+
+		self.assertNotIn("super-secret-value", traceback)
+		self.assertNotIn("sk_live_should_not_leak", traceback)
+		self.assertIn("val", traceback)  # the unrelated "other" key must survive
+
+	def test_sanitization_is_case_insensitive(self):
+		try:
+			PASSWORD = "should_be_masked_now"  # noqa: F841
+			raise Exception
+		except Exception:
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+
+		self.assertIn("Traceback with variables", traceback)  # with_context genuinely activated
+		self.assertNotIn("should_be_masked_now", traceback)
+
+	def test_sanitization_masks_session_id(self):
+		try:
+			sid = "super-secret-session-id"  # noqa: F841
+			raise Exception
+		except Exception:
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+
+		self.assertIn("Traceback with variables", traceback)  # with_context genuinely activated
+		self.assertNotIn("super-secret-session-id", traceback)
+
+	def test_sanitization_exact_match_rule_does_not_over_match(self):
+		try:
+			inside = "should_be_visible"  # noqa: F841
+			consider = "should_be_visible"  # noqa: F841
+			raise Exception
+		except Exception:
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+
+		self.assertIn("should_be_visible", traceback)
+
+	def test_sanitization_hides_object_attributes(self):
+		class Connection:
+			def __init__(self):
+				self.password = "should_not_leak"
+
+		try:
+			connection = Connection()  # noqa: F841
+			raise Exception
+		except Exception:
+			with patch.dict(frappe.conf, {"developer_mode": 1}):
+				traceback = frappe.get_traceback(with_context=True)
+
+		self.assertIn("connection =", traceback)
+		self.assertNotIn("should_not_leak", traceback)
+
+	def test_get_traceback_with_context_only_active_in_developer_mode(self):
+		def boom():
+			marker = "visible-marker"  # noqa: F841
+			raise ValueError("boom")
+
+		with patch.dict(frappe.conf, {"developer_mode": 0}):
+			try:
+				boom()
+			except ValueError:
+				traceback = frappe.get_traceback(with_context=True)
+		self.assertNotIn("visible-marker", traceback)
+		self.assertNotIn("Traceback with variables", traceback)
+
+		with patch.dict(frappe.conf, {"developer_mode": 1}):
+			try:
+				boom()
+			except ValueError:
+				traceback = frappe.get_traceback(with_context=True)
+		self.assertIn("visible-marker", traceback)
+		self.assertIn("Traceback with variables", traceback)
 
 
 class TestRounding(IntegrationTestCase):
-	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Commercial Rounding"})
-	def test_normal_rounding(self):
+	"""`flt(value, precision, rounding_method)` supports two tie-breaking rules:
+
+	  - "Commercial Rounding": ties round away from zero  (== Decimal ROUND_HALF_UP)
+	  - "Banker's Rounding":   ties round to nearest even  (== Decimal ROUND_HALF_EVEN)
+
+	The exhaustive numeric behaviour is verified against those stdlib oracles in the
+	property tests below. The example tests only document the contrast between methods
+	and cover behaviour the oracles can't reach (string parsing, invalid input, etc.).
+	"""
+
+	def test_flt_parses_strings_and_ignores_invalid_input(self):
+		self.assertEqual(flt(None), 0)
 		self.assertEqual(flt("what"), 0)
-
-		self.assertEqual(flt("0.5", 0), 1)
 		self.assertEqual(flt("0.3"), 0.3)
+		# Thousands separators are stripped before conversion.
+		self.assertEqual(flt("1,500.5", 2), 1500.5)
 
-		self.assertEqual(flt("1.5", 0), 2)
+	def test_commercial_rounding_examples(self):
+		method = "Commercial Rounding"
+		# Ties round away from zero (contrast with banker's rounding below).
+		self.assertEqual(flt("0.5", 0, rounding_method=method), 1)
+		self.assertEqual(flt(2.5, 0, rounding_method=method), 3)
+		self.assertEqual(flt(-0.5, 0, rounding_method=method), -1)
+		# Representation-error tie that must still round up.
+		self.assertEqual(flt(2.675, 2, rounding_method=method), 2.68)
 
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0), 0)
-		self.assertEqual(flt(0.5, 0), 1)
-		self.assertEqual(flt(1.455, 0), 1)
-		self.assertEqual(flt(1.5, 0), 2)
+	def test_bankers_rounding_examples(self):
+		method = "Banker's Rounding"
+		self.assertEqual(rounded(0, 0, rounding_method=method), 0)
+		self.assertEqual(rounded(5.551115123125783e-17, 2, rounding_method=method), 0.0)
+		# Ties round to the nearest even digit (contrast with commercial rounding above).
+		self.assertEqual(flt("0.5", 0, rounding_method=method), 0)
+		self.assertEqual(flt(2.5, 0, rounding_method=method), 2)
+		self.assertEqual(flt(-0.5, 0, rounding_method=method), 0)
+		self.assertEqual(flt(2.675, 2, rounding_method=method), 2.68)
 
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0), -1)
-		self.assertEqual(flt(-1.5, 0), -2)
+	def test_rounding_does_not_inflate_exactly_representable_values(self):
+		self.assertEqual(flt(9750000.0, 9, rounding_method="Commercial Rounding"), 9750000.0)
+		self.assertEqual(flt(6500000.0, 9, rounding_method="Commercial Rounding"), 6500000.0)
+		self.assertEqual(flt(26509905246072.0, 2, rounding_method="Commercial Rounding"), 26509905246072.0)
+		self.assertEqual(flt(26509905246072.01, 2, rounding_method="Banker's Rounding"), 26509905246072.01)
 
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1), 120)
-		self.assertEqual(flt(125, -1), 130)
-		self.assertEqual(flt(134.45, -1), 130)
-		self.assertEqual(flt(135, -1), 140)
+	def test_commercial_rounding_breaks_representable_ties_away_from_zero(self):
+		# Past 2**50 floats are spaced 0.25 apart, so a .5 tie is exactly representable.
+		method = "Commercial Rounding"
+		self.assertEqual(flt(2**50 + 0.5, 0, rounding_method=method), 2**50 + 1)
+		self.assertEqual(flt(-(2**50) - 0.5, 0, rounding_method=method), -(2**50) - 1)
 
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1), 1.3)
-		self.assertEqual(flt(0.15, 1), 0.2)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1), -1.3)
-		self.assertEqual(flt(-0.15, 1), -0.2)
-
-	def test_normal_rounding_as_argument(self):
-		rounding_method = "Commercial Rounding"
-
-		self.assertEqual(flt("0.5", 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt("0.3", rounding_method=rounding_method), 0.3)
-
-		self.assertEqual(flt("1.5", 0, rounding_method=rounding_method), 2)
-
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.455, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), -1)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(125, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(134.45, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(135, -1, rounding_method=rounding_method), 140)
-
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1, rounding_method=rounding_method), 1.3)
-		self.assertEqual(flt(0.15, 1, rounding_method=rounding_method), 0.2)
-		self.assertEqual(flt(2.675, 2, rounding_method=rounding_method), 2.68)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1, rounding_method=rounding_method), -1.3)
-		self.assertEqual(flt(-0.15, 1, rounding_method=rounding_method), -0.2)
-
-		# Nearest number and not even (the default behaviour)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(2.5, 0, rounding_method=rounding_method), 3)
-		self.assertEqual(flt(3.5, 0, rounding_method=rounding_method), 4)
-
-		self.assertEqual(flt(0.05, 1, rounding_method=rounding_method), 0.1)
-		self.assertEqual(flt(1.15, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(2.25, 1, rounding_method=rounding_method), 2.3)
-		self.assertEqual(flt(3.35, 1, rounding_method=rounding_method), 3.4)
+	@given(
+		st.sampled_from(["Commercial Rounding", "Banker's Rounding"]),
+		st.floats(min_value=-1e14, max_value=1e14, allow_nan=False, allow_infinity=False),
+		st.integers(min_value=0, max_value=9),
+	)
+	def test_rounding_is_idempotent(self, rounding_method, number, precision):
+		rounded_once = flt(number, precision, rounding_method=rounding_method)
+		self.assertEqual(flt(rounded_once, precision, rounding_method=rounding_method), rounded_once)
 
 	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Commercial Rounding"})
 	@given(
 		st.decimals(min_value=-1e8, max_value=1e8),
 		st.integers(min_value=-2, max_value=4),
 	)
-	def test_normal_rounding_property(self, number, precision):
+	def test_commercial_rounding_matches_round_half_up(self, number, precision):
 		with localcontext() as ctx:
 			ctx.rounding = ROUND_HALF_UP
 			self.assertEqual(Decimal(str(flt(float(number), precision))), round(number, precision))
-
-	def test_bankers_rounding(self):
-		rounding_method = "Banker's Rounding"
-
-		self.assertEqual(rounded(0, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(rounded(5.551115123125783e-17, 2, rounding_method=rounding_method), 0.0)
-
-		self.assertEqual(flt("0.5", 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt("0.3", rounding_method=rounding_method), 0.3)
-
-		self.assertEqual(flt("1.5", 0, rounding_method=rounding_method), 2)
-
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(1.455, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(125, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(134.45, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(135, -1, rounding_method=rounding_method), 140)
-
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(0.15, 1, rounding_method=rounding_method), 0.2)
-		self.assertEqual(flt(2.675, 2, rounding_method=rounding_method), 2.68)
-		self.assertEqual(flt(-2.675, 2, rounding_method=rounding_method), -2.68)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1, rounding_method=rounding_method), -1.2)
-		self.assertEqual(flt(-0.15, 1, rounding_method=rounding_method), -0.2)
-
-		# Nearest number and not even (the default behaviour)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(2.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(3.5, 0, rounding_method=rounding_method), 4)
-
-		self.assertEqual(flt(0.05, 1, rounding_method=rounding_method), 0.0)
-		self.assertEqual(flt(1.15, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(2.25, 1, rounding_method=rounding_method), 2.2)
-		self.assertEqual(flt(3.35, 1, rounding_method=rounding_method), 3.4)
-
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-		self.assertEqual(flt(-2.5, 0, rounding_method=rounding_method), -2)
-		self.assertEqual(flt(-3.5, 0, rounding_method=rounding_method), -4)
-
-		self.assertEqual(flt(-0.05, 1, rounding_method=rounding_method), 0.0)
-		self.assertEqual(flt(-1.15, 1, rounding_method=rounding_method), -1.2)
-		self.assertEqual(flt(-2.25, 1, rounding_method=rounding_method), -2.2)
-		self.assertEqual(flt(-3.35, 1, rounding_method=rounding_method), -3.4)
 
 	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Banker's Rounding"})
 	@given(
 		st.decimals(min_value=-1e8, max_value=1e8),
 		st.integers(min_value=-2, max_value=4),
 	)
-	def test_bankers_rounding_property(self, number, precision):
+	def test_bankers_rounding_matches_round_half_even(self, number, precision):
 		self.assertEqual(Decimal(str(flt(float(number), precision))), round(number, precision))
+
+	@given(
+		st.sampled_from(["Commercial Rounding", "Banker's Rounding"]),
+		st.floats(min_value=-1e8, max_value=1e8, allow_nan=False, allow_infinity=False),
+		st.integers(min_value=-2, max_value=4),
+	)
+	def test_rounding_is_sign_symmetric(self, rounding_method, number, precision):
+		# Regression: rounding a negated value must equal negating the rounded value.
+		self.assertEqual(
+			flt(-number, precision, rounding_method=rounding_method),
+			-flt(number, precision, rounding_method=rounding_method),
+		)
 
 	def test_default_rounding(self):
 		self.assertEqual(frappe.get_system_settings("rounding_method"), "Banker's Rounding")
@@ -1591,8 +2339,79 @@ class TestArgumentTypingValidations(IntegrationTestCase):
 		with self.assertRaises(FrappeTypeError):
 			test_mocks(1)
 
+	def test_validate_string_annotations(self):
+		@validate_argument_types
+		def test_strings(name: "str", count: "int | None" = None, other: "Undefined" = None):  # noqa: F821
+			return name, count, other
+
+		self.assertEqual(test_strings("a", "1"), ("a", 1, None))
+		with self.assertRaises(FrappeTypeError):
+			test_strings({"name": ("like", "%")})
+
+		# unresolvable forward refs are not validated
+		obj = object()
+		self.assertEqual(test_strings("a", other=obj), ("a", None, obj))
+
+		@validate_argument_types
+		def test_nested(docs: "str | list[dict | Undefined]"):  # noqa: F821
+			return docs
+
+		self.assertEqual(test_nested([obj]), [obj])
+
+	def test_skip_invalid_string_annotation(self):
+		@validate_argument_types
+		def test_invalid(name: "free text"):
+			return name
+
+		self.assertEqual(test_invalid({"a": 1}), {"a": 1})
+
+	def test_whitelisted_method_validates_string_annotations(self):
+		from frappe.handler import execute_cmd
+
+		# document_follow uses `from __future__ import annotations`, so its annotations are strings
+		form_dict = frappe._dict(doctype="ToDo", doc_name={"owner": "Administrator"})
+		with (
+			self.set_user("test@example.com"),
+			patch.object(frappe.local, "request", frappe._dict(method="POST"), create=True),
+			patch.object(frappe.local, "form_dict", form_dict),
+		):
+			self.assertRaises(
+				FrappeTypeError, execute_cmd, "frappe.desk.form.document_follow.follow_document"
+			)
+
+	def test_validate_literal(self):
+		@validate_argument_types
+		def test_literal(kind: Literal["a", "b"]):
+			return kind
+
+		self.assertEqual(test_literal("a"), "a")
+		with self.assertRaises(FrappeTypeError):
+			test_literal("c")
+
 
 class TestChangeLog(IntegrationTestCase):
+	def test_parse_latest_non_beta_release_skips_invalid_tags(self):
+		from semantic_version import Version
+
+		current_version = Version("16.28.0")
+		self.assertEqual(
+			parse_latest_non_beta_release(
+				[
+					{"tag_name": "v14-baseline"},
+					{"tag_name": "v16.29.0"},
+					{"tag_name": "v16.30.0", "prerelease": True},
+				],
+				current_version,
+			),
+			"16.29.0",
+		)
+		self.assertIsNone(parse_latest_non_beta_release([{"tag_name": "v14-baseline"}], current_version))
+		self.assertEqual(
+			parse_latest_non_beta_release([{"tag_name": "v16.29.0-dev"}], current_version),
+			"16.29.0-dev",
+		)
+		self.assertIsNone(parse_latest_non_beta_release([{"tag_name": "vv16.29.0"}], current_version))
+
 	def test_get_remote_url(self):
 		self.assertIsInstance(get_source_url("frappe"), str)
 
@@ -1615,6 +2434,28 @@ class TestChangeLog(IntegrationTestCase):
 		self.assertIsNone(repo)
 
 		self.assertRaises(ValueError, parse_github_url, remote_url=None)
+
+	def test_check_for_update_skips_develop_branch(self):
+		from semantic_version import Version
+
+		versions = {
+			"on_develop": {"title": "On Develop", "branch_version": "develop"},
+			"released": {"title": "Released", "version": "1.0.0"},
+		}
+		with (
+			patch("frappe.get_system_settings", return_value=0),
+			patch("frappe.is_setup_complete", return_value=True),
+			patch("frappe.utils.change_log.get_app_versions", return_value=versions),
+			patch("frappe.utils.change_log.get_source_url", return_value="https://github.com/frappe/app"),
+			patch(
+				"frappe.utils.change_log.check_release_on_github", return_value=(Version("2.0.0"), "frappe")
+			),
+			patch("frappe.utils.change_log.security_issues_count", return_value=0),
+			patch("frappe.utils.change_log.add_message_to_redis"),
+		):
+			updates = check_for_update()
+
+		self.assertEqual([u.app_name for u in updates.major], ["released"])
 
 
 class TestCrypto(IntegrationTestCase):
@@ -1685,9 +2526,22 @@ class TestDataUtils(UnitTestCase):
 	def tearDown(self):
 		frappe.local.lang = "en"
 
+	def test_orjson_dumps_fallback_on_large_integers(self):
+		def normalize(v):
+			return json.loads(v)
+
+		big = 2**63 + 1
+		result = orjson_dumps({"big": big})
+		self.assertEqual(normalize(result), normalize(json.dumps({"big": big})))
+
+		result_bytes = orjson_dumps({"big": big}, decode=False)
+		self.assertIsInstance(result_bytes, bytes)
+		self.assertEqual(normalize(result_bytes), normalize(json.dumps({"big": big}).encode()))
+
 	def test_comma_and(self):
 		self.assertEqual(comma_and(["a", "b", "c"]), "'a', 'b', and 'c'")
 		self.assertEqual(comma_and(["a", "b", "c"], add_quotes=False), "a, b, and c")
+		self.assertEqual(comma_and(["a", "b"]), "'a' and 'b'")
 
 		frappe.local.lang = "pt-BR"
 
@@ -1697,6 +2551,7 @@ class TestDataUtils(UnitTestCase):
 	def test_comma_or(self):
 		self.assertEqual(comma_or(["a", "b", "c"]), "'a', 'b', or 'c'")
 		self.assertEqual(comma_or(["a", "b", "c"], add_quotes=False), "a, b, or c")
+		self.assertEqual(comma_or(["a", "b"]), "'a' or 'b'")
 
 		frappe.local.lang = "pt-BR"
 
@@ -1718,3 +2573,17 @@ class TestMsgPrint(UnitTestCase):
 		frappe.msgprint("<ul><li>abc<li></ul>")
 		message = frappe.get_message_log()[-1]
 		self.assertIn("<ul><li>", message.message)
+
+	def test_raised_message_keeps_html_in_a_terminal(self):
+		with (
+			patch("sys.stdin") as stdin,
+			patch.dict(frappe.local.flags, {"print_messages": True}),
+			patch("builtins.print") as printed,
+		):
+			stdin.isatty.return_value = True
+			with self.assertRaises(frappe.ValidationError) as raised:
+				frappe.throw("first<br>second")  # nosemgrep: frappe-missing-translate-function-python
+
+		self.assertEqual(str(raised.exception), "first<br>second")
+		printed.assert_called_once()
+		self.assertNotIn("<br>", printed.call_args.args[0])

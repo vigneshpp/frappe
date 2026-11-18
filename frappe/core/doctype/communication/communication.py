@@ -13,7 +13,7 @@ from frappe.automation.doctype.assignment_rule.assignment_rule import (
 	apply as apply_assignment_rule,
 )
 from frappe.contacts.doctype.contact.contact import get_contact_name
-from frappe.core.doctype.comment.comment import update_comment_in_doc
+from frappe.core.doctype.comment.comment import relink_comment_cache
 from frappe.core.doctype.communication.email import validate_email
 from frappe.core.doctype.communication.mixins import CommunicationEmailMixin
 from frappe.core.utils import get_parent_doc
@@ -32,6 +32,8 @@ exclude_from_linked_with = True
 
 
 class Communication(Document, CommunicationEmailMixin):
+	_DOCTYPE_NAME = "Communication"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -240,9 +242,16 @@ class Communication(Document, CommunicationEmailMixin):
 			self.set_signature_in_email_content()
 
 	def on_update(self):
-		# add to _comment property of the doctype, so it shows up in
-		# comments count for the list view
-		update_comment_in_doc(self)
+		"""
+		add to _comment property of the doctype, so it shows up in comments count for the list view;
+		also move the cached entry off the old parent if the reference changed (e.g. via Communication.save())
+		"""
+		before_save = self.get_doc_before_save()
+		relink_comment_cache(
+			self,
+			before_save.reference_doctype if before_save else None,
+			before_save.reference_name if before_save else None,
+		)
 
 		parent = get_parent_doc(self)
 		if (method := getattr(parent, "on_communication_update", None)) and callable(method):
@@ -357,10 +366,9 @@ class Communication(Document, CommunicationEmailMixin):
 					self.sender_full_name = frappe.db.get_value("User", self.sender, "full_name")
 
 				if not self.sender_full_name:
-					first_name, last_name = frappe.db.get_value(
-						"Contact", filters={"email_id": sender_email}, fieldname=["first_name", "last_name"]
-					) or [None, None]
-					self.sender_full_name = (first_name or "") + (last_name or "")
+					self.sender_full_name = frappe.db.get_value(
+						"Contact", {"email_id": sender_email}, "full_name"
+					)
 
 				if not self.sender_full_name:
 					self.sender_full_name = sender_email
@@ -402,7 +410,9 @@ class Communication(Document, CommunicationEmailMixin):
 
 		for doctype, docname in parse_email([self.recipients, self.cc, self.bcc]):
 			# Both document and doctype names should be case insensitive in email addresses.
-			doctype = frappe.db.get_value("DocType", doctype)
+			doctype = frappe.db.exists("DocType", doctype, cache=True) or frappe.db.exists(
+				"DocType", frappe.unscrub(doctype), cache=True
+			)
 			if doctype:
 				docname = frappe.db.get_value(doctype, docname, ignore=True)
 			if not (doctype and docname):
@@ -447,11 +457,19 @@ class Communication(Document, CommunicationEmailMixin):
 			self.add_link(doctype, name)
 
 	def add_link(self, link_doctype, link_name, autosave=False):
+		title_field = frappe.get_meta(link_doctype).get_title_field()
+		link_title = (
+			frappe.db.get_value(link_doctype, link_name, title_field, cache=True, order_by=None)
+			if title_field != "name"
+			else None
+		)
+
 		self.append(
 			"timeline_links",
 			{
 				"link_doctype": link_doctype,
 				"link_name": link_name,
+				"link_title": link_title or link_name,
 				"communication_date": self.communication_date,
 			},
 		)
@@ -483,6 +501,8 @@ def on_doctype_update():
 
 
 def has_permission(doc, ptype, user=None, debug=False):
+	user = user or frappe.session.user
+
 	if ptype == "read":
 		if doc.reference_doctype == "Communication" and doc.reference_name == doc.name:
 			return True
@@ -492,7 +512,22 @@ def has_permission(doc, ptype, user=None, debug=False):
 				doc.reference_doctype, ptype="read", doc=doc.reference_name, user=user, debug=debug
 			)
 
-	return True
+	if ptype == "create":
+		return True
+
+	return has_email_account_access(doc, user)
+
+
+def has_email_account_access(doc, user):
+	"""Emails are limited to the user's linked email accounts, as in list queries."""
+	if doc.communication_medium != "Email" or doc.owner == user:
+		return True
+
+	roles = frappe.get_roles(user)
+	if "Super Email User" in roles or "System Manager" in roles:
+		return True
+
+	return doc.email_account in get_user_email_accounts(user)
 
 
 def get_permission_query_conditions_for_communication(user):
@@ -504,20 +539,19 @@ def get_permission_query_conditions_for_communication(user):
 	if "Super Email User" in roles or "System Manager" in roles:
 		return None
 	else:
-		accounts = frappe.get_all(
-			"User Email",
-			filters={"parent": user},
-			fields=["email_account"],
-			distinct=True,
-		)
+		accounts = get_user_email_accounts(user)
 
 		if not accounts:
 			return """`tabCommunication`.communication_medium!='Email'"""
 
-		email_accounts = ['"{}"'.format(account.get("email_account")) for account in accounts]
+		email_accounts = ['"{}"'.format(account) for account in accounts]
 		return """`tabCommunication`.email_account in ({email_accounts})""".format(
 			email_accounts=",".join(email_accounts)
 		)
+
+
+def get_user_email_accounts(user) -> list[str]:
+	return frappe.get_all("User Email", filters={"parent": user}, pluck="email_account", distinct=True)
 
 
 def get_contacts(email_strings: list[str], auto_create_contact=False) -> list[str]:
@@ -604,7 +638,7 @@ def parse_email(email_strings):
 			if not document_parts or len(document_parts) != 2:
 				continue
 
-			doctype = frappe.unscrub(unquote_plus(document_parts[0]))
+			doctype = unquote_plus(document_parts[0])
 			docname = unquote_plus(document_parts[1])
 			yield doctype, docname
 

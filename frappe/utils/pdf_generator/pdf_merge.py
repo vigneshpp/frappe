@@ -8,7 +8,6 @@ class PDFTransformer:
 		if not self.header_pdf and not self.footer_pdf:
 			return
 		self.no_of_pages = len(self.body_pdf.pages)
-		self.encrypt_password = self.browser.options.get("password", None)
 		# if not header / footer then return body pdf
 
 	def _set_header_pdf(self):
@@ -31,10 +30,23 @@ class PDFTransformer:
 		footer = self.footer_pdf
 
 		if not header and not footer:
+			if output:
+				from io import BytesIO
+
+				from pypdf import PdfReader
+
+				reader = PdfReader(BytesIO(body))
+				first_new_page = len(output.pages)
+				output.append_pages_from_reader(reader)
+				self.resolve_internal_links(output, reader, first_new_page)
+				return output
 			return body
 
+		if not output:
+			body = PdfWriter(clone_from=body)
+
 		body_height = body.pages[0].mediabox.top
-		body_transform = header_height = footer_height = header_body_top = 0
+		body_transform = header_height = footer_height = 0
 
 		if footer:
 			footer_height = footer.pages[0].mediabox.top
@@ -43,20 +55,26 @@ class PDFTransformer:
 		if header:
 			header_height = header.pages[0].mediabox.top
 			header_transform = body_height + footer_height
-			header_body_top = header_height + body_height + footer_height
 
-		if header and not self.is_header_dynamic:
+		# full page height: the body was rendered on a page shortened by the
+		# header/footer heights, so every body page must be raised above the
+		# footer and its mediabox restored to the full paper height
+		page_top = header_height + body_height + footer_height
+
+		# Pre-transform every header page exactly once. A dynamic header can have
+		# fewer pages than the body (pagination rounding), so the merge below
+		# clamps the index like the footer path — transforming inline there would
+		# translate a clamped page multiple times.
+		if header:
 			for h in header.pages:
-				self._transform(h, header_body_top, header_transform)
+				self._transform(h, page_top, header_transform)
 
 		for p in body.pages:
-			if header_body_top:
-				self._transform(p, header_body_top, body_transform)
+			self._transform(p, page_top, body_transform)
+
 			if header:
 				if self.is_header_dynamic:
-					p.merge_page(
-						self._transform(header.pages[p.page_number], header_body_top, header_transform)
-					)
+					p.merge_page(header.pages[min(p.page_number, len(header.pages) - 1)])
 				elif self.is_print_designer:
 					if p.page_number == 0:
 						p.merge_page(header.pages[0])
@@ -69,9 +87,10 @@ class PDFTransformer:
 				else:
 					p.merge_page(header.pages[0])
 
+			# Footer pages are not transformed — they sit at y=0 naturally.
 			if footer:
-				if self.is_footer_dynamic:
-					p.merge_page(footer.pages[p.page_number])
+				if self.is_footer_dynamic and len(footer.pages) > 1:
+					p.merge_page(footer.pages[min(p.page_number, len(footer.pages) - 1)])
 				elif self.is_print_designer:
 					if p.page_number == 0:
 						p.merge_page(footer.pages[0])
@@ -85,22 +104,57 @@ class PDFTransformer:
 					p.merge_page(footer.pages[0])
 
 		if output:
-			output.append_pages_from_reader(body)
-			return output
+			writer = output
+			first_new_page = len(writer.pages)
+			writer.append_pages_from_reader(body)
+		else:
+			writer = body
+			first_new_page = 0
+		for page in writer.pages[first_new_page:]:
+			page.compress_content_streams()
+		self.resolve_internal_links(writer, body, first_new_page, body_transform)
+		if not output:
+			writer.root_object.pop("/Dests", None)
+			writer.root_object.get("/Names", {}).pop("/Dests", None)
 
-		writer = PdfWriter()
-		writer.append_pages_from_reader(body)
-		if self.encrypt_password:
-			writer.encrypt(self.encrypt_password)
+		return output or self.get_file_data_from_writer(writer)
 
-		return self.get_file_data_from_writer(writer)
+	@staticmethod
+	def resolve_internal_links(writer, reader, first_new_page, ty=0):
+		from pypdf.generic import ArrayObject, FloatObject, NameObject
+
+		destinations = reader.named_destinations
+		for page in writer.pages[first_new_page:]:
+			for annotation in page.get("/Annots", []):
+				annotation = annotation.get_object()
+				name = annotation.get("/Dest")
+				if not isinstance(name, str) or name not in destinations:
+					continue
+				destination = destinations[name]
+				target = writer.pages[first_new_page + reader.get_destination_page_number(destination)]
+				annotation[NameObject("/Dest")] = ArrayObject(
+					[
+						target.indirect_reference,
+						destination.typ,
+						destination.left,
+						FloatObject(destination.top + ty),
+						destination.zoom,
+					]
+				)
 
 	def _transform(self, page, page_top, ty):
-		from pypdf import PdfWriter, Transformation
+		from pypdf.generic import FloatObject
 
-		transform = Transformation().translate(ty=ty)
 		page.mediabox.upper_right = (page.mediabox.right, page_top)
-		page.add_transformation(transform)
+		content = page.get_contents()
+		content.set_data(f"q 1 0 0 1 0 {FloatObject(ty)} cm\n".encode() + content.get_data() + b"\nQ")
+		page.replace_contents(content)
+		for annotation in page.get("/Annots", []):
+			annotation = annotation.get_object()
+			for key in ("/Rect", "/QuadPoints"):
+				if key in annotation:
+					points = annotation[key]
+					points[1::2] = [FloatObject(y + ty) for y in points[1::2]]
 		return page
 
 	def get_file_data_from_writer(self, writer_obj):

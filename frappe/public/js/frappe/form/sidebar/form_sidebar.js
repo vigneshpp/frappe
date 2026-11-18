@@ -1,7 +1,6 @@
 import "./assign_to";
 import "./attachments";
 import "./share";
-import "./document_follow";
 import "./user_image";
 import "./form_sidebar_users";
 import { get_user_link, get_user_message } from "../footer/version_timeline_content_builder";
@@ -16,7 +15,7 @@ frappe.ui.form.Sidebar = class {
 			doctype: this.frm.doctype,
 			frm: this.frm,
 			can_write:
-				frappe.model.can_write(this.frm.doctype, this.frm.docname) &&
+				this.frm.get_perm(0, "write") &&
 				!this.frm.fields_dict[this.frm.meta.image_field]?.df.read_only,
 			image_field: this.frm.meta.image_field ?? false,
 		});
@@ -83,36 +82,28 @@ frappe.ui.form.Sidebar = class {
 	}
 
 	setup_editable_title() {
-		// setup editable title
-		let form_sidebar_text = $(this.sidebar).find(".form-stats-likes .form-title-text");
+		let form_sidebar_text = $(this.sidebar).find(".form-stats-likes .form-title-edit");
 		this.toolbar.setup_editable_title(form_sidebar_text);
 	}
 
 	setup_print() {
-		const print_settings = frappe.model.get_doc(":Print Settings", "Print Settings");
-		const allow_print_for_draft = cint(print_settings.allow_print_for_draft);
-		const allow_print_for_cancelled = cint(print_settings.allow_print_for_cancelled);
-
-		if (
-			!frappe.model.is_submittable(this.frm.doc.doctype) ||
-			this.frm.doc.docstatus == 1 ||
-			(allow_print_for_cancelled && this.frm.doc.docstatus == 2) ||
-			(allow_print_for_draft && this.frm.doc.docstatus == 0)
-		) {
-			if (frappe.model.can_print(null, this.frm) && !this.frm.meta.issingle) {
-				let print_icon = this.page.add_action_icon(
-					"printer",
-					() => {
-						this.frm.print_doc();
-					},
-					"",
-					__("Print")
+		if (frappe.model.can_print_doc(this.frm)) {
+			this.add_print_icon("printer", () => this.frm.print_doc(), __("Print"));
+			if (this.frm.get_perm(0, "write")) {
+				this.add_print_icon(
+					"paperclip",
+					() => this.toolbar.attach_pdf(),
+					__("Attach PDF")
 				);
-				print_icon.css("background-color", "transparent");
-				print_icon.addClass("p-0");
-				this.sidebar.find(".form-print").append(print_icon);
 			}
 		}
+	}
+
+	add_print_icon(icon, action, label) {
+		let print_icon = this.page.add_action_icon(icon, action, "", label);
+		print_icon.css("background-color", "transparent");
+		print_icon.addClass("p-0");
+		this.sidebar.find(".form-print").append(print_icon);
 	}
 
 	make_like() {
@@ -165,7 +156,7 @@ frappe.ui.form.Sidebar = class {
 				) +
 					" <br> " +
 					(cint(frappe.boot.user.show_absolute_datetime_in_timeline) ||
-					cint(frappe.boot.sysdefaults.show_absolute_datetime_in_timeline)
+					frappe.defaults.is_enabled("show_absolute_datetime_in_timeline")
 						? frappe.datetime.str_to_user(this.frm.doc.modified)
 						: comment_when(this.frm.doc.modified))
 			);
@@ -179,7 +170,7 @@ frappe.ui.form.Sidebar = class {
 				) +
 					" <br> " +
 					(cint(frappe.boot.user.show_absolute_datetime_in_timeline) ||
-					cint(frappe.boot.sysdefaults.show_absolute_datetime_in_timeline)
+					frappe.defaults.is_enabled("show_absolute_datetime_in_timeline")
 						? frappe.datetime.str_to_user(this.frm.doc.creation)
 						: comment_when(this.frm.doc.creation))
 			);

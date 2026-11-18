@@ -3,9 +3,10 @@ frappe.ui.get_print_settings = function (
 	callback,
 	letter_head,
 	pick_columns,
-	has_filters = false,
+	is_query_report = false,
 	title = null,
-	default_print_format = null
+	default_print_format = null,
+	can_include_filters = is_query_report
 ) {
 	var print_settings = locals[":Print Settings"]["Print Settings"];
 
@@ -31,27 +32,10 @@ frappe.ui.get_print_settings = function (
 			default: "Landscape",
 		},
 		{
-			fieldtype: "Link",
-			fieldname: "print_format",
-			label: __("Print Format"),
-			options: "Print Format",
-			default: default_print_format,
-			description: __(
-				"If no Print Format is selected, the default template for this report will be used."
-			),
-			get_query: () => ({
-				filters: {
-					print_format_for: "Report",
-					print_format_type: "JS",
-					report: frappe.query_report ? frappe.query_report.report_name : "",
-					disabled: 0,
-				},
-			}),
-		},
-		{
 			fieldtype: "Check",
 			fieldname: "with_letter_head",
 			label: __("With Letter Head"),
+			default: 1,
 		},
 		{
 			fieldtype: "Link",
@@ -71,12 +55,33 @@ frappe.ui.get_print_settings = function (
 		},
 	];
 
-	if (has_filters) {
+	// Print format only applies to query/script reports.
+	if (is_query_report) {
+		columns.splice(1, 0, {
+			fieldtype: "Link",
+			fieldname: "print_format",
+			label: __("Print Format"),
+			options: "Print Format",
+			default: default_print_format,
+			description: __(
+				"If no Print Format is selected, the default template for this report will be used."
+			),
+			get_query: () => ({
+				filters: {
+					print_format_for: "Report",
+					report: frappe.query_report ? frappe.query_report.report_name : "",
+					disabled: 0,
+				},
+			}),
+		});
+	}
+
+	if (can_include_filters) {
 		columns.push({
 			label: __("Include filters"),
 			fieldtype: "Check",
 			fieldname: "include_filters",
-			depends_on: "eval: !doc.print_format",
+			default: 1,
 		});
 	}
 
@@ -273,4 +278,37 @@ frappe.ui.form.qz_fail = function (e) {
 		},
 		20
 	);
+};
+
+frappe.ui.form.attach_pdf = function (doctype, name, args = {}) {
+	const format = args.format || frappe.get_meta(doctype)?.default_print_format;
+	const print_format = locals[":Print Format"]?.[format] || {};
+	if (print_format.custom_format || print_format.raw_printing) {
+		args = { ...args, pdf_generator: print_format.pdf_generator || "chrome" };
+	}
+	return frappe
+		.xcall(
+			"frappe.utils.print_format.attach_pdf",
+			Object.assign({ doctype, name }, args),
+			"POST",
+			{ freeze: true, freeze_message: __("Attaching PDF...") }
+		)
+		.then((file) => {
+			const link = `<a href="${encodeURI(
+				file.file_url
+			)}" target="_blank">${frappe.utils.escape_html(file.file_name)}</a>`;
+			frappe.show_alert(
+				{
+					message: __("Attached {0}", [link]),
+					subtitle: file.kept_previous
+						? __("The earlier PDF is protected, so it was kept.")
+						: "",
+					indicator: "green",
+				},
+				10
+			);
+			const frm = frappe.views.formview?.[doctype]?.frm;
+			if (frm?.docname === name) frm.sidebar?.reload_docinfo();
+			return file;
+		});
 };

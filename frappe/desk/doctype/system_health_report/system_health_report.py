@@ -26,12 +26,12 @@ from frappe.core.doctype.scheduled_job_type.scheduled_job_type import ScheduledJ
 from frappe.model.document import Document
 from frappe.utils.background_jobs import get_queue, get_queue_list, get_redis_conn
 from frappe.utils.caching import redis_cache
-from frappe.utils.data import add_to_date
+from frappe.utils.data import add_to_date, cint
 from frappe.utils.scheduler import (
 	get_scheduler_status,
 	get_scheduler_tick,
 	is_dormant,
-	is_schduler_process_running,
+	is_scheduler_process_running,
 )
 
 
@@ -70,7 +70,27 @@ def health_check(step: str):
 	return suppress_exception
 
 
+def get_scheduler_health_status() -> str:
+	scheduler_enabled = get_scheduler_status().get("status") == "active"
+
+	try:
+		scheduler_process_running = is_scheduler_process_running()
+	except Exception:
+		# get_redis_conn raises Exception when redis_queue is not configured.
+		return "Redis Unavailable"
+
+	if not scheduler_process_running:
+		return "Process Not Found"
+	elif is_dormant():
+		return "Dormant"
+	elif scheduler_enabled:
+		return "Active"
+	return "Inactive"
+
+
 class SystemHealthReport(Document):
+	_DOCTYPE_NAME = "System Health Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -134,7 +154,7 @@ class SystemHealthReport(Document):
 		raise NotImplementedError
 
 	def load_from_db(self):
-		super(Document, self).__init__({})
+		self.init_from_dict({})
 		frappe.only_for("System Manager")
 
 		# Each method loads a section of health report
@@ -188,16 +208,7 @@ class SystemHealthReport(Document):
 
 	@health_check("Scheduler")
 	def fetch_scheduler(self):
-		scheduler_enabled = get_scheduler_status().get("status") == "active"
-
-		if not is_schduler_process_running():
-			self.scheduler_status = "Process Not Found"
-		elif is_dormant():
-			self.scheduler_status = "Dormant"
-		elif scheduler_enabled:
-			self.scheduler_status = "Active"
-		else:
-			self.scheduler_status = "Inactive"
+		self.scheduler_status = get_scheduler_health_status()
 
 		lower_threshold = add_to_date(None, days=-7, as_datetime=True)
 		# Exclude "maybe" curently executing job
@@ -270,18 +281,28 @@ class SystemHealthReport(Document):
 
 	@health_check("Errors")
 	def fetch_errors(self):
-		threshold = add_to_date(None, days=-1, as_datetime=True)
-		filters = {"creation": (">", threshold), "modified": (">", threshold)}
-		self.total_errors = frappe.db.count("Error Log", filters)
+		# Error Log rows live in the site's SQLite log database, not the primary one, so both
+		# queries are built with that dialect and run on that connection. Same window, same
+		# grouping and same ordering as before -- only the backend differs.
+		from pypika import Order
 
-		top_errors = frappe.db.sql(
-			"""select method as title, count(*) as occurrences
-			from `tabError Log`
-			where modified > %(threshold)s and creation > %(threshold)s
-			group by method
-			order by occurrences desc
-			limit 5""",
-			{"threshold": threshold},
+		from frappe.query_builder.functions import Count
+		from frappe.utils.logging import get_log_db, log_table
+
+		threshold = add_to_date(None, days=-1, as_datetime=True)
+
+		qb, table = log_table("Error Log")
+		recent = qb.from_(table).where(table.creation > threshold).where(table.modified > threshold)
+
+		db = get_log_db()
+		count = db.sql(recent.select(Count("*")))
+		self.total_errors = cint(count[0][0]) if count else 0
+
+		top_errors = db.sql(
+			recent.groupby(table.method)
+			.orderby(Count("*"), order=Order.desc)
+			.select(table.method.as_("title"), Count("*").as_("occurrences"))
+			.limit(5),
 			as_dict=True,
 		)
 		for row in top_errors:
@@ -324,10 +345,14 @@ class SystemHealthReport(Document):
 
 	@health_check("Users")
 	def fetch_user_stats(self):
+		from frappe.utils.logging import get_log_db
+
 		threshold = add_to_date(None, days=-30, as_datetime=True)
 		self.total_users = frappe.db.count("User", {"enabled": 1})
 		self.new_users = frappe.db.count("User", {"enabled": 1, "creation": (">", threshold)})
-		self.failed_logins = frappe.db.count(
+		# Activity Log rows live in the site's SQLite log database, so the count is asked of
+		# that connection -- the site database holds no table for it.
+		self.failed_logins = get_log_db().count(
 			"Activity Log",
 			{
 				"operation": "login",

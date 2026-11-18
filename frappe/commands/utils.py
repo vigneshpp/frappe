@@ -32,9 +32,7 @@ if typing.TYPE_CHECKING:
 )
 @click.option("--production", is_flag=True, default=False, help="Build assets in production mode")
 @click.option("--verbose", is_flag=True, default=False, help="Verbose")
-@click.option(
-	"--force", is_flag=True, default=False, help="Force build assets instead of downloading available"
-)
+@click.option("--force", is_flag=True, default=False, help="Force build and compile translations")
 @click.option(
 	"--save-metafiles",
 	is_flag=True,
@@ -59,7 +57,7 @@ def build(
 	using_cached=False,
 ):
 	"Compile JS and CSS source files"
-	from frappe.build import bundle, download_frappe_assets
+	from frappe.bundler import build_framework_islands, bundle
 	from frappe.gettext.translate import compile_translations
 	from frappe.utils.synchronization import filelock
 
@@ -69,13 +67,6 @@ def build(
 		apps = app
 
 	with filelock("bench_build", is_global=True, timeout=10):
-		# dont try downloading assets if force used, app specified or running via CI
-		if not (force or apps or os.environ.get("CI")):
-			# skip building frappe if assets exist remotely
-			skip_frappe = download_frappe_assets(verbose=verbose)
-		else:
-			skip_frappe = False
-
 		# don't minify in developer_mode for faster builds
 		development = frappe.local.conf.developer_mode or frappe._dev_server
 		esbuild_target = frappe.local.conf.get("esbuild_target") or os.environ.get("ESBUILD_TARGET")
@@ -92,11 +83,11 @@ def build(
 			apps=apps,
 			hard_link=hard_link,
 			verbose=verbose,
-			skip_frappe=skip_frappe,
 			save_metafiles=save_metafiles,
 			using_cached=using_cached,
 			esbuild_target=esbuild_target,
 		)
+		build_framework_islands(production=mode == "production")
 
 		if apps and isinstance(apps, str):
 			apps = apps.split(",")
@@ -105,28 +96,41 @@ def build(
 			apps = frappe.get_all_apps()
 
 		for app in apps:
-			print("Compiling translations for", app)
-			compile_translations(app, force=force)
+			if verbose:
+				print("Compiling translations for", app)
+			compile_translations(app, force=force, verbose=verbose)
 
 		run_after_build_hook(apps)
 
 
-def run_after_build_hook(apps):
+def run_after_build_hook(built_apps: list[str]):
+	"""Run build hooks after assets are built.
+
+	- `after_build`: self-referential - runs only for apps that were just built, called with no arguments.
+	- `after_app_build`: cross-app - runs for every app on the bench, called with the list of built apps,
+	  so an app can react to another app's build (e.g. compile frontends it owns for that app).
+	"""
 	from importlib import import_module
 
-	for app in apps:
+	def _get_method(fn):
+		modulename = ".".join(fn.split(".")[:-1])
+		methodname = fn.split(".")[-1]
+		return getattr(import_module(modulename), methodname)
+
+	for app in built_apps:
 		for fn in frappe.get_hooks("after_build", app_name=app):
-			modulename = ".".join(fn.split(".")[:-1])
-			methodname = fn.split(".")[-1]
-			method = getattr(import_module(modulename), methodname)
-			method()
+			_get_method(fn)()
+
+	for app in frappe.get_all_apps():
+		for fn in frappe.get_hooks("after_app_build", app_name=app):
+			_get_method(fn)(built_apps)
 
 
 @click.command("watch")
 @click.option("--apps", help="Watch assets for specific apps")
 def watch(apps=None):
 	"Watch and compile JS and CSS files as and when they change"
-	from frappe.build import watch
+	from frappe.bundler import watch
 
 	frappe.init("")
 	watch(apps)
@@ -275,7 +279,10 @@ def execute(context: CliCtxObj, method, args=None, kwargs=None, profile=False, e
 
 
 @click.command("add-to-email-queue")
-@click.argument("email-path")
+@click.argument(
+	"email-path",
+	type=click.Path(exists=True, dir_okay=True, file_okay=False, resolve_path=True),
+)
 @pass_context
 def add_to_email_queue(context: CliCtxObj, email_path):
 	"Add an email to the Email Queue"
@@ -313,7 +320,10 @@ def export_doc(context: CliCtxObj, doctype, docname):
 
 @click.command("export-json")
 @click.argument("doctype")
-@click.argument("path")
+@click.argument(
+	"path",
+	type=click.Path(dir_okay=False, file_okay=True),
+)
 @click.option("--name", help="Export only one document")
 @pass_context
 def export_json(context: CliCtxObj, doctype, path, name=None):
@@ -333,7 +343,10 @@ def export_json(context: CliCtxObj, doctype, path, name=None):
 
 @click.command("export-csv")
 @click.argument("doctype")
-@click.argument("path")
+@click.argument(
+	"path",
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+)
 @pass_context
 def export_csv(context: CliCtxObj, doctype, path):
 	"Export data import template with data for DocType"
@@ -368,8 +381,48 @@ def export_fixtures(context: CliCtxObj, app=None):
 		raise SiteNotSpecifiedError
 
 
+@click.command("convert-sidebar-fixtures")
+@click.option("--app", default=None, help="Convert one app's fixtures; omit for every installed app")
+@click.option("--dry-run", is_flag=True, default=False, help="Report what would be written")
+@pass_context
+def convert_sidebar_fixtures(context: CliCtxObj, app=None, dry_run=False):
+	"Convert an app's old workspace_sidebar fixtures into per-module Sidebar exports"
+	from frappe.desk.doctype.sidebar.convert_fixtures import apps_with_old_fixtures, convert_app
+
+	for site in context.sites:
+		try:
+			frappe.init(site)
+			frappe.connect()
+
+			if app and app not in frappe.get_installed_apps():
+				click.secho(f"{app} is not installed on {site}.", fg="red")
+				continue
+
+			apps = [app] if app else sorted(apps_with_old_fixtures())
+			if not apps:
+				click.secho("No installed app still ships the old sidebar fixtures.", fg="green")
+
+			for name in apps:
+				click.secho(f"\n{name}", bold=True)
+				results = convert_app(name, dry_run=dry_run)
+				if not results:
+					click.echo("  nothing to convert")
+				for result in results:
+					colour = {"converted": "green", "already converted": "cyan"}.get(
+						result["state"], "yellow"
+					)
+					click.secho(f"  {result['state']:18} {result['module'] or result['path']}", fg=colour)
+		finally:
+			frappe.destroy()
+	if not context.sites:
+		raise SiteNotSpecifiedError
+
+
 @click.command("import-doc")
-@click.argument("path")
+@click.argument(
+	"path",
+	type=click.Path(dir_okay=True, file_okay=True),
+)
 @pass_context
 def import_doc(context: CliCtxObj, path, force=False):
 	"Import (insert/update) doclist. If the argument is a directory, all files ending with .json are imported"
@@ -406,9 +459,9 @@ def import_doc(context: CliCtxObj, path, force=False):
 @click.option(
 	"--type",
 	"import_type",
-	type=click.Choice(["Insert", "Update"], case_sensitive=False),
+	type=click.Choice(["Insert", "Update", "Upsert"], case_sensitive=False),
 	default="Insert",
-	help="Insert New Records or Update Existing Records",
+	help="Insert New Records, Update Existing Records, or Insert or Update Records",
 )
 @click.option("--submit-after-import", default=False, is_flag=True, help="Submit document after importing it")
 @click.option("--mute-emails", default=True, is_flag=True, help="Mute emails during import")
@@ -429,7 +482,10 @@ def data_import(
 
 @click.command("bulk-rename")
 @click.argument("doctype")
-@click.argument("path")
+@click.argument(
+	"path",
+	type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+)
 @pass_context
 def bulk_rename(context: CliCtxObj, doctype, path):
 	"Rename multiple records via CSV file"
@@ -610,7 +666,7 @@ def console(context: CliCtxObj, autoreload=False):
 
 	register(_console_cleanup)
 
-	terminal = InteractiveShellEmbed.instance()
+	terminal = InteractiveShellEmbed.instance(user_ns={})
 	if autoreload:
 		terminal.extension_manager.load_extension("autoreload")
 		terminal.run_line_magic("autoreload", "2")
@@ -621,7 +677,7 @@ def console(context: CliCtxObj, autoreload=False):
 
 	for app in list(all_apps):
 		try:
-			locals()[app] = __import__(app)
+			terminal.user_ns[app] = __import__(app)
 		except ModuleNotFoundError:
 			failed_to_import.append(app)
 			all_apps.remove(app)
@@ -634,7 +690,8 @@ def console(context: CliCtxObj, autoreload=False):
 	try:
 		from IPython.core import ultratb
 
-		ultratb.VerboseTB._tb_highlight = "bg:ansibrightblack"
+		# Renamed from `_tb_highlight` in IPython 9.x (color system rewrite).
+		ultratb.VerboseTB.tb_highlight = "bg:ansibrightblack"
 	except Exception:
 		pass
 
@@ -730,6 +787,12 @@ def transform_database(context: CliCtxObj, table, engine, row_format, failfast):
 
 @click.command("serve")
 @click.option("--port", default=8000)
+@click.option(
+	"--host",
+	"bind_addr",
+	default=None,
+	help="Address to bind the development server to. Defaults to 127.0.0.1, use 0.0.0.0 to expose it on all interfaces.",
+)
 @click.option("--profile", is_flag=True, default=False)
 @click.option(
 	"--proxy",
@@ -744,6 +807,7 @@ def transform_database(context: CliCtxObj, table, engine, row_format, failfast):
 def serve(
 	context: CliCtxObj,
 	port=None,
+	bind_addr=None,
 	profile=False,
 	proxy=False,
 	no_reload=False,
@@ -766,6 +830,7 @@ def serve(
 			no_reload = True
 		frappe.app.serve(
 			port=port,
+			bind_addr=bind_addr,
 			profile=profile,
 			proxy=proxy,
 			no_reload=no_reload,
@@ -777,7 +842,11 @@ def serve(
 
 @click.command("request")
 @click.option("--args", help="arguments like `?cmd=test&key=value` or `/api/request/method?..`")
-@click.option("--path", help="path to request JSON")
+@click.option(
+	"--path",
+	type=click.Path(dir_okay=False, file_okay=True),
+	help="path to request JSON",
+)
 @pass_context
 def request(context: CliCtxObj, args=None, path=None):
 	"Run a request as an admin"
@@ -814,7 +883,10 @@ def request(context: CliCtxObj, args=None, path=None):
 
 
 @click.command("make-app")
-@click.argument("destination")
+@click.argument(
+	"destination",
+	type=click.Path(exists=True, dir_okay=True, file_okay=False, resolve_path=True),
+)
 @click.argument("app_name")
 @click.option("--no-git", is_flag=True, default=False, help="Do not initialize git repository for the app")
 def make_app(destination, app_name, no_git=False):
@@ -855,7 +927,17 @@ def set_config(context: CliCtxObj, key, value, global_=False, parse=False):
 	if parse:
 		import ast
 
-		value = ast.literal_eval(value)
+		if isinstance(value, str):
+			val_lower = value.strip().lower()
+			if val_lower == "true":
+				value = True
+			elif val_lower == "false":
+				value = False
+			else:
+				try:
+					value = ast.literal_eval(value)
+				except (ValueError, SyntaxError):
+					raise click.BadParameter(f"'{value}' is not a valid Python literal/object.")
 
 	if global_:
 		sites_path = os.getcwd()
@@ -993,7 +1075,7 @@ def list_sites(context: CliCtxObj, output_json=False):
 
 @click.command("setup-chrome")
 def setup_chrome():
-	from frappe.utils.print_utils import setup_chromium
+	from frappe.utils.chromium import setup_chromium
 
 	setup_chromium()
 
@@ -1002,6 +1084,7 @@ commands = [
 	build,
 	clear_cache,
 	clear_website_cache,
+	convert_sidebar_fixtures,
 	database,
 	transform_database,
 	jupyter,

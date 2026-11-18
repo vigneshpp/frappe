@@ -9,9 +9,10 @@ configuration.
 """
 
 import json
-import sys
 import os
+import sys
 from pathlib import Path
+
 from coverage import Coverage
 
 STANDARD_INCLUSIONS = ["*.py"]
@@ -38,7 +39,7 @@ TESTED_VIA_CLI = [
 	"*/frappe/utils/install.py",
 	"*/frappe/utils/scheduler.py",
 	"*/frappe/utils/doctor.py",
-	"*/frappe/build.py",
+	"*/frappe/bundler.py",
 	"*/frappe/database/__init__.py",
 	"*/frappe/database/db_manager.py",
 	"*/frappe/database/**/setup_db.py",
@@ -115,5 +116,7 @@ if __name__ == "__main__":
 	with CodeCoverage(with_coverage=with_coverage, app=app):
 		from frappe.parallel_test_runner import ParallelTestRunner
 
-		runner = ParallelTestRunner(app, site=site, build_number=build_number, total_builds=total_builds)
+		runner = ParallelTestRunner(
+			app, site=site, build_number=build_number, total_builds=total_builds, retries=1
+		)
 		runner.setup_and_run()

@@ -118,8 +118,6 @@ data-fieldname="{{ df.fieldname }}" data-fieldtype="{{ df.fieldtype }}"
 	{%- endif %}
 	{%- if df.fieldtype=="Code" %}
 		<pre class="value">{{ doc.get(df.fieldname)|e }}</pre>
-	{%- elif df.fieldtype in ("Text", "Long Text") -%}
-		{{ doc.get_formatted(df.fieldname, parent_doc or doc, translated=df.translatable)|e }}
 	{%- else -%}
 		{{ doc.get_formatted(df.fieldname, parent_doc or doc, translated=df.translatable) }}
 	{%- endif -%}
@@ -139,7 +137,6 @@ data-fieldname="{{ df.fieldname }}" data-fieldtype="{{ df.fieldtype }}"
 	{% if child_templates and child_templates[df.fieldname] %}
 		{% include child_templates[df.fieldname] %}
 	{% elif df.fieldtype=="Check" and doc[df.fieldname] %}
-		<!-- <i class="{{ 'fa fa-check' }}"></i> -->
 		<svg viewBox="0 0 16 16"
 			fill="transparent" stroke="#1F272E" stroke-width="2"
 			xmlns="http://www.w3.org/2000/svg" id="icon-tick"
@@ -149,29 +146,26 @@ data-fieldname="{{ df.fieldname }}" data-fieldtype="{{ df.fieldtype }}"
 	{% elif df.fieldtype=="Check" and not doc[df.fieldname] %}
 		<!-- empty -->
 	{% elif df.fieldtype in ("Image", "Attach Image") and frappe.utils.is_image(doc[doc.meta.get_field(df.fieldname).options]) %}
-		<img src="{{ doc[doc.meta.get_field(df.fieldname).options] }}"
+		<img src="{{ doc[doc.meta.get_field(df.fieldname).options]|e }}"
 			class="img-responsive"
 			{%- if df.print_width %} style="width: {{ get_width(df) }};"{% endif %}>
 	{% elif df.fieldtype=="Attach Image" %}
-		<img src="{{ doc[df.fieldname] }}"
+		<img src="{{ doc[df.fieldname]|e }}"
 			class="img-responsive"
 			{%- if df.print_width %} style="width: {{ get_width(df) }};"{% endif %}>
 	{% elif df.fieldtype=="Signature" %}
-		<img src="{{ doc[df.fieldname] }}" class="signature-img img-responsive"
+		<img src="{{ doc[df.fieldname]|e }}" class="signature-img img-responsive"
 			{%- if df.print_width %} style="width: {{ get_width(df) }};"{% endif %}>
 	{% elif df.fieldtype=="Barcode" and not doc[df.fieldname].startswith("<svg") %}
-		<svg data-barcode-value="{{ doc[df.fieldname] }}" height="80" data-options='{{ df.options }}'></svg>
+		<svg data-barcode-value="{{ doc[df.fieldname]|e }}" data-options='{{ df.options|e }}'></svg>
 	{% elif df.fieldtype in ("Attach", "Attach Image") and frappe.utils.is_image(doc[df.fieldname]) %}
-		<img src="{{ doc[df.fieldname] }}" class="img-responsive"
+		<img src="{{ doc[df.fieldname]|e }}" class="img-responsive"
 			{%- if df.print_width %} style="width: {{ get_width(df) }};"{% endif %}>
 	{% elif df.fieldtype=="HTML" %}
 		{{ frappe.render_template(df.options, {"doc":doc}) }}
 	{% elif df.fieldtype=="Currency" %}
 		{{ doc.get_formatted(df.fieldname, parent_doc or doc, translated=df.translatable) }}
-	{% elif df.fieldtype=="Data" %}
-		{%- set parent = parent_doc or doc -%}
-		{{ doc.get_formatted(df.fieldname, parent, translated=df.translatable, absolute_value=parent.absolute_value) |e }}
-	{% elif df.fieldtype in ("Text", "Long Text") %}
+	{% elif df.fieldtype in ("Data", "Code", "JSON") %}
 		{%- set parent = parent_doc or doc -%}
 		{{ doc.get_formatted(df.fieldname, parent, translated=df.translatable, absolute_value=parent.absolute_value) |e }}
 	{% else %}

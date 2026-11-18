@@ -1,4 +1,5 @@
 import AttachControl from "./components/controls/AttachControl.vue";
+import AttachmentGalleryControl from "./components/controls/AttachmentGalleryControl.vue";
 import ButtonControl from "./components/controls/ButtonControl.vue";
 import CheckControl from "./components/controls/CheckControl.vue";
 import CodeControl from "./components/controls/CodeControl.vue";
@@ -17,6 +18,7 @@ import FetchFromControl from "./components/controls/FetchFromControl.vue";
 export function registerGlobalComponents(app) {
 	app.component("AttachControl", AttachControl)
 		.component("AttachImageControl", AttachControl)
+		.component("AttachmentGalleryControl", AttachmentGalleryControl)
 		.component("AutocompleteControl", DataControl)
 		.component("BarcodeControl", DataControl)
 		.component("ButtonControl", ButtonControl)
@@ -54,5 +56,6 @@ export function registerGlobalComponents(app) {
 		.component("TextControl", TextControl)
 		.component("TextEditorControl", TextEditorControl)
 		.component("TimeControl", DataControl)
+		.component("VueComponentControl", DataControl)
 		.component("FetchFromControl", FetchFromControl);
 }

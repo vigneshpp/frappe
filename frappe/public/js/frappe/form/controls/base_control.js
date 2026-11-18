@@ -70,7 +70,7 @@ frappe.ui.form.Control = class BaseControl {
 				if (explain) console.log("By Read Only: Read");
 				status = "Read";
 			} else if (
-				(this.grid && this.grid.display_status == "Read") ||
+				(this.grid && this.grid.control !== this && this.grid.display_status == "Read") ||
 				(this.layout && this.layout.grid && this.layout.grid.display_status == "Read")
 			) {
 				// parent grid is read
@@ -84,7 +84,7 @@ frappe.ui.form.Control = class BaseControl {
 			if (
 				status === "Read" &&
 				is_null(value) &&
-				!["HTML", "Image", "Button"].includes(this.df.fieldtype)
+				!["Attachment Gallery", "HTML", "Image", "Button"].includes(this.df.fieldtype)
 			)
 				status = "Read";
 
@@ -124,8 +124,15 @@ frappe.ui.form.Control = class BaseControl {
 			status === "Read" &&
 			!this.only_input &&
 			is_null(value) &&
-			cint(frappe.boot.sysdefaults.hide_empty_read_only_fields) &&
-			!["HTML", "Image", "Button", "Geolocation"].includes(this.df.fieldtype)
+			frappe.defaults.is_enabled("hide_empty_read_only_fields") &&
+			![
+				"Attachment Gallery",
+				"HTML",
+				"Image",
+				"Button",
+				"Geolocation",
+				"Vue Component",
+			].includes(this.df.fieldtype)
 		) {
 			if (explain) console.log("By Hide Read-only, null fields: None");
 			status = "None";
@@ -140,9 +147,9 @@ frappe.ui.form.Control = class BaseControl {
 			this.refresh_input &&
 			this.refresh_input();
 
-		var value = this.get_value();
-
-		this.show_translatable_button(value);
+		if (this.df.translatable) {
+			this.show_translatable_button(this.get_value());
+		}
 	}
 	show_translatable_button(value) {
 		// Disable translation non-string fields or special string fields
@@ -165,7 +172,7 @@ frappe.ui.form.Control = class BaseControl {
 		const translation_btn = `<a class="btn-translation no-decoration text-muted" title="${__(
 			"Open Translation"
 		)}">
-				<i class="fa fa-globe"></i>
+				${frappe.utils.icon("globe", "sm")}
 			</a>`;
 
 		$(translation_btn)

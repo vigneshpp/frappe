@@ -11,7 +11,7 @@ from frappe.apps import get_default_path
 from frappe.auth import LoginManager
 from frappe.core.doctype.navbar_settings.navbar_settings import get_app_logo
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, get_url
+from frappe.utils import cint, get_request_host, get_url
 from frappe.utils.data import escape_html
 from frappe.utils.html_utils import get_icon_html
 from frappe.utils.jinja import guess_is_path
@@ -39,7 +39,7 @@ def get_context(context):
 
 	context.no_header = True
 	context.for_test = "login.html"
-	context["title"] = "Login"
+	context["title"] = _("Login")
 	context["hide_login"] = True  # dont show login link on login page again.
 	context["provider_logins"] = []
 	context["disable_signup"] = cint(frappe.get_website_settings("disable_signup"))
@@ -106,10 +106,9 @@ def get_context(context):
 	if frappe.utils.cint(frappe.get_system_settings("allow_login_using_user_name")):
 		login_label.append(_("Username"))
 
-	context["login_label"] = f" {_('or')} ".join(login_label)
+	context["login_label"] = " / ".join(login_label)
 
 	context["login_with_email_link"] = frappe.get_system_settings("login_with_email_link")
-	context["login_with_frappe_cloud_url"] = None
 
 	return context
 
@@ -139,6 +138,12 @@ def send_login_link(email: str):
 	if not frappe.get_system_settings("login_with_email_link"):
 		return
 
+	frappe.enqueue(_send_login_link, queue="short", email=email, lang=frappe.local.lang)
+
+
+def _send_login_link(email: str, lang: str):
+	frappe.local.lang = lang
+
 	try:
 		expiry = frappe.get_system_settings("login_with_email_link_expiry") or 10
 		link = _generate_temporary_login_link(email, expiry)
@@ -154,6 +159,8 @@ def send_login_link(email: str):
 			recipients=email,
 			template="login_with_email_link",
 			args={"link": link, "minutes": expiry, "app_name": app_name},
+			with_container=True,
+			wrapper="templates/emails/auth_email.html",
 			now=True,
 		)
 	except frappe.DoesNotExistError:
@@ -169,8 +176,8 @@ def send_login_link(email: str):
 def _generate_temporary_login_link(email: str, expiry: int):
 	assert isinstance(email, str)
 
-	if not frappe.db.exists("User", email):
-		frappe.throw(_("User with email address {0} does not exist").format(email), frappe.DoesNotExistError)
+	if not frappe.db.exists("User", {"name": email, "enabled": 1}):
+		frappe.throw(_("No active user found with email address {0}").format(email), frappe.DoesNotExistError)
 	key = frappe.generate_hash()
 	frappe.cache.set_value(f"one_time_login_key:{key}", email, expires_in_sec=expiry * 60)
 
@@ -211,12 +218,10 @@ def sanitize_redirect(redirect: str | None) -> str | None:
 
 	parsed_redirect = urlparse(redirect)
 
-	parsed_request_host = urlparse(frappe.local.request.url)
-	output_parsed_url = parsed_redirect._replace(
-		netloc=parsed_request_host.netloc, scheme=parsed_request_host.scheme
-	)
+	request_host = get_request_host(frappe.local.request)
+	output_parsed_url = parsed_redirect._replace(netloc=request_host, scheme=frappe.local.request.scheme)
 	if parsed_redirect.netloc:
-		if parsed_request_host.netloc != parsed_redirect.netloc:
+		if request_host != parsed_redirect.netloc:
 			output_parsed_url = output_parsed_url._replace(path="/desk")
 		else:
 			output_parsed_url = output_parsed_url._replace(path=parsed_redirect.path)

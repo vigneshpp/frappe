@@ -25,19 +25,21 @@ frappe.has_indicator = function (doctype) {
 
 frappe.get_indicator = function (doc, doctype, show_workflow_state) {
 	if (doc.__unsaved) {
-		return [__("Not Saved", null, doctype), "orange"];
+		return [__("Not Saved", null, doctype), "amber"];
 	}
 
 	if (!doctype) doctype = doc.doctype;
 
 	let meta = frappe.get_meta(doctype);
-	var workflow = frappe.workflow.workflows[doctype];
-	var without_workflow = workflow ? workflow["override_status"] : true;
+	let workflow_fieldname = frappe.workflow.get_state_fieldname(doctype);
+	// list rows lack the condition fields, so read every active workflow of the doctype
+	var without_workflow = (frappe.workflow.candidates[doctype] || []).every(
+		(workflow) => workflow.override_status
+	);
 
 	var settings = frappe.listview_settings[doctype] || {};
 
 	var is_submittable = frappe.model.is_submittable(doctype);
-	let workflow_fieldname = frappe.workflow.get_state_fieldname(doctype);
 
 	let avoid_status_override = (frappe.workflow.avoid_status_override[doctype] || []).includes(
 		doc[workflow_fieldname]
@@ -109,14 +111,14 @@ frappe.get_indicator = function (doc, doctype, show_workflow_state) {
 		if (doc.enabled) {
 			return [__("Enabled", null, doctype), "blue", "enabled,=,1"];
 		} else {
-			return [__("Disabled", null, doctype), "grey", "enabled,=,0"];
+			return [__("Disabled", null, doctype), "gray", "enabled,=,0"];
 		}
 	}
 
 	// based on disabled
 	if (frappe.meta.has_field(doctype, "disabled")) {
 		if (doc.disabled) {
-			return [__("Disabled", null, doctype), "grey", "disabled,=,1"];
+			return [__("Disabled", null, doctype), "gray", "disabled,=,1"];
 		} else {
 			return [__("Enabled", null, doctype), "blue", "disabled,=,0"];
 		}

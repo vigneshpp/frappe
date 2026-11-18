@@ -1,3 +1,6 @@
+{%- if standalone -%}
+{{ body }}
+{%- else -%}
 <!DOCTYPE html>
 <html lang="{{ lang }}" dir="{{ layout_direction }}">
 <head>
@@ -5,6 +8,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>{{ title }}</title>
 	<meta name="generator" content="frappe">
+	<meta name="frappe-print-filename" content="{{ print_filename | default('') | e }}">
 	{{ include_style('print.bundle.css') }}
 	{{ include_script('print.bundle.js') }}
 	{% if print_style %}
@@ -14,21 +18,13 @@
 	{% endif %}
 </head>
 <body>
-	<div class="action-banner print-hide">
-		<a class="p-2" onclick="window.print();">
-			{{ _("Print") }}
-		</a>
-		<a class="p-2"
-			href="/api/method/frappe.utils.print_format.download_pdf?doctype={{doctype|e}}&name={{name|e}}&format={{print_format|e}}&letterhead={{letterhead|e}}&no_letterhead={{no_letterhead|e}}&_lang={{lang|e}}&key={{key|e}}&pdf_generator={{pdf_generator|e}}">
-			{{ _('Get PDF') }}
-		</a>
-	</div>
+	{% if not no_action_banner %}{% include "templates/print_formats/print_action_banner.html" %}{% endif %}
 	<div class="print-format-gutter">
 		<div class="print-format">
 			{{ body }}
 		</div>
 	</div>
-	<script>
+	<script data-frappe-print>
 		document.addEventListener('DOMContentLoaded', () => {
 			const page_div = document.querySelector('.page-break');
 
@@ -46,9 +42,25 @@
 			}
 			document.querySelectorAll("svg[data-barcode-value]").forEach(render_barcode)
 		});
+
+		(() => {
+			const meta = document.querySelector('meta[name="frappe-print-filename"]');
+			const print_filename = meta && meta.content;
+			if (!print_filename) return;
+
+			let original_title = document.title;
+			window.addEventListener('beforeprint', () => {
+				original_title = document.title;
+				document.title = print_filename;
+			});
+			window.addEventListener('afterprint', () => {
+				document.title = original_title;
+			});
+		})();
 	</script>
 </body>
 {%- if comment -%}
 <!-- {{ comment }} -->
 {%- endif -%}
 </html>
+{%- endif -%}

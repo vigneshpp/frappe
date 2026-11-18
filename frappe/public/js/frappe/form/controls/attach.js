@@ -15,7 +15,7 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 		this.$value = $(
 			`<div class="attached-file flex justify-between align-center">
 				<div class="ellipsis">
-				${frappe.utils.icon("es-line-link", "sm")}
+				${frappe.utils.icon("link", "sm")}
 					<a class="attached-file-link" target="_blank"></a>
 				</div>
 				<div class="flex" style="align-items: center">
@@ -33,14 +33,19 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 	}
 	clear_attachment() {
 		let me = this;
-		frappe.confirm(__("Are you sure you want to delete the attachment?"), function () {
+		const message = __("Are you sure you want to delete the attachment?");
+		const dialog = frappe.confirm(message, function () {
 			if (me.frm) {
-				me.parse_validate_and_set_in_model(null);
-				me.refresh();
-				me.frm.attachments.remove_attachment_by_filename(me.value, async () => {
-					await me.parse_validate_and_set_in_model(null);
+				let file_url = me.value || me.get_model_value();
+				me.parse_validate_and_set_in_model(null).then(() => {
 					me.refresh();
-					me.frm.doc.docstatus == 1 ? me.frm.save("Update") : me.frm.save();
+					if (!me.frm.is_new()) {
+						me.save_form(() => {
+							if (!me.frm.is_dirty()) {
+								me.frm.attachments.remove_attachment_by_filename(file_url);
+							}
+						});
+					}
 				});
 			} else {
 				me.dataurl = null;
@@ -50,6 +55,7 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 				me.refresh();
 			}
 		});
+		dialog.keep_grid_form_open = true;
 	}
 	on_attach_click() {
 		this.set_upload_options();
@@ -82,6 +88,8 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 			options.doctype = this.frm.doctype;
 			options.docname = this.frm.docname;
 			options.fieldname = this.df.fieldname;
+			options.field_doctype = this.doctype;
+			options.keep_grid_form_open = true;
 			options.make_attachments_public = this.df.make_attachment_public
 				? 1
 				: this.frm.meta.make_attachments_public;
@@ -105,13 +113,15 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 				filename = file_url_parts[1];
 				dataurl = file_url_parts[2] + ":" + file_url_parts[3];
 			}
+			let href = dataurl || this.value;
+			if (frappe.utils.has_unsafe_url_scheme(href)) href = null;
 			if (this.$input && this.$value) {
 				this.$input.toggle(false);
 				this.$value
 					.toggle(true)
 					.find(".attached-file-link")
 					.text(filename || this.value)
-					.attr("href", dataurl || this.value);
+					.attr("href", href);
 			} else {
 				this.$wrapper.html(`
 					<div class="attached-file flex justify-between align-center">
@@ -123,7 +133,7 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 				this.$wrapper
 					.find("a")
 					.text(filename || this.value)
-					.attr("href", dataurl || this.value);
+					.attr("href", href);
 			}
 		} else {
 			this.$input?.toggle(true);
@@ -139,8 +149,26 @@ frappe.ui.form.ControlAttach = class ControlAttach extends frappe.ui.form.Contro
 		if (this.frm) {
 			await this.parse_validate_and_set_in_model(attachment.file_url);
 			this.frm.attachments.update_attachment(attachment);
-			this.frm.doc.docstatus == 1 ? this.frm.save("Update") : this.frm.save();
+			if (!this.frm.is_new() && this.frm.is_dirty()) {
+				this.save_form();
+			}
 		}
 		this.set_value(attachment.file_url);
+	}
+
+	save_form(callback) {
+		const open_row = this.frm.open_grid_row();
+		const in_open_row = open_row?.doc === this.doc;
+		this.frm.save(this.frm.doc.docstatus == 1 ? "Update" : "Save", (r) => {
+			if (in_open_row && !r.exc) {
+				const { grid, doc } = open_row;
+				// a new row is renamed on save, so fall back to its position
+				const row =
+					grid.get_row(doc.name) ??
+					grid.grid_rows.find((grid_row) => grid_row.doc.idx === doc.idx);
+				row?.toggle_view(true);
+			}
+			callback?.(r);
+		});
 	}
 };

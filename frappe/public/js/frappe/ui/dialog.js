@@ -14,7 +14,20 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 		this.is_dialog = true;
 		this.last_focus = null;
 
-		$.extend(this, { animate: true, size: null, auto_make: true, centered: false }, opts);
+		$.extend(
+			this,
+			{
+				animate: true,
+				size: null,
+				auto_make: true,
+				centered: false,
+				keep_grid_form_open: false,
+				// on a phone, show as a frappe.ui.BottomSheet (static and minimizable dialogs
+				// stay dialogs); set the actions before show()
+				sheet_on_mobile: false,
+			},
+			opts
+		);
 		if (this.auto_make) {
 			this.make();
 		}
@@ -94,8 +107,10 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 				me.display = false;
 				me.is_minimized = false;
 				me.hide_scrollbar(false);
-				// hide any grid row form if open
-				frappe.ui.form.get_open_grid_form?.()?.hide_form();
+				if (!me.keep_grid_form_open) {
+					// hide any grid row form if open
+					frappe.ui.form.get_open_grid_form?.()?.hide_form();
+				}
 
 				if (frappe.ui.open_dialogs[frappe.ui.open_dialogs.length - 1] === me) {
 					frappe.ui.open_dialogs.pop();
@@ -109,16 +124,23 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 				me.onhide && me.onhide();
 				me.on_hide && me.on_hide();
 			})
+			.on("hidden.bs.modal", function () {
+				me.$wrapper.css("z-index", "");
+			})
 			.on("shown.bs.modal", function () {
 				// focus on first input
 				me.display = true;
 				window.cur_dialog = me;
 				frappe.ui.open_dialogs.push(me);
-				me.focus_on_first_input();
+				// dialogs that were still fading in when show() ran are only listed now
+				me.stack_above_open_dialogs();
+				// Bootstrap's focus guard goes before the first focus, so a combobox
+				// panel (mounted in <body>) can take it
+				$(document).off("focusin.modal");
+				if (!me.sheet) me.focus_on_first_input();
 				me.hide_scrollbar(true);
 				me.on_page_show && me.on_page_show();
 				$(document).trigger("frappe.ui.Dialog:shown");
-				$(document).off("focusin.modal");
 			})
 			.on("scroll", function () {
 				var $input = $("input:focus");
@@ -131,12 +153,28 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 			})
 			.on("keydown", function (e) {
 				if (e.key === "Escape" || e.keyCode === 27) {
-					// when dialog is open and contains an awesomplete dropdown - do not close the dialog on escape key press
-					if (me.display && me.$wrapper.find(".awesomplete").length) {
+					// _awesomplete_was_open is set in the capture-phase listener below, before
+					// Awesomplete's own keydown handler closes the dropdown and clears aria-expanded.
+					if (me._awesomplete_was_open) {
+						me._awesomplete_was_open = false;
 						e.stopImmediatePropagation();
 					}
 				}
 			});
+
+		// Runs in capture phase, before Awesomplete's bubble-phase keydown handler on the input,
+		// so aria-expanded is still "true" when the dropdown is open.
+		me.$wrapper[0].addEventListener(
+			"keydown",
+			function (e) {
+				if (e.key === "Escape" || e.keyCode === 27) {
+					me._awesomplete_was_open =
+						me.display &&
+						!!me.$wrapper.find(".awesomplete input[aria-expanded='true']").length;
+				}
+			},
+			true // capture phase
+		);
 	}
 
 	set_modal_size() {
@@ -165,7 +203,20 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 	}
 
 	get_primary_btn() {
-		return this.standard_actions.find(".btn-primary");
+		return this.standard_actions.find(".btn-modal-primary");
+	}
+
+	// the footer buttons are es-buttons — swap only the label text so the
+	// spinner/loading-label structure survives; when there's no label span
+	// (empty initial label, or an external caller .html()'d the structure
+	// away) rebuild it via dress, which leaves the other attributes alone
+	set_btn_label($btn, label) {
+		const $label = $btn.find(".es-button__label");
+		if ($label.length) {
+			$label.text(label);
+		} else {
+			frappe.ui.button.dress($btn, { label });
+		}
 	}
 
 	get_minimize_btn() {
@@ -206,8 +257,15 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 		this.footer.removeClass("hide");
 		this.has_primary_action = true;
 		var me = this;
-		const primary_btn = this.get_primary_btn().removeClass("hide").html(label);
-		const spinner = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" style="width: 13px; height: 13px; animation: spin 1s linear infinite;"><circle opacity=".25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path opacity=".25" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/></svg>`;
+		// rebuild the es-button content so the spinner + loading-label
+		// structure matches this action (replaces the old hand-rolled
+		// spinner html; the busy visuals are pure CSS on aria-busy)
+		const primary_btn = this.get_primary_btn().removeClass("hide");
+		frappe.ui.button.dress(primary_btn, {
+			label,
+			loading_label: this.primary_action_loading_label || undefined,
+			variant: "solid",
+		});
 		if (typeof click == "function") {
 			primary_btn.off("click").on("click", function () {
 				me.primary_action_fulfilled = true;
@@ -218,31 +276,9 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 				if (!values) return;
 				const action = click.apply(me, [values]);
 				if (action && typeof action.then === "function") {
-					const loading_label = me.primary_action_loading_label;
-					primary_btn
-						.css({
-							"min-width": primary_btn.outerWidth(),
-							"min-height": primary_btn.outerHeight(),
-						})
-						.prop("disabled", true)
-						.addClass("btn-primary-dark")
-						.html(
-							`<div class="d-flex align-items-center justify-content-center" style="gap: 0.45rem;">
-									${spinner}
-								${
-									loading_label
-										? `<span class="text-muted" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${loading_label}</span>`
-										: ""
-								}
-							</div>`
-						);
-
+					primary_btn.attr("aria-busy", "true");
 					Promise.resolve(action).finally(() => {
-						primary_btn
-							.css({ "min-width": "", "min-height": "" })
-							.prop("disabled", false)
-							.removeClass("btn-primary-dark")
-							.html(label);
+						primary_btn.removeAttr("aria-busy");
 					});
 				}
 			});
@@ -256,15 +292,16 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 	}
 
 	set_secondary_action_label(label) {
-		this.get_secondary_btn().removeClass("hide").html(label);
+		this.set_btn_label(this.get_secondary_btn().removeClass("hide"), label);
 	}
 
 	disable_primary_action() {
-		this.get_primary_btn().addClass("disabled");
+		// class kept in sync for callers that read .hasClass("disabled")
+		this.get_primary_btn().prop("disabled", true).addClass("disabled");
 	}
 
 	enable_primary_action() {
-		this.get_primary_btn().removeClass("disabled");
+		this.get_primary_btn().prop("disabled", false).removeClass("disabled");
 	}
 
 	make_head() {
@@ -273,6 +310,7 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 
 	set_title(t) {
 		this.$wrapper.find(".modal-title").html(t);
+		this.sheet?.set_title(this.$wrapper.find(".modal-title").text());
 	}
 
 	set_indicator() {
@@ -285,6 +323,10 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 	}
 
 	show() {
+		this.restore_from_sheet?.();
+		if (this.sheet_on_mobile && !this.static && !this.minimizable && frappe.is_mobile())
+			return this.show_as_sheet();
+
 		// show it
 		if (window.location.pathname.startsWith("/desk")) {
 			this.handle_focus();
@@ -295,7 +337,9 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 		} else {
 			this.$wrapper.removeClass("fade");
 		}
+		const opening = !this.display;
 		this.$wrapper.modal("show");
+		if (opening) this.stack_above_open_dialogs();
 
 		this.$wrapper.removeClass("modal-minimize");
 
@@ -312,9 +356,65 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 		return this;
 	}
 
+	show_as_sheet() {
+		this.clear_message();
+		this.primary_action_fulfilled = false;
+		this.is_visible = true;
+		frappe.require(["bottom_sheet.bundle.js", "bottom_sheet.bundle.css"]).then(() => {
+			if (this.is_visible && !this.sheet) this.open_sheet();
+		});
+		return this;
+	}
+
+	open_sheet() {
+		const actions = this.footer.children();
+		const buttons = actions.find(".es-button").attr("data-size", "md");
+		this.sheet = new frappe.ui.BottomSheet({
+			title: this.$wrapper.find(".modal-title").text(),
+			content: this.modal_body.get(0),
+			footer: this.footer.hasClass("hide") ? null : actions.get(),
+			on_close: () => {
+				this.sheet = null;
+				this.is_visible = false;
+				// moved back on the next show: now, the sheet would slide out empty
+				this.restore_from_sheet = () => {
+					this.restore_from_sheet = null;
+					buttons.removeAttr("data-size");
+					this.header.after(this.modal_body);
+					this.footer.append(actions);
+				};
+				this.$wrapper.trigger("hide.bs.modal").trigger("hidden.bs.modal");
+			},
+		});
+		this.$wrapper.trigger("show.bs.modal");
+		this.sheet.open();
+		this.$wrapper.trigger("shown.bs.modal");
+	}
+
 	hide() {
+		if (this.sheet) {
+			this.sheet.close();
+			return;
+		}
 		this.$wrapper.modal("hide");
 		this.is_visible = false;
+	}
+
+	stack_above_open_dialogs() {
+		// messages and progress sit at 2000; stacking over them would put a dialog
+		// above the freeze, toasts and menus
+		const below = frappe.ui.open_dialogs.filter(
+			(d) =>
+				d !== this &&
+				d.display &&
+				!d.is_minimized &&
+				cint(d.$wrapper.css("z-index")) < 2000
+		);
+		if (!below.length) return;
+
+		const top = Math.max(...below.map((d) => cint(d.$wrapper.css("z-index"))));
+		this.$wrapper.css("z-index", Math.max(top + 2, cint(this.$wrapper.css("z-index"))));
+		$(this.$wrapper.data("bs.modal")._backdrop).css("z-index", top + 1);
 	}
 
 	handle_focus() {
@@ -366,14 +466,12 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 
 	add_custom_action(label, action, css_class = null) {
 		this.footer.removeClass("hide");
-		let action_button = $(`
-			<button class="btn btn-secondary btn-sm ${css_class || ""}">
-				${label}
-			</button>
-		`);
+		let action_button = frappe.ui.button({
+			label,
+			css_class: css_class || "",
+			onclick: action,
+		});
 		this.custom_actions.append(action_button);
-
-		action && action_button.click(action);
 	}
 
 	add_custom_button() {}

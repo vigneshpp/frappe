@@ -6,6 +6,7 @@ import json
 import frappe
 from frappe import _
 from frappe.custom.doctype.property_setter.property_setter import delete_property_setter
+from frappe.database import savepoint
 from frappe.model import core_doctypes_list
 from frappe.model.docfield import supports_translation
 from frappe.model.document import Document
@@ -14,6 +15,8 @@ from frappe.utils import cstr, random_string
 
 
 class CustomField(Document):
+	_DOCTYPE_NAME = "Custom Field"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -23,6 +26,7 @@ class CustomField(Document):
 		from frappe.types import DF
 
 		alignment: DF.Literal["", "Left", "Center", "Right"]
+		allow_bulk_edit: DF.Check
 		allow_in_quick_entry: DF.Check
 		allow_on_submit: DF.Check
 		bold: DF.Check
@@ -41,6 +45,7 @@ class CustomField(Document):
 			"Autocomplete",
 			"Attach",
 			"Attach Image",
+			"Attachment Gallery",
 			"Barcode",
 			"Button",
 			"Check",
@@ -81,24 +86,32 @@ class CustomField(Document):
 			"Text",
 			"Text Editor",
 			"Time",
+			"Vue Component",
 		]
 		hidden: DF.Check
 		hide_border: DF.Check
 		hide_days: DF.Check
 		hide_seconds: DF.Check
 		ignore_user_permissions: DF.Check
+		ignore_versioning: DF.Check
 		ignore_xss_filter: DF.Check
 		in_global_search: DF.Check
+		in_import_template: DF.Check
 		in_list_view: DF.Check
 		in_preview: DF.Check
 		in_standard_filter: DF.Check
 		insert_after: DF.Literal[None]
+		is_app_disabled: DF.Check
 		is_system_generated: DF.Check
 		is_virtual: DF.Check
 		label: DF.Data | None
 		length: DF.Int
 		link_filters: DF.JSON | None
+		make_attachment_public: DF.Check
 		mandatory_depends_on: DF.Code | None
+		mask: DF.Check
+		max_value: DF.Float
+		min_value: DF.Float
 		module: DF.Link | None
 		no_copy: DF.Check
 		non_negative: DF.Check
@@ -111,6 +124,7 @@ class CustomField(Document):
 		print_width: DF.Data | None
 		read_only: DF.Check
 		read_only_depends_on: DF.Code | None
+		remember_last_selected_value: DF.Check
 		report_hide: DF.Check
 		reqd: DF.Check
 		search_index: DF.Check
@@ -193,7 +207,9 @@ class CustomField(Document):
 			and not CustomizeForm.allow_fieldtype_change(old_fieldtype, self.fieldtype)
 		):
 			frappe.throw(
-				_("Fieldtype cannot be changed from {0} to {1}").format(old_fieldtype, self.fieldtype)
+				_("Fieldtype of {0} in {1} cannot be changed from {2} to {3}").format(
+					frappe.bold(self.fieldname), self.dt, old_fieldtype, self.fieldtype
+				)
 			)
 
 		if not self.fieldname:
@@ -251,7 +267,9 @@ class CustomField(Document):
 			)
 
 		if self.fieldname == self.insert_after:
-			frappe.throw(_("Insert After cannot be set as {0}").format(meta.get_label(self.insert_after)))
+			frappe.throw(
+				_("Insert After cannot be set as {0}").format(meta.get_translated_label(self.insert_after))
+			)
 
 	def get_permission_log_options(self, event=None):
 		if event != "after_delete" and self.fieldtype not in (
@@ -351,14 +369,11 @@ def create_custom_fields(custom_fields: dict, ignore_validate=False, update=True
 				for df in fields:
 					field = existing_custom_fields.get((doctype, df["fieldname"]))
 					if not field:
-						try:
+						with savepoint(catch=frappe.exceptions.DuplicateEntryError):
 							df = df.copy()
 							df["owner"] = "Administrator"
 							custom_field = create_custom_field(doctype, df, ignore_validate=ignore_validate)
 							process_field_update(custom_field)
-
-						except frappe.exceptions.DuplicateEntryError:
-							pass
 
 					elif update:
 						custom_field = frappe.get_doc({"doctype": "Custom Field", **field})
@@ -396,7 +411,7 @@ def get_existing_custom_fields(custom_fields):
 	return {(field.dt, field.fieldname): field for field in existing_fields}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def rename_fieldname(custom_field: str, fieldname: str):
 	frappe.only_for("System Manager")
 

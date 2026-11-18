@@ -2,15 +2,17 @@
 # License: MIT. See LICENSE
 
 import email
+import imaplib
 import os
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe import _
 from frappe.core.doctype.communication.email import make
 from frappe.desk.form.load import get_attachments
-from frappe.email.doctype.email_account.email_account import notify_unreplied
+from frappe.email.doctype.email_account.email_account import EmailAccount, notify_unreplied
 from frappe.email.email_body import get_message_id
 from frappe.email.receive import Email, InboundMail, SentEmailInInboxError
 from frappe.tests import IntegrationTestCase
@@ -185,10 +187,26 @@ class TestEmailAccount(IntegrationTestCase):
 			subject="test-mail-001",
 			now=True,
 		)
-		frappe.db.commit()  # now=True requires commit
+		with patch.object(frappe.db, "commit"):
+			frappe.db.after_commit.run()
 
 		sent_mail = email.message_from_string(frappe.safe_decode(frappe.flags.sent_mail))
 		self.assertTrue("test-mail-001" in sent_mail.get("Subject"))
+
+	@patch.object(EmailAccount, "get_access_token")
+	def test_no_smtp_authentication_skips_smtp_login(self, get_access_token):
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		email_account.password = "smtp-password"
+		email_account.no_smtp_authentication = 1
+
+		for auth_method in ("Basic", "OAuth"):
+			email_account.auth_method = auth_method
+			config = email_account.sendmail_config()
+			self.assertIsNone(config["password"])
+			self.assertFalse(config["use_oauth"])
+			self.assertIsNone(config["access_token"])
+
+		get_access_token.assert_not_called()
 
 	def test_print_format(self):
 		comm_name = make(
@@ -350,7 +368,8 @@ class TestEmailAccount(IntegrationTestCase):
 		message_id = Email(mail_content).mail.get("Message-ID")
 
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
-		email_account.handle_bad_emails(uid=-1, raw=mail_content, reason="Testing")
+		with patch.object(frappe.db, "commit"):
+			email_account.handle_bad_emails(uid=-1, raw=mail_content, reason="Testing")
 		self.assertTrue(frappe.db.get_value("Unhandled Email", {"message_id": message_id}))
 
 	def test_handle_bad_encoding(self):
@@ -359,7 +378,8 @@ class TestEmailAccount(IntegrationTestCase):
 		mail_content = b"\x80"  # invalid byte
 
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
-		email_account.handle_bad_emails(uid=uid, raw=mail_content, reason="Testing")
+		with patch.object(frappe.db, "commit"):
+			email_account.handle_bad_emails(uid=uid, raw=mail_content, reason="Testing")
 		self.assertTrue(frappe.db.get_value("Unhandled Email", {"uid": uid}))
 
 	def test_imap_folder(self):
@@ -377,6 +397,80 @@ class TestEmailAccount(IntegrationTestCase):
 
 		with self.assertRaises(Exception):
 			email_account.validate()
+
+	def test_moving_the_default_skips_the_old_default_accounts_checks(self):
+		frappe.db.savepoint("move_default")
+		self.addCleanup(frappe.db.rollback, save_point="move_default")
+		frappe.db.set_value("Email Account", "_Test Email Account 1", "default_outgoing", 1)
+		account = frappe.get_doc(
+			{
+				"doctype": "Email Account",
+				"email_account_name": "_Test Move Default",
+				"email_id": "move-default@example.com",
+				"enable_outgoing": 1,
+				"smtp_server": "smtp.example.com",
+			}
+		).insert()
+
+		def validate(doc):
+			if doc.name == "_Test Email Account 1":
+				frappe.throw(_("This mailbox needs reconnecting"))
+
+		with (
+			self.set_user("test@example.com"),
+			patch.object(EmailAccount, "validate", autospec=True, side_effect=validate),
+		):
+			account.default_outgoing = 1
+			account.save()
+
+		self.assertEqual(frappe.db.get_value("Email Account", "_Test Email Account 1", "default_outgoing"), 0)
+
+	def test_validation_surfaces_imap_auth_error(self):
+		# auth failure on save must raise, not swallow and leak a NONAUTH LIST error
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		email_account.flags.validate_imap_pop_connection = True
+
+		server = MagicMock()
+		server.connect.side_effect = imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+
+		with self.assertRaises(frappe.ValidationError):
+			email_account.check_email_server_connection(server, in_receive=True)
+
+	def test_validation_surfaces_imap_connection_error(self):
+		# a connection/timeout failure on save must raise too, not swallow into a NONAUTH leak
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		email_account.flags.validate_imap_pop_connection = True
+
+		server = MagicMock()
+		server.connect.side_effect = OSError("timed out")
+
+		with self.assertRaises(OSError):
+			email_account.check_email_server_connection(server, in_receive=True)
+
+	def test_background_receive_auth_error_disables_account(self):
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		email_account.flags.validate_imap_pop_connection = False
+
+		server = MagicMock()
+		server.connect.side_effect = imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+
+		with (
+			self.set_user("test@example.com"),
+			patch.object(email_account, "handle_incoming_connect_error") as mocked_handler,
+			self.assertRaises(imaplib.IMAP4.error),
+		):
+			email_account.check_email_server_connection(server, in_receive=True)
+
+		mocked_handler.assert_called_once()
+
+	def test_background_receive_raises_connection_error(self):
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+
+		server = MagicMock()
+		server.connect.side_effect = OSError("timed out")
+
+		with self.set_user("test@example.com"), self.assertRaises(OSError):
+			email_account.check_email_server_connection(server, in_receive=True)
 
 	def test_append_to(self):
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
@@ -433,10 +527,139 @@ class TestEmailAccount(IntegrationTestCase):
 		self.assertEqual(inbox_mails, 2)
 		self.assertEqual(test_folder_mails, 1)
 
+	def test_email_sync_rule_ignores_reindexed_uids(self):
+		email_account = frappe.get_doc(
+			doctype="Email Account",
+			email_account_name="Test IMAP Sync Account",
+			email_id="test_imap_sync@example.com",
+			use_imap=1,
+			email_sync_option="ALL",
+			initial_sync_count=100,
+			imap_folder=[{"folder_name": "INBOX", "append_to": "Communication"}],
+		).insert(ignore_permissions=True)
+		self.addCleanup(email_account.delete)
+
+		communication = frappe.get_doc(
+			doctype="Communication",
+			communication_type="Communication",
+			communication_medium="Email",
+			sent_or_received="Received",
+			email_account=email_account.name,
+			subject="Quotation request",
+			sender="sender@example.com",
+			uid=-1,
+		).insert(ignore_permissions=True)
+		self.addCleanup(communication.delete)
+
+		self.assertEqual(email_account.build_email_sync_rule(), "UID 1:101")
+
+	def make_imap_account(self, sync_from_uids):
+		email_account = frappe.get_doc(
+			doctype="Email Account",
+			email_account_name="Test IMAP Folders Account",
+			email_id="test_imap_folders@example.com",
+			email_server="imap.example.com",
+			enable_incoming=1,
+			use_imap=1,
+			email_sync_option="ALL",
+			create_contact=0,
+			imap_folder=[
+				{"folder_name": folder_name, "uidvalidity": "1", "sync_from_uid": sync_from_uid}
+				for folder_name, sync_from_uid in sync_from_uids.items()
+			],
+		).insert(ignore_permissions=True)
+
+		def delete_account():
+			for name in frappe.get_all("Communication", {"email_account": email_account.name}, pluck="name"):
+				frappe.delete_doc("Communication", name, force=True)
+			frappe.delete_doc("Email Account", email_account.name, force=True)
+
+		self.addCleanup(delete_account)
+		return email_account.name
+
+	def get_sync_from_uids(self, email_account):
+		return dict(
+			frappe.get_all(
+				"IMAP Folder", {"parent": email_account}, ["folder_name", "sync_from_uid"], as_list=True
+			)
+		)
+
+	def test_each_folder_syncs_from_its_own_position(self):
+		email_account = self.make_imap_account({"RFQ": 0, "INBOX": 0, "Sales": 0})
+		frappe.get_doc(
+			doctype="Communication",
+			communication_medium="Email",
+			sent_or_received="Received",
+			email_account=email_account,
+			subject="Quotation request rfq-6806",
+			sender="sender@example.com",
+			message_id="rfq-6806@example.com",
+			uid=6806,
+		).insert(ignore_permissions=True)
+		mailbox = IMAPMailbox({"RFQ": {6806: "rfq-6806"}, "INBOX": {6035: "inbox-6035"}, "Sales": {}})
+		receive_from_mailbox(mailbox, email_account)
+
+		mailbox.folders["RFQ"][6807] = "rfq-6807"
+		mailbox.folders["INBOX"][6036] = "quotation-42"
+		mailbox.folders["Sales"][1] = "quotation-42"
+		receive_from_mailbox(mailbox, email_account)
+
+		self.assertTrue(frappe.db.exists("Communication", {"message_id": "rfq-6807@example.com"}))
+		self.assertEqual(frappe.db.count("Communication", {"message_id": "quotation-42@example.com"}), 1)
+		self.assertEqual(self.get_sync_from_uids(email_account), {"RFQ": 6808, "INBOX": 6037, "Sales": 2})
+
+	def test_uidvalidity_change_keeps_other_folder_position(self):
+		email_account = self.make_imap_account({"RFQ": 6807, "INBOX": 6036})
+		mailbox = IMAPMailbox(
+			{"RFQ": {6806: "rfq-6806"}, "INBOX": {1: "inbox-1", 2: "inbox-2"}}, uidvalidity={"INBOX": 9}
+		)
+		receive_from_mailbox(mailbox, email_account)
+
+		self.assertEqual(self.get_sync_from_uids(email_account), {"RFQ": 6807, "INBOX": 3})
+
+	def test_failed_mail_keeps_folder_position_behind_it(self):
+		email_account = self.make_imap_account({"RFQ": 7})
+		mailbox = IMAPMailbox({"RFQ": {7: "rfq-7", 8: "rfq-8"}})
+		process = InboundMail.process
+
+		def process_or_fail(mail):
+			if mail.uid == "8":
+				raise ValueError("attachment could not be saved")
+			return process(mail)
+
+		with patch.object(InboundMail, "process", process_or_fail), self.assertRaises(Exception):
+			receive_from_mailbox(mailbox, email_account)
+
+		self.assertTrue(frappe.db.exists("Communication", {"message_id": "rfq-7@example.com"}))
+		self.assertEqual(self.get_sync_from_uids(email_account), {"RFQ": 8})
+
+	def test_unparseable_mail_keeps_the_rest_of_the_batch(self):
+		email_account = self.make_imap_account({"RFQ": 7})
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		mailbox = IMAPMailbox({"RFQ": {7: "rfq-7", 8: "rfq-8"}})
+		init = InboundMail.__init__
+
+		def init_or_fail(mail, content, email_account, uid=None, *args):
+			if uid == "7":
+				raise ValueError("header could not be decoded")
+			init(mail, content, email_account, uid, *args)
+
+		with patch.object(InboundMail, "__init__", init_or_fail):
+			receive_from_mailbox(mailbox, email_account)
+
+		self.assertTrue(frappe.db.exists("Communication", {"message_id": "rfq-8@example.com"}))
+		self.assertTrue(frappe.db.exists("Unhandled Email", {"email_account": email_account, "uid": "7"}))
+
+	@patch("frappe.email.receive.EmailServer.connect", return_value=True)
 	@patch("frappe.email.receive.EmailServer.select_imap_folder", return_value=True)
 	@patch("frappe.email.receive.EmailServer.logout", side_effect=lambda: None)
 	def mocked_get_inbound_mails(
-		email_account, messages=None, mocked_logout=None, mocked_select_imap_folder=None
+		email_account,
+		messages=None,
+		mocked_logout=None,
+		mocked_select_imap_folder=None,
+		mocked_connect=None,
 	):
 		from frappe.email.receive import EmailServer
 
@@ -451,10 +674,15 @@ class TestEmailAccount(IntegrationTestCase):
 
 		return mails
 
+	@patch("frappe.email.receive.EmailServer.connect", return_value=True)
 	@patch("frappe.email.receive.EmailServer.select_imap_folder", return_value=True)
 	@patch("frappe.email.receive.EmailServer.logout", side_effect=lambda: None)
 	def mocked_email_receive(
-		email_account, messages=None, mocked_logout=None, mocked_select_imap_folder=None
+		email_account,
+		messages=None,
+		mocked_logout=None,
+		mocked_select_imap_folder=None,
+		mocked_connect=None,
 	):
 		if messages is None:
 			messages = {}
@@ -464,7 +692,11 @@ class TestEmailAccount(IntegrationTestCase):
 
 		from frappe.email.receive import EmailServer
 
-		with patch.object(EmailServer, "get_messages", side_effect=get_mocked_messages):
+		with (
+			patch.object(EmailServer, "get_messages", side_effect=get_mocked_messages),
+			patch.object(frappe.db, "commit"),
+			patch.object(frappe.db, "rollback"),
+		):
 			email_account.receive()
 
 
@@ -616,14 +848,14 @@ class TestInboundMail(IntegrationTestCase):
 
 	def test_reference_document_by_record_name_in_subject(self):
 		# Create email queue record
-		todo = self.new_todo()
+		todo = self.new_todo(sender="test_sender@example.com")
 
 		mail_content = self.get_test_mail(fname="incoming-subject-placeholder.raw").replace(
 			"{{ subject }}", f"RE: (#{todo.name})"
 		)
 
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
-		inbound_mail = InboundMail(mail_content, email_account, 12345, 1)
+		inbound_mail = InboundMail(mail_content, email_account, 12345, 1, "ToDo")
 		reference_doc = inbound_mail.reference_document()
 		self.assertEqual(todo.name, reference_doc.name)
 
@@ -635,9 +867,35 @@ class TestInboundMail(IntegrationTestCase):
 			"{{ subject }}", f"RE: {subject}"
 		)
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
-		inbound_mail = InboundMail(mail_content, email_account, 12345, 1)
+		inbound_mail = InboundMail(mail_content, email_account, 12345, 1, "ToDo")
 		reference_doc = inbound_mail.reference_document()
 		self.assertEqual(todo.name, reference_doc.name)
+
+	def test_subject_match_when_append_to_doctype_has_no_subject_field(self):
+		"""Inbound mail must not raise when the `Append To` doctype has no subject_field configured."""
+		mail_content = self.get_test_mail(fname="incoming-subject-placeholder.raw").replace(
+			"{{ subject }}", "RE: An unmatched subject line"
+		)
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		inbound_mail = InboundMail(mail_content, email_account, 12345, 1)
+
+		no_subject_fields = frappe._dict(subject_field=None, sender_field=None)
+		with patch.object(InboundMail, "get_email_fields", return_value=no_subject_fields):
+			# Should return None instead of raising an exception
+			self.assertIsNone(inbound_mail.match_record_by_subject_and_sender("ToDo"))
+
+	def test_subject_match_when_append_to_doctype_has_no_sender_field(self):
+		"""Subject matching must skip the sender filter (not crash) when sender_field is absent."""
+		mail_content = self.get_test_mail(fname="incoming-subject-placeholder.raw").replace(
+			"{{ subject }}", "RE: An unmatched subject line"
+		)
+		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
+		inbound_mail = InboundMail(mail_content, email_account, 12345, 1)
+
+		# subject_field set, sender_field absent: must build the subject filter and skip the sender one.
+		no_sender_field = frappe._dict(subject_field="description", sender_field=None)
+		with patch.object(InboundMail, "get_email_fields", return_value=no_sender_field):
+			self.assertIsNone(inbound_mail.match_record_by_subject_and_sender("ToDo"))
 
 	def test_reference_document_by_subject_match_with_accents(self):
 		subject = "Nouvelle tâche à faire 😃"
@@ -649,7 +907,7 @@ class TestInboundMail(IntegrationTestCase):
 			.encode("utf-8")
 		)  # note: encode to bytes because that's what triggered the error
 		email_account = frappe.get_doc("Email Account", "_Test Email Account 1")
-		inbound_mail = InboundMail(mail_content, email_account, 12345, 1)
+		inbound_mail = InboundMail(mail_content, email_account, 12345, 1, "ToDo")
 		reference_doc = inbound_mail.reference_document()
 		self.assertEqual(todo.name, reference_doc.name)
 
@@ -733,3 +991,58 @@ def cleanup(sender=None):
 	for name in names:
 		frappe.delete_doc_if_exists("Communication", name.name)
 		frappe.delete_doc_if_exists("Communication Link", {"parent": name.name})
+
+
+class IMAPMailbox:
+	"""IMAP server with per-folder UIDs; like Zoho, a UID range starting past the last UID matches nothing."""
+
+	def __init__(self, folders, uidvalidity=None):
+		self.folders = folders
+		self.uidvalidity = uidvalidity or {}
+		self.selected_folder = None
+
+	def __call__(self, *args, **kwargs):
+		return self
+
+	def login(self, *args):
+		return "OK", [b""]
+
+	def logout(self):
+		return "BYE", [b""]
+
+	def select(self, folder, readonly=False):
+		self.selected_folder = self.folders[folder.strip('"')]
+		return "OK", [b""]
+
+	def status(self, folder, names):
+		folder_name = folder.strip('"')
+		uidvalidity = self.uidvalidity.get(folder_name, 1)
+		uidnext = max(self.folders[folder_name], default=0) + 1
+		return "OK", [f"{folder} (UIDVALIDITY {uidvalidity} UIDNEXT {uidnext})".encode()]
+
+	def uid(self, command, *args):
+		mails = self.selected_folder
+		if command == "search":
+			start, end = args[1].removeprefix("UID ").split(":")
+			end = max(mails, default=0) if end == "*" else int(end)
+			return "OK", [" ".join(str(uid) for uid in sorted(mails) if int(start) <= uid <= end).encode()]
+
+		uid = int(args[0])
+		raw_mail = (
+			"From: sender@example.com\r\n"
+			"To: test_imap_folders@example.com\r\n"
+			f"Subject: Quotation request {mails[uid]}\r\n"
+			f"Message-ID: <{mails[uid]}@example.com>\r\n"
+			"Content-Type: text/plain\r\n\r\n"
+			"Please share the price list.\r\n"
+		).encode()
+		return "OK", [(f"{uid} (UID {uid} BODY[] {{0}}".encode(), raw_mail), b")"]
+
+
+def receive_from_mailbox(mailbox, email_account):
+	with (
+		patch("frappe.email.receive.imaplib.IMAP4", mailbox),
+		patch.object(frappe.db, "commit"),
+		patch.object(frappe.db, "rollback"),
+	):
+		frappe.get_doc("Email Account", email_account).receive()

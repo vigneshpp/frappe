@@ -49,6 +49,15 @@ class TestNaming(IntegrationTestCase):
 		self.assertEqual(append_number_if_name_exists(DOCTYPE, note.name), f"{note.name}-1")
 		self.assertEqual(append_number_if_name_exists(DOCTYPE, TITLE, "title", "_"), f"{TITLE}_1")
 
+	@run_only_if(db_type_is.SQLITE)
+	def test_getseries_uses_an_atomic_sqlite_increment(self):
+		key = f"atomic-series-{frappe.generate_hash()}"
+		self.addCleanup(frappe.db.delete, "Series", {"name": key})
+
+		self.assertEqual(getseries(key, 5), "00001")
+		self.assertEqual(getseries(key, 5), "00002")
+		self.assertEqual(frappe.db.get_value("Series", key, "current"), 2)
+
 	def test_field_autoname_name_sync(self):
 		country = frappe.get_last_doc("Country")
 		original_name = country.name
@@ -58,6 +67,21 @@ class TestNaming(IntegrationTestCase):
 
 		self.assertEqual(country.name, original_name)
 		self.assertEqual(country.name, country.country_name)
+
+	def test_field_autoname_keeps_fieldtype(self):
+		doctype = new_doctype(
+			autoname="field:number",
+			fields=[{"label": "Number", "fieldname": "number", "fieldtype": "Int", "set_only_once": 1}],
+		).insert()
+
+		doc = frappe.get_doc(doctype=doctype.name, number=3).insert()
+		self.assertEqual(doc.number, 3)
+
+		doc = frappe.get_doc(doctype.name, doc.name)
+		doc.some_fieldname = "changed"
+		doc.save()
+
+		doctype.delete()
 
 	def test_child_table_naming(self):
 		child_dt_with_naming = new_doctype(istable=1, autoname="field:some_fieldname").insert()
@@ -125,17 +149,10 @@ class TestNaming(IntegrationTestCase):
 		"""
 		Test if braced params are replaced for consecutive week number in format autoname
 		"""
-		doctype = "ToDo"
+		doctype = new_doctype(autoname="format:TODO-{WW}-{##}").insert()
 
-		todo_doctype = frappe.get_doc("DocType", doctype)
-		todo_doctype.autoname = "format:TODO-{WW}-{##}"
-		todo_doctype.save()
-
-		description = "Format"
-
-		todo = frappe.new_doc(doctype)
-		todo.description = description
-		todo.insert()
+		doc = frappe.new_doc(doctype.name)
+		doc.insert()
 
 		series = getseries("", 2)
 
@@ -146,7 +163,7 @@ class TestNaming(IntegrationTestCase):
 
 		week = determine_consecutive_week_number(now_datetime())
 
-		self.assertEqual(todo.name, f"TODO-{week}-{series}")
+		self.assertEqual(doc.name, f"TODO-{week}-{series}")
 
 	def test_expression_autoname_multiple_fields_pattern_without_dot_before_dash(self):
 		"""
@@ -273,6 +290,22 @@ class TestNaming(IntegrationTestCase):
 
 		self.assertEqual(current_index.get("current"), 2)
 
+		frappe.db.delete("Series", {"name": series})
+
+	def test_revert_series_date_based_cross_date(self):
+		# A date-templated series must revert against the date embedded in the name,
+		# not the current date. Deleting a doc created on a different day should still
+		# decrement that day's counter.
+		key = "PO-.YYYY.-.MM.-.DD.-.###"
+		series = "PO-2020-01-01-"
+		name = "PO-2020-01-01-005"
+		frappe.db.delete("Series", {"name": series})
+		frappe.db.sql("""INSERT INTO `tabSeries` (name, current) values (%s, 5)""", (series,))
+		revert_series_if_last(key, name)
+		current_index = frappe.db.sql(
+			"""SELECT current from `tabSeries` where name = %s""", series, as_dict=True
+		)[0]
+		self.assertEqual(current_index.get("current"), 4)
 		frappe.db.delete("Series", {"name": series})
 
 	def test_naming_for_cancelled_and_amended_doc(self):
@@ -405,6 +438,15 @@ class TestNaming(IntegrationTestCase):
 		self.assertTrue(
 			name.startswith("KOOH-on_update"), f"incorrect name generated {name}, missing field value"
 		)
+
+	def test_naming_series_counter_using_fields(self):
+		webhook = frappe.new_doc("Webhook")
+		webhook.webhook_docevent = "on_update"
+		series = NamingSeries("KOOH-.{webhook_docevent}.-.####")
+
+		self.assertEqual(series.get_prefix(webhook), "KOOH-on_update-")
+		series.update_counter(7, webhook)
+		self.assertEqual(series.get_current_value(webhook), 7)
 
 	def test_naming_with_empty_part(self):
 		# check naming with empty part (duplicate dots)

@@ -233,9 +233,9 @@ frappe.ui.form.on("Number Card", {
 			if (filters.length) {
 				filters.forEach((filter) => {
 					const filter_row = $(`<tr>
-							<td>${filter[1]}</td>
-							<td>${filter[2] || ""}</td>
-							<td>${filter[3]}</td>
+							<td>${frappe.utils.escape_html(filter[1])}</td>
+							<td>${frappe.utils.escape_html(filter[2] || "")}</td>
+							<td>${frappe.utils.escape_html(filter[3])}</td>
 						</tr>`);
 
 					table.find("tbody").append(filter_row);
@@ -248,9 +248,9 @@ frappe.ui.form.on("Number Card", {
 				if (filters[f.fieldname]) {
 					let condition = "=";
 					const filter_row = $(`<tr>
-							<td>${f.label}</td>
+							<td>${frappe.utils.escape_html(f.label)}</td>
 							<td>${condition}</td>
-							<td>${filters[f.fieldname] || ""}</td>
+							<td>${frappe.utils.escape_html(filters[f.fieldname] || "")}</td>
 						</tr>`);
 					table.find("tbody").append(filter_row);
 					if (!filters_set) filters_set = true;
@@ -275,18 +275,20 @@ frappe.ui.form.on("Number Card", {
 			let dialog = new frappe.ui.Dialog({
 				title: __("Set Filters"),
 				fields,
-				primary_action: function () {
-					let values = this.get_values();
-					if (values) {
-						this.hide();
-						if (is_document_type) {
-							let filters = frm.filter_group.get_filters();
-							frm.set_value("filters_json", JSON.stringify(filters));
-						} else {
-							frm.set_value("filters_json", JSON.stringify(values));
-						}
-						frm.trigger("render_filters_table");
+				primary_action: function (values) {
+					this.hide();
+					if (is_document_type) {
+						let filters = frm.filter_group.get_filters();
+						frm.set_value("filters_json", JSON.stringify(filters));
+					} else {
+						frappe.report_utils.add_cleared_filter_values(
+							frappe.query_reports[frm.doc.report_name],
+							this,
+							values
+						);
+						frm.set_value("filters_json", JSON.stringify(values));
 					}
+					frm.trigger("render_filters_table");
 				},
 				primary_action_label: __("Update"),
 			});
@@ -559,8 +561,8 @@ frappe.ui.form.on("Number Card", {
 			let filter_rows = "";
 			dynamic_filters.forEach((filter) => {
 				filter_rows += `<tr>
-						<td>${filter[1]}</td>
-						<td><code>${filter[3] || ""}</code></td>
+						<td>${frappe.utils.escape_html(filter[1])}</td>
+						<td><code>${frappe.utils.escape_html(filter[3] || "")}</code></td>
 					</tr>`;
 			});
 

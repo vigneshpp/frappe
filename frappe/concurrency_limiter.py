@@ -17,65 +17,111 @@ Usage::
 
 """
 
+import os
+import sys
 from collections.abc import Callable
-from functools import wraps
+from functools import cache, wraps
+from typing import NamedTuple
 
 import frappe
 from frappe.exceptions import ServiceUnavailableError
 from frappe.utils import cint
-from frappe.utils.caching import redis_cache
 from frappe.utils.redis_semaphore import RedisSemaphore
 
 # Default wait timeout (seconds) before returning 503 to the caller.
 _DEFAULT_WAIT_TIMEOUT = 10
 
 
-@redis_cache(shared=True)
-def _default_limit() -> int:
-	"""Derive a sensible default concurrency limit from gunicorn's max concurrency."""
-	return max(1, gunicorn_max_concurrency() // 2)
+class WebTierSettings(NamedTuple):
+	"""Gunicorn's resolved settings for the web tier this process serves.
+
+	``timeout`` is how long a worker may stay silent before the master kills it, not a
+	request time limit: ``0`` disables it, and a threaded worker keeps notifying the
+	master while its requests run.
+	"""
+
+	workers: int
+	threads: int
+	timeout: int
+	graceful_timeout: int
 
 
-def gunicorn_max_concurrency() -> int:
-	"""Detect max concurrent requests from the running gunicorn master's cmdline."""
-	import os
+@cache
+def web_tier_settings() -> WebTierSettings | None:
+	"""Gunicorn settings of the web tier this process serves.
 
-	fallback = 4
+	Returns ``None`` when there is no fixed pool to exhaust: the development
+	server starts a thread per request, and CLI commands and background jobs
+	are not a web tier at all. Also ``None`` when gunicorn's settings cannot be
+	resolved, so that nothing is derived from guessed settings.
+
+	Gunicorn sets ``SERVER_SOFTWARE``, and its workers are forked from the master,
+	so ``sys.argv`` and ``os.environ`` in a worker are the master's. Reading the
+	parent's ``/proc/<pid>/cmdline`` instead reports nothing on macOS, where every
+	process then looks like a small gunicorn.
+	"""
+	if not os.environ.get("SERVER_SOFTWARE", "").startswith("gunicorn"):
+		return None
 
 	try:
-		ppid = os.getppid()
-		with open(f"/proc/{ppid}/cmdline", "rb") as f:
-			args = f.read().rstrip(b"\0").decode().split("\0")
-
-		if not any("gunicorn" in a for a in args):
-			return fallback
-
-		workers = _extract_cli_int(args, "-w", "--workers") or fallback
-		threads = _extract_cli_int(args, "--threads") or 1
-		return workers * threads
-	except OSError:
-		return fallback
+		cfg = _gunicorn_config()
+	except SystemExit:
+		return None
+	return WebTierSettings(cfg.workers, cfg.threads, cfg.timeout, cfg.graceful_timeout)
 
 
-def _extract_cli_int(args: list[str], *flags: str) -> int | None:
-	"""Return the integer value for a CLI flag from a split argument list.
+def web_tier_concurrency() -> int | None:
+	"""Number of requests this process' web tier serves at once, or ``None`` as in `web_tier_settings`."""
+	settings = web_tier_settings()
+	return settings.workers * settings.threads if settings else None
 
-	Handles both ``--flag value`` and ``--flag=value`` forms.
+
+def _gunicorn_config():
+	"""Resolve gunicorn's settings the way its command line runner does.
+
+	Gunicorn does not pass its config to the application, so this reads the same
+	sources in the same order: defaults (including ``WEB_CONCURRENCY``), the config
+	file, ``GUNICORN_CMD_ARGS``, then the command line. A worker reuses the config
+	module the master loaded instead of running the file again. Gunicorn exits on
+	invalid settings, which raises ``SystemExit`` here.
 	"""
-	for i, arg in enumerate(args):
-		for flag in flags:
-			if arg == flag and i + 1 < len(args):
-				return int(args[i + 1])
-			if arg.startswith(f"{flag}="):
-				return int(arg.split("=", 1)[1])
-	return None
+	from gunicorn.app.base import Application
+	from gunicorn.config import get_default_config_file
+
+	class Settings(Application):
+		def get_config_from_filename(self, filename):
+			if config := sys.modules.get("__config__"):
+				return vars(config)
+			return super().get_config_from_filename(filename)
+
+		def load_config(self):
+			parser = self.cfg.parser()
+			args = parser.parse_args(sys.argv[1:])
+			env_args = parser.parse_args(self.cfg.get_cmd_args_from_env())
+
+			if config_file := args.config or env_args.config or get_default_config_file():
+				self.load_config_from_file(config_file)
+
+			for parsed in (env_args, args):
+				for name, value in vars(parsed).items():
+					if value is not None and name != "args":
+						self.cfg.set(name.lower(), value)
+
+	return Settings().cfg
+
+
+def _default_limit() -> int | None:
+	"""Half of the web tier's capacity, or ``None`` when nothing needs protecting."""
+	capacity = web_tier_concurrency()
+	return max(1, capacity // 2) if capacity else None
 
 
 def concurrent_limit(limit: int | None = None, wait_timeout: int = _DEFAULT_WAIT_TIMEOUT):
 	"""Decorator that limits simultaneous in-flight executions of the wrapped function.
 
-	:param limit: Maximum number of concurrent executions. Defaults to half of ``workers x threads``
-	    as detected from the gunicorn master process.
+	:param limit: Maximum number of concurrent executions. Defaults to half of gunicorn's
+	    ``workers x threads``, and to no limit when the process serves requests without a fixed
+	    worker pool or the pool's size cannot be resolved.
 	:param wait_timeout: Seconds to wait for a free slot before returning 503.
 	    Defaults to 10 s.
 
@@ -92,6 +138,9 @@ def concurrent_limit(limit: int | None = None, wait_timeout: int = _DEFAULT_WAIT
 				return fn(*args, **kwargs)
 
 			_limit = cint(limit) if limit is not None else _default_limit()
+			if _limit is None:
+				return fn(*args, **kwargs)
+
 			key = f"concurrency:{fn.__module__}.{fn.__qualname__}"
 
 			sem = RedisSemaphore(key, _limit, wait_timeout, shared=True)
@@ -102,6 +151,7 @@ def concurrent_limit(limit: int | None = None, wait_timeout: int = _DEFAULT_WAIT
 					headers.set("Retry-After", str(retry_after))
 				exc = ServiceUnavailableError(frappe._("Server is busy. Please try again in a few seconds."))
 				exc.retry_after = retry_after
+				exc.skip_error_log = True
 				raise exc
 
 			try:
@@ -117,9 +167,7 @@ def concurrent_limit(limit: int | None = None, wait_timeout: int = _DEFAULT_WAIT
 @frappe.whitelist()
 def get_stats() -> dict:
 	frappe.only_for("System Manager")
-	cached_limit = _default_limit()
-	gunicorn_limit = gunicorn_max_concurrency()
 	return {
-		"cached_limit": cached_limit,
-		"gunicorn_limit": gunicorn_limit,
+		"default_limit": _default_limit(),
+		"web_tier_concurrency": web_tier_concurrency(),
 	}

@@ -1,5 +1,4 @@
 import csv
-import gettext
 import multiprocessing
 import os
 from collections import defaultdict
@@ -17,6 +16,7 @@ from frappe.utils import get_bench_path
 
 PO_DIR = "locale"  # po and pot files go into [app]/locale
 POT_FILE = "main.pot"  # the app's pot file is always main.pot
+PYTHON_KEYWORDS = DEFAULT_KEYWORDS | {"_lt": None, "N_": None}
 
 
 def new_catalog(app: str, locale: str | None = None) -> Catalog:
@@ -131,9 +131,6 @@ def generate_pot(target_app: str | None = None):
 	apps = [target_app] if target_app else frappe.get_all_apps(True)
 	default_method_map = get_method_map("frappe")
 
-	keywords = DEFAULT_KEYWORDS.copy()
-	keywords["_lt"] = None
-
 	for app in apps:
 		app_path = frappe.get_pymodule_path(app, "..")
 		catalog = new_catalog(app)
@@ -145,7 +142,7 @@ def generate_pot(target_app: str | None = None):
 		method_map.extend(default_method_map)
 
 		for filename, lineno, message, comments, context in extract_from_dir(
-			app_path, method_map, directory_filter=directory_filter, keywords=keywords
+			app_path, method_map, directory_filter=directory_filter, keywords=PYTHON_KEYWORDS
 		):
 			if not message:
 				continue
@@ -247,13 +244,13 @@ def new_po(locale, target_app: str | None = None):
 		)
 
 
-def compile_translations(target_app: str | None = None, locale: str | None = None, force=False):
+def compile_translations(target_app: str | None = None, locale: str | None = None, force=False, verbose=True):
 	apps = [target_app] if target_app else frappe.get_all_apps(True)
 	tasks = []
 	for app in apps:
 		locales = [locale] if locale else get_locales(app)
 		for current_locale in locales:
-			tasks.append((app, current_locale, force))
+			tasks.append((app, current_locale, force, verbose))
 
 	# Execute all tasks, doing this sequentially is quite slow hence use processpool of 4
 	# processes.
@@ -264,21 +261,23 @@ def compile_translations(target_app: str | None = None, locale: str | None = Non
 	executer.join()
 
 
-def _compile_translation(app, locale, force=False):
+def _compile_translation(app, locale, force=False, verbose=True):
 	po_path = get_po_path(app, locale)
 	mo_path = get_mo_path(app, locale)
 	if not po_path.exists():
 		return
 
 	if mo_path.exists() and po_path.stat().st_mtime < mo_path.stat().st_mtime and not force:
-		print(f"MO file already up to date at {mo_path}")
+		if verbose:
+			print(f"MO file already up to date at {mo_path}")
 		return
 
 	with open(po_path, "rb") as f:
 		catalog = read_po(f)
 
 	mo_path = write_binary(app, catalog, locale)
-	print(f"MO file created at {mo_path}")
+	if verbose:
+		print(f"MO file created at {mo_path}")
 
 
 def update_po(target_app: str | None = None, locale: str | None = None):
@@ -303,23 +302,19 @@ def migrate(app: str | None = None, locale: str | None = None):
 	apps = [app] if app else frappe.get_all_apps(True)
 
 	for app in apps:
-		if locale:
-			csv_to_po(app, locale)
-		else:
-			app_path = Path(frappe.get_app_path(app))
-			for filename in (app_path / "translations").iterdir():
-				if filename.suffix != ".csv":
-					continue
-				csv_to_po(app, filename.stem)
+		app_path = Path(frappe.get_app_path(app))
+		for filename in sorted((app_path / "translations").glob("*.csv")):
+			if locale and filename.stem.replace("-", "_").lower() != locale.replace("-", "_").lower():
+				continue
+			csv_to_po(app, filename)
 
 
-def csv_to_po(app: str, locale: str):
-	csv_file = Path(frappe.get_app_path(app)) / "translations" / f"{locale.replace('_', '-')}.csv"
-	locale = locale.replace("-", "_")
-	if not csv_file.exists():
-		return
+def csv_to_po(app: str, csv_file: Path):
+	language, _, region = csv_file.stem.replace("-", "_").partition("_")
+	locale = f"{language}_{region.upper()}" if region else language
 
-	catalog: Catalog = get_catalog(app)
+	catalog: Catalog = get_catalog(app, locale)
+	catalog.update(get_catalog(app), no_fuzzy_matching=True)
 	msgid_context_map = defaultdict(list)
 	for message in catalog:
 		msgid_context_map[message.id].append(message.context)
@@ -329,27 +324,29 @@ def csv_to_po(app: str, locale: str):
 			if len(row) < 2:
 				continue
 
-			msgid = escape_percent(row[0])
-			msgstr = escape_percent(row[1])
+			msgid = row[0]
+			msgstr = row[1]
 			msgctxt = row[2] if len(row) >= 3 else None
 
 			if not msgctxt:
 				# if old context is not defined, add msgstr to all contexts
 				for context in msgid_context_map.get(msgid, []):
 					if message := catalog.get(msgid, context):
-						message.string = msgstr
+						if not message.string:
+							message.string = msgstr
 			elif message := catalog.get(msgid, msgctxt):
-				message.string = msgstr
+				if not message.string:
+					message.string = msgstr
 
 	po_path = write_catalog(app, catalog, locale)
 	print(f"PO file created at {po_path}")
 
 
 def get_translations_from_mo(lang, app):
-	"""Get translations from MO files.
+	"""Get translations from the MO file of exactly this locale.
 
-	For dialects (i.e. es_GT), take translations from the base language (i.e. es)
-	and then update with specific translations from the dialect (i.e. es_GT).
+	Dialects (i.e. es_GT) are not resolved here; callers merge the base language
+	(i.e. es) separately so that a dialect catalogue stays an overlay on top of it.
 
 	If we only have a translation with context, also use it as a translation
 	without context. This way we can provide the context for each source string
@@ -361,9 +358,8 @@ def get_translations_from_mo(lang, app):
 	translations = {}
 	lang = lang.replace("-", "_")  # Frappe uses dash, babel uses underscore.
 
-	locale_dir = get_locale_dir()
-	mo_file = gettext.find(app, locale_dir, (lang,))
-	if not mo_file:
+	mo_file = get_mo_path(app, lang)
+	if not mo_file.exists():
 		return translations
 	with open(mo_file, "rb") as f:
 		catalog = read_mo(f)
@@ -378,7 +374,3 @@ def get_translations_from_mo(lang, app):
 			else:
 				translations[m.id] = m.string
 	return translations
-
-
-def escape_percent(s: str):
-	return s.replace("%", "&#37;")

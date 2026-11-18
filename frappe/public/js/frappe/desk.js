@@ -40,6 +40,7 @@ frappe.Application = class Application {
 		this.load_user_permissions();
 		this.make_nav_bar();
 		this.make_sidebar();
+		this.set_desktop_page_class();
 		this.set_favicon();
 		this.set_fullwidth_if_enabled();
 		this.add_browser_class();
@@ -122,7 +123,7 @@ frappe.Application = class Application {
 
 	setup_tours() {
 		if (
-			!window.Cypress &&
+			!navigator.webdriver &&
 			frappe.boot.onboarding_tours &&
 			frappe.boot.user.onboarding_status != null
 		) {
@@ -144,11 +145,27 @@ frappe.Application = class Application {
 			frappe.msgprint(frappe.boot.messages);
 		}
 
-		if (frappe.user_roles.includes("System Manager")) {
+		if (
+			frappe.user_roles.includes("System Manager") ||
+			frappe.user_roles.includes("Workspace Manager")
+		) {
 			// delayed following requests to make boot faster
 			setTimeout(() => {
-				this.show_change_log();
-				this.show_update_available();
+				// One prompt per boot, in order: whichever has something to say takes the
+				// turn, and the rest of the notices follow whenever it closes.
+				const rest = () => {
+					this.show_change_log();
+					this.show_update_available();
+				};
+				const prompts = [
+					frappe.ui.maybe_show_new_navigation_prompt,
+					frappe.ui.maybe_show_legacy_gravatar_cleanup_prompt,
+				];
+
+				for (const prompt of prompts) {
+					if (prompt({ onhide: rest })) return;
+				}
+				rest();
 			}, 1000);
 		}
 
@@ -242,7 +259,9 @@ frappe.Application = class Application {
 					},
 				],
 			});
-			s.fields_dict.checking.$wrapper.html('<i class="fa fa-spinner fa-spin fa-4x"></i>');
+			s.fields_dict.checking.$wrapper.html(
+				frappe.utils.icon("loader-circle", "xl", "", "animation: spin 1s linear infinite")
+			);
 			s.show();
 			frappe.call({
 				method: "frappe.email.doctype.email_account.email_account.set_email_password",
@@ -270,9 +289,36 @@ frappe.Application = class Application {
 		});
 		d.show();
 	}
+	// `frappe.boot.user.all_reports` held an exact duplicate of `frappe.boot.allowed_reports` --
+	// the same dict from the same call, so ~47 KB of every boot payload was spent twice. The key
+	// is gone from the payload; this getter keeps app code reading it working, and because it
+	// hands back the very same object, writes through it still land where they used to.
+	//
+	// Ends: delete this in the release after the one that ships it, by which point every app has
+	// had a version in which to move to `frappe.boot.allowed_reports`.
+	alias_removed_boot_keys() {
+		if (!frappe.boot.user || "all_reports" in frappe.boot.user) return;
+
+		let warned = false;
+		Object.defineProperty(frappe.boot.user, "all_reports", {
+			configurable: true,
+			get: () => {
+				if (!warned) {
+					warned = true;
+					console.warn(
+						"frappe.boot.user.all_reports is deprecated and will be removed; " +
+							"read frappe.boot.allowed_reports instead."
+					);
+				}
+				return frappe.boot.allowed_reports;
+			},
+		});
+	}
 	load_bootinfo() {
 		if (frappe.boot) {
+			this.alias_removed_boot_keys();
 			this.setup_workspaces();
+			this.load_custom_icons();
 			frappe.model.sync(frappe.boot.docs);
 			this.check_metadata_cache_status();
 			this.set_globals();
@@ -289,6 +335,21 @@ frappe.Application = class Application {
 			this.set_as_guest();
 		}
 		frappe.ui.toolbar.fetch_session_defaults();
+	}
+
+	load_custom_icons() {
+		// Custom Icons join the sprite the bundled icon files are fetched into, so
+		// `frappe.utils.icon()` and the Icon field resolve them like any other icon.
+		let icons = frappe.boot.custom_icons || [];
+		if (!icons.length) return;
+
+		let symbols = icons.map((icon) => icon.symbol).join("");
+		document
+			.getElementById("all-symbols")
+			?.insertAdjacentHTML(
+				"beforeend",
+				`<svg xmlns="http://www.w3.org/2000/svg" style="display: none">${symbols}</svg>`
+			);
 	}
 
 	setup_workspaces() {
@@ -368,6 +429,7 @@ frappe.Application = class Application {
 				"body"
 			);
 			frappe.container = new frappe.views.Container();
+			frappe.ui.setup_site_banners();
 		}
 	}
 	make_nav_bar() {
@@ -378,7 +440,6 @@ frappe.Application = class Application {
 	}
 	logout() {
 		var me = this;
-		me.logged_out = true;
 		frappe.confirm(__("Are you sure you want to log out?"), function () {
 			return frappe.call({
 				method: "logout",
@@ -387,13 +448,25 @@ frappe.Application = class Application {
 						return;
 					}
 
+					me.logged_out = true;
 					me.redirect_to_login();
 				},
 			});
 		});
 	}
 	handle_session_expired() {
-		frappe.app.redirect_to_login();
+		if (frappe.app.session_expired_dialog) {
+			return;
+		}
+		const dialog = new frappe.ui.Dialog({
+			title: __("Session Expired"),
+		});
+		dialog.onhide = () => frappe.app.redirect_to_login();
+		frappe.app.session_expired_dialog = dialog;
+		dialog.show();
+		dialog.set_message(
+			__("Your session has expired due to inactivity. Please log in again to continue.")
+		);
 	}
 	redirect_to_login() {
 		window.location.href = `/login?redirect-to=${encodeURIComponent(
@@ -438,8 +511,8 @@ frappe.Application = class Application {
 		if (
 			!Array.isArray(change_log) ||
 			!change_log.length ||
-			window.Cypress ||
-			cint(frappe.boot.sysdefaults.disable_change_log_notification)
+			navigator.webdriver ||
+			frappe.defaults.is_enabled("disable_change_log_notification")
 		) {
 			return;
 		}
@@ -460,12 +533,17 @@ frappe.Application = class Application {
 	}
 
 	show_update_available() {
-		if (!frappe.boot.has_app_updates) return;
+		if (!frappe.boot.has_app_updates || !frappe.boot.setup_complete) return;
 		frappe.xcall("frappe.utils.change_log.show_update_popup");
 	}
 
 	add_browser_class() {
 		$("html").addClass(frappe.utils.get_browser().name.toLowerCase());
+	}
+
+	set_desktop_page_class() {
+		// desktop.css scopes its rules to this class. Both forms of /app/desktop share them.
+		$("body").addClass("desktop-page");
 	}
 
 	set_fullwidth_if_enabled() {

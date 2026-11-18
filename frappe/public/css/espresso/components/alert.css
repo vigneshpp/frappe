@@ -1,0 +1,184 @@
+/* Espresso Alert — a static message with an optional icon, description,
+ * actions and dismiss button. Two layouts, as in frappe-ui:
+ *
+ *   row (default)   one line: icon, title, then the action and dismiss inline
+ *   banner          stacked: icon and title, then the description and the
+ *                   actions underneath
+ *
+ * Markup:
+ *   <div class="es-alert" role="alert" data-theme="blue">
+ *     <svg>...</svg>                                    (themed icon, optional)
+ *     <span class="es-alert__title">...</span>
+ *     <div class="es-alert__actions">...</div>          (optional)
+ *     <button class="es-button es-alert__dismiss">...</button>   (optional)
+ *   </div>
+ *
+ *   <div class="es-alert" role="alert" data-layout="banner" data-theme="blue">
+ *     <div class="es-alert__head">
+ *       <svg>...</svg>
+ *       <span class="es-alert__title">...</span>
+ *     </div>
+ *     <div class="es-alert__body">
+ *       <p class="es-alert__description">...</p>        (optional)
+ *       <div class="es-alert__actions">...</div>        (optional)
+ *     </div>
+ *     <button class="es-button es-alert__dismiss">...</button>   (optional)
+ *   </div>
+ *
+ * Attributes (all optional):
+ *   data-layout    banner                        (default: row)
+ *   data-theme     yellow | blue | red | green   (no theme = gray, no icon)
+ *   data-variant   subtle | outline              (default: subtle)
+ *
+ * The theme colors only the icon and the row action's label. "yellow" uses
+ * the amber tokens — the name comes from frappe-ui's Alert. frappe-ui's colored
+ * ink scales sit one step below ours (its ink-blue-5 is our ink-blue-6), so
+ * the steps here are one above the ones in Alert.vue to get the same colors. */
+
+.es-alert {
+    --es-al-icon: var(--ink-gray-7);
+    --es-al-action: var(--ink-gray-7);
+
+    display: flex;
+    align-items: center;
+    min-height: calc(var(--spacing) * 10);
+    padding-block: calc(var(--spacing) * 1.5);
+    padding-inline: calc(var(--spacing) * 3.5) calc(var(--spacing) * 1.5);
+    border-radius: var(--radius-6);
+    background: var(--surface-gray-1);
+}
+
+.es-alert[data-layout="banner"] {
+    display: block;
+    position: relative;
+    min-height: 0;
+    padding: calc(var(--spacing) * 3);
+}
+
+/* ---- themes ---- */
+.es-alert[data-theme="yellow"] {
+    --es-al-icon: var(--ink-amber-6);
+    --es-al-action: var(--ink-amber-7);
+}
+
+.es-alert[data-theme="blue"] {
+    --es-al-icon: var(--ink-blue-6);
+    --es-al-action: var(--ink-blue-7);
+}
+
+.es-alert[data-theme="red"] {
+    --es-al-icon: var(--ink-red-6);
+    --es-al-action: var(--ink-red-7);
+}
+
+.es-alert[data-theme="green"] {
+    --es-al-icon: var(--ink-green-6);
+    --es-al-action: var(--ink-green-7);
+}
+
+/* ---- outline variant: border instead of a filled background ---- */
+.es-alert[data-variant="outline"] {
+    background: transparent;
+    border: 1px solid var(--outline-gray-3);
+}
+
+/* ---- icon and title ---- */
+.es-alert > svg,
+.es-alert__head > svg {
+    width: calc(var(--spacing) * 4);
+    height: calc(var(--spacing) * 4);
+    color: var(--es-al-icon);
+    flex-shrink: 0;
+}
+
+.es-alert > svg {
+    margin-inline-end: calc(var(--spacing) * 2);
+}
+
+.es-alert__title {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink-gray-8);
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.35;
+    letter-spacing: 0.015em;
+}
+
+/* a row that ends with the title gets the same room on both sides */
+.es-alert > .es-alert__title:last-child {
+    margin-inline-end: calc(var(--spacing) * 2);
+}
+
+.es-alert__head {
+    display: flex;
+    align-items: center;
+    gap: calc(var(--spacing) * 1.5);
+}
+
+/* keep the title clear of the dismiss button in the corner */
+.es-alert:has(> .es-alert__dismiss) > .es-alert__head {
+    padding-inline-end: calc(var(--spacing) * 8);
+}
+
+/* ---- banner body: description, then the actions ---- */
+.es-alert__body {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: calc(var(--spacing) * 3);
+    margin-top: var(--spacing);
+}
+
+.es-alert__body:empty {
+    display: none;
+}
+
+.es-alert__description {
+    margin: 0;
+    color: var(--ink-gray-6);
+    font-size: var(--text-p-base);
+    line-height: 1.5;
+    letter-spacing: 0.02em;
+}
+
+/* ---- actions ---- */
+.es-alert__actions {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing);
+    flex-shrink: 0;
+}
+
+.es-alert > .es-alert__actions {
+    margin-inline-start: calc(var(--spacing) * 1.5);
+}
+
+.es-alert .es-alert__action[data-variant="ghost"] {
+    --bt-fg: var(--es-al-action);
+}
+
+.es-alert[data-layout="banner"] .es-alert__action[data-variant="outline"] {
+    border-color: transparent;
+    box-shadow: var(--shadow-sm);
+}
+
+.es-alert[data-layout="banner"] .es-alert__action[data-variant="ghost"] {
+    --bt-fg: var(--ink-gray-7);
+}
+
+/* ---- dismiss ---- */
+.es-alert__dismiss {
+    margin-inline-start: calc(var(--spacing) * 1.5);
+}
+
+.es-alert__actions + .es-alert__dismiss {
+    margin-inline-start: var(--spacing);
+}
+
+.es-alert[data-layout="banner"] > .es-alert__dismiss {
+    position: absolute;
+    top: calc(var(--spacing) * 1.5);
+    inset-inline-end: calc(var(--spacing) * 1.5);
+    margin: 0;
+}

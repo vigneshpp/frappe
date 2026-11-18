@@ -7,6 +7,8 @@ from frappe.realtime import get_website_room
 
 
 class DiscussionReply(Document):
+	_DOCTYPE_NAME = "Discussion Reply"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,11 +21,18 @@ class DiscussionReply(Document):
 		topic: DF.Link | None
 	# end: auto-generated types
 
+	def validate(self):
+		from frappe.desk.form.utils import validate_comment_content
+
+		validate_comment_content(self.reply)
+
 	def on_update(self):
+		from frappe.utils.html_utils import sanitize_html
+
 		frappe.publish_realtime(
 			event="update_message",
 			room=get_website_room(),
-			message={"reply": frappe.utils.md_to_html(self.reply), "reply_name": self.name},
+			message={"reply": sanitize_html(frappe.utils.md_to_html(self.reply)), "reply_name": self.name},
 			after_commit=True,
 		)
 

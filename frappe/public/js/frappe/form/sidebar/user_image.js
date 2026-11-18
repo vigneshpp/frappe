@@ -3,7 +3,6 @@ frappe.ui.form.set_user_image = function (frm) {
 	var image_field = frm.meta.image_field;
 	var image = frm.doc[image_field];
 	var title_image = frm.page.$title_area.find(".title-image");
-	var image_actions = frm.sidebar.image_wrapper.find(".sidebar-image-actions");
 
 	image_section.toggleClass("hide", image_field ? false : true);
 	title_image.toggleClass("hide", image_field ? false : true);
@@ -12,15 +11,15 @@ frappe.ui.form.set_user_image = function (frm) {
 		return;
 	}
 
+	image_section
+		.find(".sidebar-image-edit")
+		.html(frappe.utils.icon(image ? "camera" : "plus", "xs"));
+
 	// if image field has value
 	if (image) {
 		image_section.find(".sidebar-image").attr("src", image).removeClass("hide");
-
 		image_section.find(".sidebar-standard-image").addClass("hide");
-
 		title_image.css("background-image", `url("${image}")`).html("");
-
-		image_actions.find(".sidebar-image-change, .sidebar-image-remove").show();
 	} else {
 		image_section.find(".sidebar-image").attr("src", null).addClass("hide");
 
@@ -33,9 +32,6 @@ frappe.ui.form.set_user_image = function (frm) {
 			.html(frappe.get_abbr(title));
 
 		title_image.css("background-image", "").html(frappe.get_abbr(title));
-
-		image_actions.find(".sidebar-image-change").show();
-		image_actions.find(".sidebar-image-remove").hide();
 	}
 };
 
@@ -47,41 +43,48 @@ frappe.ui.form.setup_user_image_event = function (frm) {
 		});
 	}
 
-	if (frm.meta.image_field && !frm.fields_dict[frm.meta.image_field].df.read_only) {
-		frm.sidebar.image_wrapper.on("click", ":not(.sidebar-image-actions)", (e) => {
-			let $target = $(e.currentTarget);
-			if ($target.is("a.dropdown-toggle, .dropdown")) {
-				return;
+	if (
+		frm.meta.image_field &&
+		!frm.fields_dict[frm.meta.image_field].df.read_only &&
+		frm.get_perm(0, "write")
+	) {
+		const upload_image = function () {
+			var field = frm.get_field(frm.meta.image_field);
+			if (!field.$input) {
+				field.make_input();
 			}
-			let dropdown = frm.sidebar.image_wrapper.find(".sidebar-image-actions .dropdown");
-			dropdown.toggleClass("open");
-			e.stopPropagation();
+			field.$input.trigger("attach_doc_image");
+			frm.page.close_sidebar?.();
+		};
+
+		frm.sidebar.image_wrapper
+			.attr({ tabindex: 0, role: "button", "aria-label": __("Change image") })
+			.on("keydown", function (e) {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					this.click();
+				}
+			});
+
+		// without an image, upload directly instead of opening the menu below
+		frm.sidebar.image_wrapper.on("click", function (e) {
+			if (!frm.doc[frm.meta.image_field]) {
+				e.stopImmediatePropagation();
+				upload_image();
+			}
+		});
+
+		new frappe.ui.Dropdown({
+			trigger: frm.sidebar.image_wrapper,
+			options: [
+				{ label: __("Upload image"), icon: "image-plus", onclick: upload_image },
+				{
+					label: __("Remove image"),
+					icon: "trash-2",
+					theme: "red",
+					onclick: () => frm.get_field(frm.meta.image_field).clear_attachment(),
+				},
+			],
 		});
 	}
-
-	// bind click on image_wrapper
-	frm.sidebar.image_wrapper.on(
-		"click",
-		".sidebar-image-change, .sidebar-image-remove",
-		function (e) {
-			let $target = $(e.currentTarget);
-			var field = frm.get_field(frm.meta.image_field);
-			if ($target.is(".sidebar-image-change")) {
-				if (!field.$input) {
-					field.make_input();
-				}
-				field.$input.trigger("attach_doc_image");
-				// close sidebar
-				frm.page.close_sidebar?.();
-			} else {
-				/// on remove event for a sidebar image wrapper remove attach file.
-				frm.attachments.remove_attachment_by_filename(
-					frm.doc[frm.meta.image_field],
-					function () {
-						field.set_value("").then(() => frm.save());
-					}
-				);
-			}
-		}
-	);
 };

@@ -13,6 +13,8 @@ from frappe.utils.data import comma_and
 
 
 class AssignmentRule(Document):
+	_DOCTYPE_NAME = "Assignment Rule"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -43,6 +45,7 @@ class AssignmentRule(Document):
 	def validate(self):
 		self.validate_document_types()
 		self.validate_assignment_days()
+		self.validate_users()
 
 	def clear_cache(self):
 		super().clear_cache()
@@ -53,6 +56,13 @@ class AssignmentRule(Document):
 		if self.document_type == "ToDo":
 			frappe.throw(
 				_("Assignment Rule is not allowed on document type {0}").format(frappe.bold(_("ToDo")))
+			)
+
+	def validate_users(self):
+		if not self.disabled and self.rule in ("Round Robin", "Load Balancing") and not self.users:
+			frappe.throw(
+				_("{0} is required").format(frappe.bold(_(self.meta.get_label("users")))),
+				frappe.MandatoryError,
 			)
 
 	def validate_assignment_days(self):
@@ -83,12 +93,12 @@ class AssignmentRule(Document):
 		if not user or not frappe.db.exists("User", user):
 			return False
 
-		assign_to.add(
+		assign_to._add(
 			dict(
 				assign_to=[user],
 				doctype=doc.get("doctype"),
 				name=doc.get("name"),
-				description=frappe.render_template(self.description, doc),
+				description=frappe.render_template(self.description, doc, restrict_globals=True),
 				assignment_rule=self.name,
 				notify=True,
 				date=doc.get(self.due_date_based_on) if self.due_date_based_on else None,
@@ -130,13 +140,16 @@ class AssignmentRule(Document):
 		Get next user based on round robin
 		"""
 
+		# self.last_user can be stale: cached doc, or a snapshot older than another assignment
+		last_user = frappe.db.get_value("Assignment Rule", self.name, "last_user", for_update=True)
+
 		# first time, or last in list, pick the first
-		if not self.last_user or self.last_user == self.users[-1].user:
+		if not last_user or last_user == self.users[-1].user:
 			return self.users[0].user
 
 		# find out the next user in the list
 		for i, d in enumerate(self.users):
-			if self.last_user == d.user:
+			if last_user == d.user:
 				return self.users[i + 1].user
 
 		# bad last user, assign to the first one
@@ -228,7 +241,7 @@ def get_assignments(doc) -> list[dict]:
 
 
 @frappe.whitelist()
-def bulk_apply(doctype: str, docnames: str | list[str]):
+def bulk_apply(doctype: str, docnames: str | list[str]) -> bool:
 	if not frappe.get_cached_value("User", frappe.session.user, "bulk_actions"):
 		frappe.throw(_("You are not allowed to perform bulk actions"), frappe.PermissionError)
 
@@ -245,6 +258,8 @@ def bulk_apply(doctype: str, docnames: str | list[str]):
 			)
 		else:
 			apply(doctype=doctype, name=name)
+
+	return background
 
 
 def reopen_closed_assignment(doc):
@@ -281,6 +296,7 @@ def apply(doc=None, method=None, doctype=None, name=None):
 
 	if not doc and doctype and name:
 		doc = frappe.get_doc(doctype, name)
+		doc.check_permission()
 
 	assignment_rules = get_doctype_map(
 		"Assignment Rule",
@@ -330,6 +346,7 @@ def apply(doc=None, method=None, doctype=None, name=None):
 	assignments = get_assignments(doc)
 
 	if assignments:
+		closed_assignments_checked = False
 		for assignment_rule in assignment_rule_docs:
 			if assignment_rule.is_rule_not_applicable_today():
 				continue
@@ -355,7 +372,8 @@ def apply(doc=None, method=None, doctype=None, name=None):
 						_todo.save(ignore_permissions=True)
 					break
 
-				else:
+				elif not closed_assignments_checked:
+					closed_assignments_checked = True
 					reopened = reopen_closed_assignment(doc)
 					if reopened:
 						break

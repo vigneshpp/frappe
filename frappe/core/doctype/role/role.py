@@ -4,6 +4,7 @@
 import frappe
 from frappe.core.page.permission_manager.permission_manager import get_permissions
 from frappe.model.document import Document
+from frappe.permissions import setup_custom_perms
 from frappe.website.path_resolver import validate_path
 from frappe.website.router import clear_routing_cache
 
@@ -11,6 +12,8 @@ STANDARD_ROLES = ("Administrator", "System Manager", "Script Manager", "All", "G
 
 
 class Role(Document):
+	_DOCTYPE_NAME = "Role"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -81,7 +84,7 @@ class Role(Document):
 		users_with_same_user_type = frappe.get_all("User", {"user_type": role_user_type}, pluck="name")
 
 		for user_name in set(users_with_role) - set(users_with_same_user_type):
-			user = frappe.get_doc("User", user_name)
+			user = frappe.get_lazy_doc("User", user_name)
 			user_type = user.user_type
 			user.set_system_user()
 			if user_type != user.user_type:
@@ -98,6 +101,7 @@ class Role(Document):
 
 		perms = get_permissions(role=cur_role)
 		for perm in perms:
+			setup_custom_perms(perm.parent)
 			perm.update(
 				{
 					"name": None,

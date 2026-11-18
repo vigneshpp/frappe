@@ -8,8 +8,11 @@ frappe.ui.keys.setup = function () {
 		var key = frappe.ui.keys.get_key(e);
 		if (frappe.ui.keys.handlers[key]) {
 			var out = null;
+			// shortcuts check their own target
+			const island_key = is_island_key(e);
 			for (var i = 0, l = frappe.ui.keys.handlers[key].length; i < l; i++) {
 				var handler = frappe.ui.keys.handlers[key][i];
+				if (island_key && !handler.is_shortcut) continue;
 				var _out = handler.apply(this, [e]);
 				if (_out === false) {
 					out = _out;
@@ -22,6 +25,13 @@ frappe.ui.keys.setup = function () {
 
 let standard_shortcuts = [];
 frappe.ui.keys.standard_shortcuts = standard_shortcuts;
+frappe.ui.keys.get_shortcut_label = function (shortcut) {
+	let label = shortcut.split("+").map(frappe.utils.to_title_case).join("+");
+	if (frappe.utils.is_mac()) {
+		label = label.replace("Ctrl+", "⌘").replace("Alt+", "⌥").replace("Shift+", "⇧");
+	}
+	return label;
+};
 frappe.ui.keys.add_shortcut = ({
 	shortcut,
 	action,
@@ -41,11 +51,7 @@ frappe.ui.keys.add_shortcut = ({
 		condition = () => true;
 	}
 	let handler = (e) => {
-		let $focused_element = $(document.activeElement);
-		let is_input_focused = $focused_element.is(
-			"input, select, textarea, [contenteditable=true]"
-		);
-		if (is_input_focused && !ignore_inputs) return;
+		if (is_input(key_target(e)) && !ignore_inputs) return;
 		if (!condition()) return;
 
 		if (action && (!page || page.wrapper.is(":visible"))) {
@@ -59,6 +65,7 @@ frappe.ui.keys.add_shortcut = ({
 	};
 	// monkey patch page to handler
 	handler.page = page;
+	handler.is_shortcut = true;
 	// remove handler with the same page attached to it
 	frappe.ui.keys.off(shortcut, page);
 	// attach new handler
@@ -74,79 +81,99 @@ frappe.ui.keys.add_shortcut = ({
 	}
 };
 
+// the key's own target: an input in an island's shadow root leaves document.activeElement on the
+// island's host
+export function key_target(e) {
+	return e.originalEvent?.composedPath()[0] || document.activeElement;
+}
+
+// a key typed into an island's input is the island's, unless the island sits in the dialog or
+// grid row that Desk's Escape, Enter and Ctrl+Up/Down act on: Escape in a chat beside the page
+// must not close the page's dialog. The shadow root comes from the event's path, which still holds
+// it when the island's own handler has already removed the input
+function is_island_key(e) {
+	const target = key_target(e);
+	const path = e.originalEvent?.composedPath() || [];
+	const root = path.find((node) => node instanceof ShadowRoot) || target?.getRootNode?.();
+	if (!is_input(target) || !(root instanceof ShadowRoot)) return false;
+	return !root.host.closest(".modal, .grid-row-open");
+}
+
+export function is_input(element) {
+	return $(element).is("input, select, textarea, [contenteditable=true]");
+}
+
+frappe.ui.keys.get_shortcut_groups = () => {
+	const page_name = window.cur_page?.page?.page;
+	const frm_name = window.cur_page?.page?.frm;
+	return [
+		{ heading: __("Global Shortcuts"), shortcuts: standard_shortcuts.filter((s) => !s.page) },
+		{
+			heading: __("Page Shortcuts"),
+			shortcuts: standard_shortcuts.filter((s) => s.page && s.page === page_name),
+		},
+		{
+			heading: __("Grid Shortcuts"),
+			shortcuts: standard_shortcuts.filter((s) => s.page && s.page === frm_name),
+		},
+	];
+};
+
+frappe.ui.keys.generate_shortcuts_html = (shortcuts, heading) => {
+	if (!shortcuts.length) return "";
+
+	const deduped = [];
+	const seen = {};
+	shortcuts
+		.filter((s) => (s.condition ? s.condition() : true))
+		.filter((s) => !!s.description)
+		.forEach((shortcut) => {
+			if (seen[shortcut.description] !== undefined) {
+				deduped[seen[shortcut.description]].keys.push(shortcut.shortcut);
+			} else {
+				seen[shortcut.description] = deduped.length;
+				deduped.push({ ...shortcut, keys: [shortcut.shortcut] });
+			}
+		});
+
+	const rows = deduped
+		.map((shortcut) => {
+			const shortcut_label = shortcut.keys
+				.map(
+					(k) =>
+						`<kbd>${frappe.utils.escape_html(
+							frappe.ui.keys.get_shortcut_label(k)
+						)}</kbd>`
+				)
+				.join(" / ");
+			const description = frappe.utils.escape_html(shortcut.description || "");
+			return `<tr>
+				<td width="40%">${shortcut_label}</td>
+				<td width="60%">${description}</td>
+			</tr>`;
+		})
+		.join("");
+	if (!rows) return "";
+
+	return `<h5 style="margin: 0;">${heading}</h5>
+		<table style="margin-top: 10px;" class="table table-bordered">
+			${rows}
+		</table>`;
+};
+
 frappe.ui.keys.show_keyboard_shortcut_dialog = () => {
 	if (frappe.ui.keys.is_dialog_shown) return;
 
-	let global_shortcuts = standard_shortcuts.filter((shortcut) => !shortcut.page);
-	let current_page_shortcuts = standard_shortcuts.filter(
-		(shortcut) => shortcut.page && shortcut.page === window.cur_page.page.page
-	);
-
-	let grid_shortcuts = standard_shortcuts.filter(
-		(shortcut) => shortcut.page && shortcut.page === window.cur_page.page.frm
-	);
-
-	function generate_shortcuts_html(shortcuts, heading) {
-		if (!shortcuts.length) {
-			return "";
-		}
-		let deduped = [];
-		let seen = {};
-		shortcuts
-			.filter((s) => (s.condition ? s.condition() : true))
-			.filter((s) => !!s.description)
-			.forEach((shortcut) => {
-				if (seen[shortcut.description] !== undefined) {
-					deduped[seen[shortcut.description]].keys.push(shortcut.shortcut);
-				} else {
-					seen[shortcut.description] = deduped.length;
-					deduped.push({ ...shortcut, keys: [shortcut.shortcut] });
-				}
-			});
-		let html = deduped
-			.map((shortcut) => {
-				let shortcut_label = shortcut.keys
-					.map((k) => {
-						let label = k.split("+").map(frappe.utils.to_title_case).join("+");
-						if (frappe.utils.is_mac()) {
-							label = label.replace("Ctrl", "⌘").replace("Alt", "⌥");
-						}
-						label = label.replace("Shift", "⇧");
-						return `<kbd>${label}</kbd>`;
-					})
-					.join(" / ");
-				return `<tr>
-					<td width="40%">${shortcut_label}</td>
-					<td width="60%">${shortcut.description || ""}</td>
-				</tr>`;
-			})
-			.join("");
-		if (!html) return "";
-
-		html = `<h5 style="margin: 0;">${heading}</h5>
-			<table style="margin-top: 10px;" class="table table-bordered">
-				${html}
-			</table>`;
-		return html;
-	}
-
-	let global_shortcuts_html = generate_shortcuts_html(global_shortcuts, __("Global Shortcuts"));
-	let current_page_shortcuts_html = generate_shortcuts_html(
-		current_page_shortcuts,
-		__("Page Shortcuts")
-	);
-	let grid_shortcuts_html = generate_shortcuts_html(grid_shortcuts, __("Grid Shortcuts"));
-
-	let dialog = new frappe.ui.Dialog({
+	const dialog = new frappe.ui.Dialog({
 		title: __("Keyboard Shortcuts"),
 		on_hide() {
 			frappe.ui.keys.is_dialog_shown = false;
 		},
 	});
 
-	dialog.$body.append(global_shortcuts_html);
-	dialog.$body.append(current_page_shortcuts_html);
-	dialog.$body.append(grid_shortcuts_html);
+	frappe.ui.keys.get_shortcut_groups().forEach(({ heading, shortcuts }) => {
+		dialog.$body.append(frappe.ui.keys.generate_shortcuts_html(shortcuts, heading));
+	});
 	dialog.$body.append(`
 		<div class="text-muted">
 			${__("Press Alt Key to trigger additional shortcuts in Menu and Sidebar")}
@@ -235,11 +262,11 @@ frappe.ui.keys.add_shortcut({
 });
 
 frappe.ui.keys.on("escape", function (e) {
-	handle_escape_key();
+	handle_escape_key(e);
 });
 
 frappe.ui.keys.on("esc", function (e) {
-	handle_escape_key();
+	handle_escape_key(e);
 });
 
 frappe.ui.keys.on("enter", function (e) {
@@ -319,8 +346,8 @@ frappe.ui.keyCode = {
 	BACKSPACE: 8,
 };
 
-function handle_escape_key() {
-	close_grid_and_dialog();
+function handle_escape_key(e) {
+	if (!e.isDefaultPrevented()) close_grid_and_dialog();
 	document.activeElement?.blur();
 	$(document).trigger("escape");
 }

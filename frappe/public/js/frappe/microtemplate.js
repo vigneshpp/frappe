@@ -196,6 +196,36 @@ frappe.render_template = function (name, data) {
 		w.document.close();
 	});
 
+function parse_server_messages(response) {
+	try {
+		const body = JSON.parse(new TextDecoder().decode(response));
+		return body._server_messages ? JSON.parse(body._server_messages) : null;
+	} catch {
+		return null;
+	}
+}
+
+function pdf_size_message() {
+	return __(
+		"The report may be too large to render in a single request. Narrow the filters and try again, or use Print and save as PDF from your browser."
+	);
+}
+
+function show_pdf_error(message, response) {
+	const server_messages = parse_server_messages(response);
+
+	if (server_messages) {
+		frappe.msgprint(server_messages);
+		return;
+	}
+
+	frappe.msgprint({
+		title: __("Could not generate PDF"),
+		message: message,
+		indicator: "red",
+	});
+}
+
 frappe.render_pdf = function (html, opts = {}) {
 	//Create a form to place the HTML content
 	var formData = new FormData();
@@ -205,31 +235,74 @@ frappe.render_pdf = function (html, opts = {}) {
 	if (opts.orientation) {
 		formData.append("orientation", opts.orientation);
 	}
+	if (opts.print_format) {
+		formData.append("print_format", opts.print_format);
+	}
 	var blob = new Blob([], { type: "text/xml" });
 	formData.append("blob", blob);
 
+	download_pdf("frappe.utils.print_format.report_to_pdf", formData, opts.report_name);
+};
+
+frappe.download_report_pdf = function (args, filename) {
+	const formData = new FormData();
+	for (const [key, value] of Object.entries(args)) {
+		if (value == null) continue;
+		formData.append(key, typeof value === "object" ? JSON.stringify(value) : value);
+	}
+
+	download_pdf("frappe.utils.print_format.download_report_pdf", formData, filename);
+};
+
+function download_pdf(method, formData, filename) {
 	var xhr = new XMLHttpRequest();
-	xhr.open("POST", "/api/method/frappe.utils.print_format.report_to_pdf");
+	xhr.open("POST", `/api/method/${method}`);
 	xhr.setRequestHeader("X-Frappe-CSRF-Token", frappe.csrf_token);
 	xhr.responseType = "arraybuffer";
+	xhr.timeout = 10 * 60 * 1000;
+
+	frappe.dom?.freeze(__("Generating PDF..."));
 
 	xhr.onload = function (success) {
-		if (this.status === 200) {
-			var blob = new Blob([success.currentTarget.response], { type: "application/pdf" });
-			var objectUrl = URL.createObjectURL(blob);
+		frappe.dom?.unfreeze();
 
-			// Create a hidden a tag to force set report name
-			// https://stackoverflow.com/questions/19327749/javascript-blob-filename-without-link
-			let hidden_a_tag = document.createElement("a");
-			document.body.appendChild(hidden_a_tag);
-			hidden_a_tag.style = "display: none";
-			hidden_a_tag.href = objectUrl;
-			hidden_a_tag.download = opts.report_name || "report.pdf";
+		if (this.status !== 200) {
+			const timed_out = [408, 413, 502, 503, 504].includes(this.status);
 
-			// Open report in a new window
-			hidden_a_tag.click();
-			window.URL.revokeObjectURL(objectUrl);
+			show_pdf_error(
+				timed_out ? pdf_size_message() : __("Check the Error Log for details."),
+				success.currentTarget.response
+			);
+			return;
 		}
+
+		var blob = new Blob([success.currentTarget.response], { type: "application/pdf" });
+		var objectUrl = URL.createObjectURL(blob);
+
+		// Create a hidden a tag to force set report name
+		// https://stackoverflow.com/questions/19327749/javascript-blob-filename-without-link
+		let hidden_a_tag = document.createElement("a");
+		document.body.appendChild(hidden_a_tag);
+		hidden_a_tag.style = "display: none";
+		hidden_a_tag.href = objectUrl;
+		hidden_a_tag.download = filename || "report.pdf";
+
+		// Open report in a new window
+		hidden_a_tag.click();
+		window.URL.revokeObjectURL(objectUrl);
 	};
+
+	xhr.ontimeout = function () {
+		frappe.dom?.unfreeze();
+		show_pdf_error(pdf_size_message());
+	};
+
+	xhr.onerror = function () {
+		frappe.dom?.unfreeze();
+		show_pdf_error(
+			__("The request could not be completed. Check your connection and try again.")
+		);
+	};
+
 	xhr.send(formData);
-};
+}

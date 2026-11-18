@@ -5,7 +5,7 @@ frappe.provide("frappe.tags");
 
 frappe.search.AwesomeBar = class AwesomeBar {
 	setup(element) {
-		$(".search-bar, .navbar-search-bar").removeClass("hidden");
+		$(".navbar-search-bar").removeClass("hidden");
 
 		this.options = [];
 		this.global_results = [];
@@ -13,18 +13,21 @@ frappe.search.AwesomeBar = class AwesomeBar {
 		this.setup_search_modal(element);
 
 		frappe.search.utils.setup_recent();
+		this.setup_page_change_event();
 	}
 
 	setup_search_modal(element) {
-		let is_event_listeners_added = false;
 		let $search_element = $(element);
 
 		let search_modal = new frappe.get_modal("Search", "");
-
+		this.search_modal = search_modal;
 		search_modal.removeClass("fade");
 		search_modal.on("shown.bs.modal", () => {
 			const input = search_modal.find("#navbar-search").get(0);
 			setTimeout(() => input.focus(), 10);
+		});
+		search_modal.on("hide.bs.modal", () => {
+			this._hook_search_seq = (this._hook_search_seq || 0) + 1;
 		});
 
 		let search_modal_body = `<div class="align-baseline flex p-2 relative navbar-modal-wrapper">
@@ -67,21 +70,37 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			.addClass("cool-awesomebar-modal-footer")
 			.html(search_modal_footer);
 
-		$search_element.on("click", () => {
-			if ($(search_modal).hasClass("show")) {
-				search_modal.modal("hide");
+		$(document).on("click", element, () => {
+			if (this.is_open()) {
+				this.close();
 				return;
 			}
 			search_modal.modal("show");
-
-			if (is_event_listeners_added) return;
-			is_event_listeners_added = true;
-
 			this.setup_event_listeners(search_modal);
 		});
 	}
 
+	open(search_modal) {
+		const modal = search_modal || this.search_modal;
+		if (!modal) return;
+		modal.modal("show");
+		this.setup_event_listeners(modal);
+	}
+
+	close() {
+		if (!this.is_open()) return;
+		this.search_modal.modal("hide");
+	}
+
+	is_open() {
+		return Boolean(this.search_modal?.hasClass("show"));
+	}
+
 	setup_event_listeners(search_modal) {
+		// Listeners and the Awesomplete dropdown only need to be set up once.
+		// Re-running this on every open creates duplicate dropdowns and shows results twice.
+		if (this.awesomplete) return;
+
 		var me = this;
 		let $input = search_modal.find("#navbar-search");
 		let input = $input.get(0);
@@ -91,6 +110,21 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			maxItems: 99,
 			autoFirst: true,
 			list: [],
+			container: function (input) {
+				let container = document.createElement("div");
+				container.className = "awesomplete";
+				let input_row = document.createElement("div");
+				input_row.className = "awesomebar-input-row";
+				let icon = document.createElement("span");
+				icon.className = "awesomebar-search-icon";
+				icon.setAttribute("aria-hidden", "true");
+				icon.innerHTML = frappe.utils.icon("search", "sm");
+				input.parentNode.insertBefore(container, input);
+				input_row.appendChild(icon);
+				input_row.appendChild(input);
+				container.appendChild(input_row);
+				return container;
+			},
 			filter: function (text, term) {
 				return true;
 			},
@@ -103,7 +137,9 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			item: function (item, term) {
 				const d = this.get_item(item.value);
 				let target = "#";
-				if (d.route) {
+				if (is_external_url(d.route) || is_in_app_path(d.route)) {
+					target = first_route(d.route);
+				} else if (d.route) {
 					target = frappe.router.make_url(
 						frappe.router.convert_from_standard_route(
 							frappe.router.get_route_from_arguments(
@@ -111,18 +147,6 @@ frappe.search.AwesomeBar = class AwesomeBar {
 							)
 						)
 					);
-				}
-				if (d.type == "sidebar") {
-					d.route_options = {
-						sidebar: d.description,
-					};
-				}
-				if (d.type == "Desktop Icon") {
-					target = frappe.utils.get_route_for_icon(d.icon_data);
-					d.route = target;
-					d.route_options = {
-						sidebar: d.icon_data.label,
-					};
 				}
 				let html = `<span>${__(d.label || d.value)}</span>`;
 
@@ -149,27 +173,20 @@ frappe.search.AwesomeBar = class AwesomeBar {
 		$input.on(
 			"input",
 			frappe.utils.debounce(function (e) {
-				var value = e.target.value;
-				var txt = value.trim().replace(/\s\s+/g, " ");
-				var last_space = txt.lastIndexOf(" ");
-				me.global_results = [];
+				var txt = e.target.value.trim().replace(/\s\s+/g, " ");
+				me._hook_search_seq = (me._hook_search_seq || 0) + 1;
 
-				me.options = [];
-
-				if (txt && txt.length > 1) {
-					if (last_space !== -1) {
-						me.set_specifics(txt.slice(0, last_space), txt.slice(last_space + 1));
-					}
-					me.add_defaults(txt);
-					me.options = me.options.concat(me.build_options(txt));
-					me.options = me.options.concat(me.global_results);
-				} else {
-					me.options = me.options.concat(
-						me.deduplicate(frappe.search.utils.get_recent_pages(txt || ""))
-					);
-					me.options = me.options.concat(frappe.search.utils.get_frequent_links());
+				let options = me.get_options(txt);
+				if (txt.length > 1 && frappe.boot.has_awesomebar_search) {
+					me.fetch_hook_results(txt, me._hook_search_seq);
 				}
-				let options = me.deduplicate(me.options);
+
+				// hide footer and remove spacing when there are no results
+				$(this.awesomplete.ul).toggleClass("p-0 m-0", cint(me.options?.length) == 0);
+				search_modal
+					.find(".cool-awesomebar-modal-footer")
+					.toggleClass("hide", cint(me.options?.length) == 0);
+
 				awesomplete.options_with_desc = me.create_options_with_descriptions(options);
 				Awesomplete.prototype._itemCursor = 0;
 				awesomplete.list = options;
@@ -194,26 +211,7 @@ frappe.search.AwesomeBar = class AwesomeBar {
 
 		$input.on("awesomplete-select", function (e) {
 			var o = e.originalEvent;
-			var value = o.text.value;
-			var item = awesomplete.get_item(value);
-
-			if (item.route_options) {
-				frappe.route_options = item.route_options;
-			}
-
-			if (item.onclick) {
-				item.onclick(item.match);
-			} else {
-				let event = o.originalEvent;
-				if (event.ctrlKey || event.metaKey) {
-					frappe.open_in_new_tab = true;
-				}
-				if (item.route && item.route[0].startsWith("https://")) {
-					window.open(item.route[0], "_blank");
-					return;
-				}
-				frappe.set_route(item.route);
-			}
+			me.open_option(awesomplete.get_item(o.text.value), o.originalEvent);
 			$input.val("");
 			$input.trigger("blur");
 			search_modal.modal("hide");
@@ -229,6 +227,52 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			}
 		});
 	}
+
+	// What the modal lists for `txt`, which has its spaces already squeezed, before any
+	// results from the `awesomebar_search` hook. The search page lists the same.
+	get_options(txt) {
+		const last_space = txt.lastIndexOf(" ");
+		this.global_results = [];
+		this.options = [];
+
+		if (txt.length > 1) {
+			if (last_space !== -1) {
+				this.set_specifics(txt.slice(0, last_space), txt.slice(last_space + 1));
+			}
+			this.add_defaults(txt);
+			this.options = this.options.concat(this.build_options(txt));
+			this.options = this.options.concat(this.global_results);
+		} else {
+			this.options = this.options.concat(
+				this.deduplicate(frappe.search.utils.get_recent_pages(txt))
+			);
+			this.options = this.options.concat(frappe.search.utils.get_frequent_links());
+		}
+
+		return this.deduplicate(this.options);
+	}
+
+	// Go where an option leads. `event` is the click or keypress that picked it.
+	open_option(item, event) {
+		if (item.route_options) {
+			frappe.route_options = item.route_options;
+		}
+
+		if (item.onclick) {
+			item.onclick(item.match);
+		} else if (is_external_url(item.route)) {
+			window.open(first_route(item.route), "_blank");
+		} else if (is_in_app_path(item.route)) {
+			navigate_in_app_path(first_route(item.route), event);
+		} else {
+			if (event.ctrlKey || event.metaKey) {
+				frappe.open_in_new_tab = true;
+			}
+			frappe.route_flags.jump = true;
+			frappe.set_route(item.route);
+		}
+	}
+
 	create_options_with_descriptions(options) {
 		let options_with_desc = {};
 		options.forEach((opt) => {
@@ -265,13 +309,13 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			.concat(
 				frappe.search.utils.get_search_in_list(txt),
 				frappe.search.utils.get_doctypes(txt),
+				frappe.search.utils.get_doctype_layouts(txt),
 				frappe.search.utils.get_reports(txt),
 				frappe.search.utils.get_pages(txt),
-				frappe.search.utils.get_desktop_icons(txt),
+				frappe.search.utils.get_workspaces(txt),
 				frappe.search.utils.get_dashboards(txt),
 				frappe.search.utils.get_recent_pages(txt || ""),
-				frappe.search.utils.get_executables(txt),
-				frappe.search.utils.get_marketplace_apps(txt)
+				frappe.search.utils.get_executables(txt)
 			);
 		if (txt.charAt(0) === "#") {
 			options = frappe.tags.utils.get_tags(txt);
@@ -316,6 +360,32 @@ frappe.search.AwesomeBar = class AwesomeBar {
 
 	set_global_results(global_results, txt) {
 		this.global_results = this.global_results.concat(global_results);
+	}
+
+	// Results apps add through the `awesomebar_search` hook. Fetched, so they arrive late.
+	get_hook_results(txt) {
+		return frappe
+			.call({ method: "frappe.desk.search.awesomebar_search", args: { txt } })
+			.then((r) => r.message || []);
+	}
+
+	merge_hook_results(options, results) {
+		return this.deduplicate(options.concat(results)).sort((a, b) => b.index - a.index);
+	}
+
+	fetch_hook_results(txt, seq) {
+		this.get_hook_results(txt).then((results) => {
+			if (seq !== this._hook_search_seq || !results.length) return;
+			this.options = this.merge_hook_results(this.options, results);
+			$(this.awesomplete.ul).toggleClass("p-0 m-0", cint(this.options?.length) == 0);
+			this.search_modal
+				.find(".cool-awesomebar-modal-footer")
+				.toggleClass("hide", cint(this.options?.length) == 0);
+			this.awesomplete.options_with_desc = this.create_options_with_descriptions(
+				this.options
+			);
+			this.awesomplete.list = this.options;
+		});
 	}
 
 	make_global_search(txt) {
@@ -447,4 +517,58 @@ frappe.search.AwesomeBar = class AwesomeBar {
 			});
 		}
 	}
+
+	setup_correct_button(wrapper) {
+		$(wrapper).find("#full-search-button").toggleClass("hidden", frappe.is_mobile());
+	}
+	setup_page_change_event() {
+		const me = this;
+		$(document).on("page-change", function (event, data) {
+			me.setup_correct_button(data);
+		});
+
+		$(document).on("form-refresh", function (event, data) {
+			me.setup_correct_button(data.wrapper);
+		});
+	}
 };
+
+function first_route(route) {
+	return Array.isArray(route) ? route[0] : route;
+}
+
+function is_external_url(route) {
+	const first = first_route(route);
+	return (
+		typeof first === "string" && (first.startsWith("https://") || first.startsWith("http://"))
+	);
+}
+
+function is_in_app_path(route) {
+	const first = first_route(route);
+	return typeof first === "string" && first.startsWith("/") && !first.startsWith("//");
+}
+
+function is_desk_path(path) {
+	const pathname = path.split(/[?#]/)[0];
+	return (
+		pathname === "/desk" ||
+		pathname.startsWith("/desk/") ||
+		pathname === "/app" ||
+		pathname.startsWith("/app/")
+	);
+}
+
+function navigate_in_app_path(path, event) {
+	if (is_desk_path(path)) {
+		if (event.ctrlKey || event.metaKey) {
+			frappe.open_in_new_tab = true;
+		}
+		frappe.route_flags.jump = true;
+		frappe.set_route(path);
+	} else if (event.ctrlKey || event.metaKey) {
+		window.open(path, "_blank");
+	} else {
+		window.location.href = path;
+	}
+}

@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING
 import frappe
 import frappe.share
 from frappe import _dict
-from frappe.boot import get_allowed_reports
+from frappe.app_state import get_disabled_modules
 from frappe.core.doctype.domain_settings.domain_settings import get_active_modules
+from frappe.desk.desk_views import DeskViews
 from frappe.permissions import AUTOMATIC_ROLES, get_rights, get_roles, get_valid_perms
 from frappe.query_builder import DocType, Order
 from frappe.query_builder.functions import Concat_ws
@@ -77,6 +78,7 @@ class UserPermissions:
 		self.doctype_map = {}
 
 		active_domains = frappe.get_active_domains()
+		disabled_modules = get_disabled_modules()
 		all_doctypes = frappe.get_all(
 			"DocType",
 			fields=[
@@ -91,6 +93,9 @@ class UserPermissions:
 		)
 
 		for dt in all_doctypes:
+			if dt.module in disabled_modules:
+				continue
+
 			if not dt.restrict_to_domain or (dt.restrict_to_domain in active_domains):
 				self.doctype_map[dt["name"]] = dt
 
@@ -159,7 +164,7 @@ class UserPermissions:
 			if p.get("read") or p.get("write") or p.get("create"):
 				if p.get("report"):
 					self.can_get_report.append(dt)
-				for key in ("import", "export", "print", "email"):
+				for key in ("import", "print", "email"):
 					if p.get(key):
 						getattr(self, "can_" + key).append(dt)
 
@@ -173,6 +178,9 @@ class UserPermissions:
 							pass
 						else:
 							self.allow_modules.append(dtp.get("module"))
+
+				if p.get("export"):
+					self.can_export.append(dt)
 
 		self.can_write += self.can_create
 		self.can_write += self.in_create
@@ -216,6 +224,27 @@ class UserPermissions:
 			self.build_permissions()
 		return self.can_read
 
+	def load_user_default_workspace(self):
+		"""
+		Note: ideally it should leverage existing `load_user` routine, through some specific flag aka `workspace_only` (aka ability to query only a specific attribute as required).
+		"""
+		user_data = frappe.db.get_value("User", self.name, ["default_workspace"], as_dict=True)
+		if user_data is None:
+			# NOTE: `user_data` shouldn't be None, as both "User" (as table) and "self.name" (as column) are expected to be Present always ??
+			return None
+
+		if user_data.get("default_workspace"):
+			try:
+				workspace = frappe.get_cached_doc("Workspace", user_data.default_workspace)
+				user_data.default_workspace = {
+					"name": workspace.name,
+					"public": workspace.public,
+					"title": workspace.title,
+				}
+			except frappe.DoesNotExistError:
+				user_data.default_workspace = None
+		return user_data.default_workspace
+
 	def load_user(self):
 		d = frappe.db.get_value(
 			"User",
@@ -233,6 +262,7 @@ class UserPermissions:
 				"mute_sounds",
 				"show_absolute_datetime_in_timeline",
 				"send_me_a_copy",
+				"send_read_receipt",
 				"user_type",
 				"onboarding_status",
 				"default_workspace",
@@ -279,11 +309,12 @@ class UserPermissions:
 		):
 			d[key] = list(set(getattr(self, key)))
 
-		d.all_reports = self.get_all_reports()
+		# not `all_reports`: `DeskViews` already puts the identical dict on `bootinfo` as
+		# `allowed_reports`, and shipping it twice cost ~47 KB of every boot payload.
 		return d
 
 	def get_all_reports(self):
-		return get_allowed_reports()
+		return DeskViews.get_allowed_reports()
 
 
 def get_user_fullname(user: str) -> str:

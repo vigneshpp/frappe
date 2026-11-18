@@ -5,6 +5,7 @@
  "creation": "2014-07-11 17:18:09.923399",
  "doctype": "DocType",
  "document_type": "System",
+ "documentation": "https://docs.frappe.io/framework/notifications",
  "engine": "InnoDB",
  "field_order": [
   "enabled",
@@ -12,9 +13,8 @@
   "module",
   "column_break_2",
   "channel",
-  "slack_webhook_url",
+  "notification_webhook_url",
   "filters_section",
-  "subject",
   "event",
   "document_type",
   "col_break_1",
@@ -27,6 +27,7 @@
   "value_changed",
   "sender",
   "send_system_notification",
+  "notification_type",
   "sender_email",
   "section_break_9",
   "condition_type",
@@ -42,6 +43,8 @@
   "send_to_all_assignees",
   "recipients",
   "message_sb",
+  "email_template",
+  "subject",
   "message_type",
   "message",
   "message_examples",
@@ -70,18 +73,18 @@
    "fieldname": "channel",
    "fieldtype": "Select",
    "label": "Channel",
-   "options": "Email\nSlack\nSystem Notification\nSMS",
+   "options": "Email\nWebhook\nSystem Notification\nSMS",
    "reqd": 1,
    "set_only_once": 1
   },
   {
-   "depends_on": "eval:doc.channel=='Slack'",
-   "description": "To use Slack Channel, add a <a href=\"#List/Slack%20Webhook%20URL/List\" rel=\"noopener noreferrer\">Slack Webhook URL</a>.",
-   "fieldname": "slack_webhook_url",
+   "depends_on": "eval:doc.channel=='Webhook'",
+   "description": "Add a <a href=\"/desk/notification-webhook-url\">Notification Webhook URL</a> provided by your notification service.",
+   "fieldname": "notification_webhook_url",
    "fieldtype": "Link",
-   "label": "Slack Channel",
-   "mandatory_depends_on": "eval:doc.channel=='Slack'",
-   "options": "Slack Webhook URL"
+   "label": "Notification Webhook URL",
+   "mandatory_depends_on": "eval:doc.channel=='Webhook'",
+   "options": "Notification Webhook URL"
   },
   {
    "fieldname": "filters",
@@ -90,16 +93,6 @@
    "label": "Filters",
    "options": "JSON",
    "read_only": 1
-  },
-  {
-   "depends_on": "eval: in_list(['Email', 'Slack', 'System Notification'], doc.channel)",
-   "description": "For a dynamic subject, use Jinja tags like this: <code>{{ doc.name }} Delivered</code>",
-   "fieldname": "subject",
-   "fieldtype": "Data",
-   "ignore_xss_filter": 1,
-   "in_list_view": 1,
-   "label": "Subject",
-   "mandatory_depends_on": "eval: in_list(['Email', 'Slack', 'System Notification'], doc.channel)"
   },
   {
    "fieldname": "document_type",
@@ -222,7 +215,7 @@
    "label": "Value To Be Set"
   },
   {
-   "depends_on": "eval:doc.channel !=\"Slack\"",
+   "depends_on": "eval:doc.channel !=\"Webhook\"",
    "fieldname": "column_break_5",
    "fieldtype": "Section Break",
    "label": "Recipients"
@@ -231,16 +224,35 @@
    "fieldname": "recipients",
    "fieldtype": "Table",
    "label": "Recipients",
-   "mandatory_depends_on": "eval:doc.channel!=='Slack' && !doc.send_to_all_assignees",
+   "mandatory_depends_on": "eval:doc.channel!=='Webhook' && !doc.send_to_all_assignees",
    "options": "Notification Recipient"
   },
   {
    "fieldname": "message_sb",
    "fieldtype": "Section Break",
-   "label": "Message"
+   "label": "Content"
+  },
+  {
+   "depends_on": "eval: doc.channel == 'Email'",
+   "description": "Send this notification's content from an Email Template instead of Subject/Message.",
+   "fieldname": "email_template",
+   "fieldtype": "Link",
+   "label": "Email Template",
+   "options": "Email Template"
+  },
+  {
+   "depends_on": "eval: in_list(['Email', 'Webhook', 'System Notification'], doc.channel) && !doc.email_template",
+   "description": "For a dynamic subject, use Jinja tags like this: <code>{{ doc.name }} Delivered</code>",
+   "fieldname": "subject",
+   "fieldtype": "Data",
+   "ignore_xss_filter": 1,
+   "in_list_view": 1,
+   "label": "Subject",
+   "mandatory_depends_on": "eval: in_list(['Email', 'Webhook', 'System Notification'], doc.channel) && !doc.email_template"
   },
   {
    "default": "Add your message here",
+   "depends_on": "eval: !doc.email_template",
    "fieldname": "message",
    "fieldtype": "Code",
    "ignore_xss_filter": 1,
@@ -285,6 +297,15 @@
    "fieldname": "send_system_notification",
    "fieldtype": "Check",
    "label": "Send System Notification"
+  },
+  {
+   "default": "Alert",
+   "depends_on": "eval: doc.channel === 'System Notification' || doc.send_system_notification",
+   "description": "Category for the in-app notification. Used for filtering and per-user email preferences.",
+   "fieldname": "notification_type",
+   "fieldtype": "Link",
+   "label": "Notification Type",
+   "options": "Notification Type"
   },
   {
    "default": "0",
@@ -360,10 +381,10 @@
   }
  ],
  "grid_page_length": 50,
- "icon": "fa fa-envelope",
+ "icon": "bell-dot",
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-04-22 15:37:19.355265",
+ "modified": "2026-10-07 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Email",
  "name": "Notification",

@@ -8,6 +8,7 @@ $.extend(frappe.model, {
 		"Autocomplete",
 		"Attach",
 		"Attach Image",
+		"Attachment Gallery",
 		"Barcode",
 		"Button",
 		"Check",
@@ -44,12 +45,14 @@ $.extend(frappe.model, {
 		"Text",
 		"Text Editor",
 		"Time",
+		"Vue Component",
 	],
 
 	no_value_type: [
 		"Section Break",
 		"Column Break",
 		"Tab Break",
+		"Attachment Gallery",
 		"HTML",
 		"Table",
 		"Table MultiSelect",
@@ -57,6 +60,7 @@ $.extend(frappe.model, {
 		"Image",
 		"Fold",
 		"Heading",
+		"Vue Component",
 	],
 
 	layout_fields: ["Section Break", "Column Break", "Tab Break", "Fold"],
@@ -68,7 +72,6 @@ $.extend(frappe.model, {
 		"modified",
 		"modified_by",
 		"_user_tags",
-		"_comments",
 		"_assign",
 		"_liked_by",
 		"docstatus",
@@ -132,12 +135,12 @@ $.extend(frappe.model, {
 		},
 		{ fieldname: "_user_tags", fieldtype: "Data", label: __("Tags") },
 		{ fieldname: "_liked_by", fieldtype: "Data", label: __("Liked By") },
-		{ fieldname: "_comments", fieldtype: "Text", label: __("Comments") },
 		{ fieldname: "_assign", fieldtype: "Text", label: __("Assigned To") },
 		{ fieldname: "docstatus", fieldtype: "Int", label: __("Document Status") },
 	],
 
 	numeric_fieldtypes: ["Int", "Float", "Currency", "Percent", "Duration"],
+	plain_text_fieldtypes: ["Data", "Long Text", "Small Text", "Text", "Password", "MultiSelect"],
 
 	std_fields_table: [{ fieldname: "parent", fieldtype: "Data", label: __("Parent") }],
 
@@ -275,7 +278,15 @@ $.extend(frappe.model, {
 			// meta has sugar, like __js and other properties that doc won't have
 			frappe.meta.__doctype_meta = JSON.parse(JSON.stringify(meta));
 		}
-		for (const asset_key of ["__list_js", "__custom_list_js", "__calendar_js", "__tree_js"]) {
+		// custom scripts run last so they can override the standard
+		// definitions for any view, calendar included (#37460)
+		for (const asset_key of [
+			"__list_js",
+			"__calendar_js",
+			"__tree_js",
+			"__kanban_js",
+			"__custom_list_js",
+		]) {
 			if (meta[asset_key]) {
 				new Function(meta[asset_key])();
 			}
@@ -286,17 +297,19 @@ $.extend(frappe.model, {
 		}
 	},
 
-	with_doc: function (doctype, name, callback) {
-		return new Promise((resolve) => {
+	with_doc: function (doctype, name, callback, error_callback) {
+		return new Promise((resolve, reject) => {
 			if (!name) name = doctype; // single type
-			if (
+			const use_cache =
+				!error_callback &&
 				locals[doctype] &&
 				locals[doctype][name] &&
-				frappe.model.get_docinfo(doctype, name)
-			) {
+				frappe.model.get_docinfo(doctype, name);
+			if (use_cache) {
 				callback && callback(name);
 				resolve(frappe.get_doc(doctype, name));
 			} else {
+				let permission_denied = false;
 				return frappe.call({
 					method: "frappe.desk.form.load.getdoc",
 					type: "GET",
@@ -307,6 +320,18 @@ $.extend(frappe.model, {
 					callback: function (r) {
 						callback && callback(name, r);
 						resolve(frappe.get_doc(doctype, name));
+					},
+					error_handlers: {
+						PermissionError: () => {
+							permission_denied = true;
+						},
+					},
+					error: function (r) {
+						if (permission_denied) {
+							frappe.model.remove_from_locals(doctype, name);
+						}
+						error_callback && error_callback(r, permission_denied);
+						reject(r);
 					},
 				});
 			}
@@ -435,13 +460,32 @@ $.extend(frappe.model, {
 		return frappe.boot.user.can_print.indexOf(doctype) !== -1;
 	},
 
+	// whether a document in this docstatus is printable at all, per Print Settings
+	// (submitted documents always are; draft/cancelled only if explicitly allowed)
+	can_print_docstatus: function (doctype, docstatus) {
+		if (!frappe.model.is_submittable(doctype) || docstatus == 1) return true;
+
+		const print_settings = frappe.model.get_doc(":Print Settings", "Print Settings") || {};
+		if (docstatus == 2) return !!cint(print_settings.allow_print_for_cancelled);
+		if (docstatus == 0) return !!cint(print_settings.allow_print_for_draft);
+		return false;
+	},
+
+	can_print_doc: function (frm) {
+		return !!(
+			frappe.model.can_print_docstatus(frm.doc.doctype, frm.doc.docstatus) &&
+			frappe.model.can_print(null, frm) &&
+			!frm.meta.issingle
+		);
+	},
+
 	can_email: function (doctype, frm) {
 		if (frm) return frm.perm[0].email === 1;
 		return frappe.boot.user.can_email.indexOf(doctype) !== -1;
 	},
 
 	can_share: function (doctype, frm) {
-		let disable_sharing = cint(frappe.sys_defaults.disable_document_sharing);
+		let disable_sharing = frappe.defaults.is_enabled("disable_document_sharing");
 
 		if (disable_sharing && frappe.session.user !== "Administrator") {
 			return false;
@@ -651,7 +695,7 @@ $.extend(frappe.model, {
 		}
 		let meta = frappe.get_meta(doc.doctype);
 		if (meta.title_field) {
-			return this.get_title_from_title_field(doc, meta);
+			return this.get_title_from_title_field(doc, meta) || String(doc.name);
 		} else {
 			return String(doc.name);
 		}
@@ -718,24 +762,30 @@ $.extend(frappe.model, {
 				title = `${value} (${docname})`;
 			}
 		}
-		frappe.confirm(__("Permanently delete {0}?", [title.bold()]), function () {
-			return frappe.call({
-				method: "frappe.client.delete",
-				args: {
-					doctype: doctype,
-					name: docname,
-				},
-				freeze: true,
-				freeze_message: __("Deleting {0}...", [title]),
-				callback: function (r, rt) {
-					if (!r.exc) {
-						frappe.utils.play_sound("delete");
-						frappe.model.clear_doc(doctype, docname);
-						if (callback) callback(r, rt);
-					}
-				},
-			});
-		});
+		// destructive: red primary via frappe.warn, not a neutral confirm
+		frappe.warn(
+			__("Confirm"),
+			__("Permanently delete {0}?", [title.bold()]),
+			function () {
+				return frappe.call({
+					method: "frappe.client.delete",
+					args: {
+						doctype: doctype,
+						name: docname,
+					},
+					freeze: true,
+					freeze_message: __("Deleting {0}...", [title]),
+					callback: function (r, rt) {
+						if (!r.exc) {
+							frappe.utils.play_sound("delete");
+							frappe.model.delete_from_locals(doctype, docname);
+							if (callback) callback(r, rt);
+						}
+					},
+				});
+			},
+			__("Delete")
+		);
 	},
 
 	rename_doc: function (doctype, docname, callback) {
@@ -757,10 +807,8 @@ $.extend(frappe.model, {
 			],
 		});
 
-		d.set_primary_action(__("Rename"), function () {
+		d.set_primary_action(__("Rename"), function (args) {
 			d.hide();
-			var args = d.get_values();
-			if (!args) return;
 			return frappe.call({
 				method: "frappe.rename_doc",
 				freeze: true,
@@ -774,13 +822,17 @@ $.extend(frappe.model, {
 				btn: d.get_primary_btn(),
 				callback: function (r, rt) {
 					if (!r.exc) {
+						frappe.model.rename_doc_in_locals(
+							doctype,
+							docname,
+							r.message || args.new_name,
+							args.merge
+						);
 						$(document).trigger("rename", [
 							doctype,
 							docname,
 							r.message || args.new_name,
 						]);
-						if (locals[doctype] && locals[doctype][docname])
-							delete locals[doctype][docname];
 						d.hide();
 						if (callback) callback(r.message);
 					}
@@ -810,7 +862,11 @@ $.extend(frappe.model, {
 			frappe.throw(
 				__("Please specify") +
 					": " +
-					__(frappe.meta.get_label(doc.doctype, fieldname, doc.parent || doc.name))
+					frappe.meta.get_translated_label(
+						doc.doctype,
+						fieldname,
+						doc.parent || doc.name
+					)
 			);
 		}
 	},

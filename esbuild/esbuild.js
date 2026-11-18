@@ -1,6 +1,9 @@
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
+const { spawn } = require("child_process");
 const glob = require("fast-glob");
+const { update_assets_json } = require("./assets_json");
 const esbuild = require("esbuild");
 const vue = require("esbuild-plugin-vue3");
 const yargs = require("yargs");
@@ -8,11 +11,10 @@ const cliui = require("cliui")();
 const chalk = require("chalk");
 const html_plugin = require("./frappe-html");
 const vue_style_plugin = require("./frappe-vue-style");
-const rtlcss = require("rtlcss");
-const postCssPlugin = require("@frappe/esbuild-plugin-postcss2").default;
+const style_plugin = require("./style-plugin");
+const { derive_rtl_styles } = require("./derive-rtl");
 const ignore_assets = require("./ignore-assets");
-const sass_options = require("./sass_options");
-const build_cleanup_plugin = require("./build-cleanup");
+const build_cleanup_plugin = require("./build-cleanup").plugin;
 
 const {
 	app_list,
@@ -32,10 +34,6 @@ const argv = yargs
 	.option("apps", {
 		type: "string",
 		description: "Run build for specific apps",
-	})
-	.option("skip_frappe", {
-		type: "boolean",
-		description: "Skip building frappe assets",
 	})
 	.option("files", {
 		type: "string",
@@ -72,6 +70,10 @@ const argv = yargs
 		type: "string",
 		description: "Specifies the target of the build output.",
 	})
+	.option("verbose", {
+		type: "boolean",
+		description: "Print detailed build output",
+	})
 	.example("node esbuild --apps frappe,erpnext", "Run build only for frappe and erpnext")
 	.example(
 		"node esbuild --files frappe/website.bundle.js,frappe/desk.bundle.js",
@@ -79,14 +81,16 @@ const argv = yargs
 	)
 	.version(false).argv;
 
-const APPS = (!argv.apps ? app_list : argv.apps.split(",")).filter(
-	(app) => !(argv.skip_frappe && app == "frappe")
-);
+const APPS = !argv.apps ? app_list : argv.apps.split(",");
 const FILES_TO_BUILD = argv.files ? argv.files.split(",") : [];
 const WATCH_MODE = Boolean(argv.watch);
 const PRODUCTION = Boolean(argv.production);
 const RUN_BUILD_COMMAND = !WATCH_MODE && Boolean(argv["run-build-command"]);
-const ESBUILD_TARGET = argv["esbuild-target"] || "es2017";
+const ESBUILD_TARGET = argv["esbuild-target"] || "es2020";
+// Allow VERBOSE to be inherited by nested esbuild invocations (per-app
+// build) via the environment; CLI flag propagation through yarn run breaks
+// chained scripts like `yarn copy && cp`.
+const VERBOSE = Boolean(argv.verbose) || process.env.FRAPPE_BUILD_VERBOSE === "1";
 
 const TOTAL_BUILD_TIME = `${chalk.black.bgGreen(" DONE ")} Total Build Time`;
 const NODE_PATHS = [].concat(
@@ -96,9 +100,15 @@ const NODE_PATHS = [].concat(
 	app_list.map((app) => path.resolve(apps_path, app)).filter(fs.existsSync)
 );
 const USING_CACHED = Boolean(argv["using-cached"]);
+// In non-verbose mode we only keep the tail of child-process output so failed
+// builds still have actionable context without growing unbounded. Verbose mode
+// uses Infinity to preserve the full log for serialized flushing.
+const MAX_OUTPUT_BUFFER = 20000;
 
 execute().catch((e) => {
-	console.error(e);
+	if (!e?.reported) {
+		console.error(e);
+	}
 	process.exit(1);
 });
 
@@ -130,16 +140,29 @@ async function execute() {
 	}
 
 	if (!WATCH_MODE) {
-		log_built_assets(results);
-		console.timeEnd(TOTAL_BUILD_TIME);
-		log();
+		if (VERBOSE) {
+			log_built_assets(results);
+			console.timeEnd(TOTAL_BUILD_TIME);
+			log();
+		} else {
+			console.timeEnd(TOTAL_BUILD_TIME);
+		}
 	} else {
 		log("Watching for changes...");
 	}
 	for (const result of results) {
 		await write_assets_json(result.metafile);
 	}
-	RUN_BUILD_COMMAND && run_build_command_for_apps(APPS);
+	if (RUN_BUILD_COMMAND) {
+		await run_build_command_for_apps(APPS);
+		if (APPS.includes("frappe")) {
+			await run_frontend_build(
+				"studio",
+				path.resolve(__dirname, "..", "studio", "frontend")
+			);
+			await run_frontend_build("flow", path.resolve(__dirname, "..", "flow"));
+		}
+	}
 	if (!WATCH_MODE) {
 		process.exit(0);
 	}
@@ -204,7 +227,6 @@ function build_assets_for_apps(apps, files) {
 
 		let file_map = {};
 		let style_file_map = {};
-		let rtl_style_file_map = {};
 		for (let file of files) {
 			let relative_app_path = path.relative(apps_path, file);
 			let app = relative_app_path.split(path.sep)[0];
@@ -226,7 +248,6 @@ function build_assets_for_apps(apps, files) {
 			}
 			if ([".css", ".scss", ".less", ".sass", ".styl"].includes(extension)) {
 				style_file_map[output_name] = file;
-				rtl_style_file_map[output_name.replace("/css/", "/css-rtl/")] = file;
 			} else {
 				file_map[output_name] = file;
 			}
@@ -235,16 +256,20 @@ function build_assets_for_apps(apps, files) {
 			files: file_map,
 			outdir: output_path,
 		});
+		// RTL stylesheets are derived from the compiled LTR CSS instead of
+		// compiling every .bundle.scss a second time. Watch-mode rebuilds derive
+		// again in watch_plugin's onEnd.
 		let style_build = build_style_files({
 			files: style_file_map,
 			outdir: output_path,
+		}).then(async (result) => {
+			let rtl_result = await derive_rtl_styles(result.metafile);
+			return rtl_result ? [result, rtl_result] : [result];
 		});
-		let rtl_style_build = build_style_files({
-			files: rtl_style_file_map,
-			outdir: output_path,
-			rtl_style: true,
-		});
-		return Promise.all([build, style_build, rtl_style_build]);
+		return Promise.all([build, style_build]).then(([build_result, style_results]) => [
+			build_result,
+			...style_results,
+		]);
 	});
 }
 
@@ -291,28 +316,44 @@ function get_files_to_build(files) {
 }
 
 function build_files({ files, outdir }) {
-	let build_plugins = [vue(), html_plugin, build_cleanup_plugin, vue_style_plugin];
-	return esbuild.build(get_build_options(files, outdir, build_plugins));
+	// vue_style before cleanup: it re-hashes bundle filenames after inlining
+	// css, and cleanup must judge staleness against the renamed metafile
+	let build_plugins = [vue(), html_plugin, vue_style_plugin, build_cleanup_plugin];
+	if (WATCH_MODE) build_plugins.push(watch_plugin);
+	return build_or_watch(get_build_options(files, outdir, build_plugins));
 }
 
-function build_style_files({ files, outdir, rtl_style = false }) {
-	let plugins = [];
-	if (rtl_style) {
-		plugins.push(rtlcss);
+function build_style_files({ files, outdir }) {
+	let build_plugins = [ignore_assets, build_cleanup_plugin, style_plugin];
+
+	if (WATCH_MODE) build_plugins.push(watch_plugin);
+	let options = get_build_options(files, outdir, build_plugins);
+	// Keep /*!rtl:...*/ control comments (ignore/raw blocks) in place so
+	// derive-rtl.js can honor them; esbuild strips regular comments and moves
+	// legal comments to EOF by default.
+	options.legalComments = "inline";
+	return build_or_watch(options);
+}
+
+// As of esbuild 0.17 the `watch`/`incremental` build options and the
+// `onRebuild` callback were removed in favour of the context API. In watch
+// mode we create a context, run the initial build via rebuild() (so callers
+// still get a result with a metafile), and then start watching. Rebuilds are
+// handled by `watch_plugin` via the onEnd hook.
+async function build_or_watch(options) {
+	if (!WATCH_MODE) {
+		return esbuild.build(options);
 	}
-
-	let build_plugins = [
-		ignore_assets,
-		build_cleanup_plugin,
-		postCssPlugin({
-			plugins: plugins,
-			sassOptions: sass_options,
-		}),
-	];
-
-	plugins.push(require("autoprefixer"));
-	return esbuild.build(get_build_options(files, outdir, build_plugins));
+	let context = await esbuild.context(options);
+	let result = await context.rebuild();
+	await context.watch();
+	return result;
 }
+
+// The `@framework/ui` package, as an app's frontend imports it. It ships raw
+// source and lives inside this repo, so desk code reaches it by the same
+// specifier instead of counting `../` up out of a bundle directory.
+const FRAMEWORK_UI_PATH = path.resolve(__dirname, "..", "ui");
 
 function get_build_options(files, outdir, plugins) {
 	return {
@@ -325,50 +366,76 @@ function get_build_options(files, outdir, plugins) {
 		metafile: true,
 		minify: PRODUCTION,
 		nodePaths: NODE_PATHS,
+		alias: {
+			"@framework/ui": FRAMEWORK_UI_PATH,
+		},
 		define: {
 			"process.env.NODE_ENV": JSON.stringify(PRODUCTION ? "production" : "development"),
 			__VUE_OPTIONS_API__: JSON.stringify(true),
 			__VUE_PROD_DEVTOOLS__: JSON.stringify(false),
 		},
 		plugins: plugins,
-		watch: get_watch_config(),
 	};
 }
 
-function get_watch_config() {
-	if (WATCH_MODE) {
-		return {
-			async onRebuild(error, result) {
-				if (error) {
-					log_error("There was an error during rebuilding changes.");
-					log();
-					log(chalk.dim(error.stack));
-					notify_redis({ error });
-				} else {
-					let { new_assets_json, prev_assets_json } = await write_assets_json(
-						result.metafile
-					);
+// Replaces the old `onRebuild` watch callback (removed in esbuild 0.17). The
+// onEnd hook fires after every build, so the first invocation (the initial
+// build, whose assets.json is written by execute()) is skipped; subsequent
+// rebuilds update assets.json and notify the browser.
+const watch_plugin = {
+	name: "frappe-watch",
+	setup(build) {
+		let first_build = true;
+		build.onEnd(async (result) => {
+			if (first_build) {
+				first_build = false;
+				return;
+			}
 
-					let changed_files;
-					if (prev_assets_json) {
-						changed_files = get_rebuilt_assets(prev_assets_json, new_assets_json);
-
-						let timestamp = new Date().toLocaleTimeString();
-						let message = `${timestamp}: Compiled ${changed_files.length} files...`;
-						log(chalk.yellow(message));
-						for (let filepath of changed_files) {
-							let filename = path.basename(filepath);
-							log("    " + filename);
-						}
-						log();
-					}
-					notify_redis({ success: true, changed_files });
+			if (result.errors.length) {
+				log_error("There was an error during rebuilding changes.");
+				log();
+				let error = {
+					errors: result.errors,
+					stack: result.errors.map((e) => e.text).join("\n"),
+				};
+				log(chalk.dim(error.stack));
+				notify_redis({ error });
+			} else {
+				let metafiles = [result.metafile];
+				// Style rebuilds must re-derive the RTL variants before
+				// assets-rtl.json is written (no-op for the JS build).
+				let rtl_result = await derive_rtl_styles(result.metafile);
+				if (rtl_result) {
+					metafiles.push(rtl_result.metafile);
 				}
-			},
-		};
-	}
-	return null;
-}
+
+				let changed_files;
+				for (let metafile of metafiles) {
+					let { new_assets_json, prev_assets_json } = await write_assets_json(metafile);
+					if (prev_assets_json) {
+						changed_files = changed_files || [];
+						changed_files.push(
+							...get_rebuilt_assets(prev_assets_json, new_assets_json)
+						);
+					}
+				}
+
+				if (changed_files) {
+					let timestamp = new Date().toLocaleTimeString();
+					let message = `${timestamp}: Compiled ${changed_files.length} files...`;
+					log(chalk.yellow(message));
+					for (let filepath of changed_files) {
+						let filename = path.basename(filepath);
+						log("    " + filename);
+					}
+					log();
+				}
+				notify_redis({ success: true, changed_files });
+			}
+		});
+	},
+};
 
 function log_built_assets(results) {
 	let outputs = {};
@@ -435,33 +502,46 @@ function log_built_assets(results) {
 	log(cliui.toString());
 }
 
-// to store previous build's assets.json for comparison
-let prev_assets_json;
-let curr_assets_json;
+// previous build's assets(-rtl).json contents, keyed per file, for comparison
+let assets_json_history = {};
 
 async function write_assets_json(metafile) {
 	let rtl = false;
-	prev_assets_json = curr_assets_json;
 	let out = {};
 	for (let output in metafile.outputs) {
 		let info = metafile.outputs[output];
 		let asset_path = "/" + path.relative(sites_path, output);
 		if (info.entryPoint) {
 			let key = path.basename(info.entryPoint);
+			// Style bundles are keyed by their compiled extension: the
+			// desk.bundle.scss entry point is "desk.bundle.css" in assets.json.
+			if (asset_path.endsWith(".css")) {
+				key = key.replace(/\.(scss|sass|less|styl|css)$/, ".css");
+			}
 			if (key.endsWith(".css") && asset_path.includes("/css-rtl/")) {
 				rtl = true;
 				key = `rtl_${key}`;
+			} else if (out[key]) {
+				log_warn(
+					`${key} is built from more than one entry point, only ${asset_path} is served ` +
+						`instead of ${out[key]}. Bundle names must be unique across apps.`
+				);
 			}
 			out[key] = asset_path;
 		}
 	}
 
-	let { obj: assets_json, path: assets_json_path } = await get_assets_json_path_and_obj(rtl);
-	// update with new values
-	let new_assets_json = Object.assign({}, assets_json, out);
-	curr_assets_json = new_assets_json;
+	const assets_json_path = get_assets_json_path(rtl);
+	const { next: new_assets_json } = await update_assets_json(
+		assets_json_path,
+		(assets_json) => ({
+			...assets_json,
+			...out,
+		})
+	);
+	let prev_assets_json = assets_json_history[assets_json_path];
+	assets_json_history[assets_json_path] = new_assets_json;
 
-	await fs.promises.writeFile(assets_json_path, JSON.stringify(new_assets_json, null, 4));
 	await update_assets_json_in_cache();
 	if (argv["save-metafiles"]) {
 		// use current timestamp in readable formate as a suffix for filename
@@ -487,17 +567,19 @@ async function update_assets_json_in_cache() {
 	// handle error event to avoid printing stack traces
 	try {
 		await client.connect();
+		await client.del("assets_json");
+		await client.quit();
 	} catch (e) {
 		log_warn("Cannot connect to redis_cache to update assets_json");
 	}
-	client.del("assets_json", (err) => {
-		client.unref();
-	});
+}
+
+function get_assets_json_path(is_rtl) {
+	return path.resolve(assets_path, is_rtl ? "assets-rtl.json" : "assets.json");
 }
 
 async function get_assets_json_path_and_obj(is_rtl) {
-	const file_name = is_rtl ? "assets-rtl.json" : "assets.json";
-	const assets_json_path = path.resolve(assets_path, file_name);
+	const assets_json_path = get_assets_json_path(is_rtl);
 	let assets_json;
 	try {
 		assets_json = await fs.promises.readFile(assets_json_path, "utf-8");
@@ -508,16 +590,52 @@ async function get_assets_json_path_and_obj(is_rtl) {
 	return { obj: assets_json, path: assets_json_path };
 }
 
-function run_build_command_for_apps(apps) {
-	let cwd = process.cwd();
-	let { execSync } = require("child_process");
+function get_build_concurrency(app_count) {
+	const raw = process.env.FRAPPE_BUILD_CONCURRENCY?.trim();
+	if (raw) {
+		const env_limit = Number(raw);
+		if (Number.isInteger(env_limit)) {
+			if (env_limit === 0) {
+				return Math.min(1, app_count);
+			}
+			if (env_limit > 0) {
+				return Math.min(env_limit, app_count);
+			}
+		}
+	}
+	const cpu_limit = Math.max(1, Math.floor(os.cpus().length / 2));
+	return Math.min(cpu_limit, app_count);
+}
 
+// Track running app-build children so failures or signals can terminate all of
+// them together and avoid orphaned processes.
+const BUILD_CHILDREN = new Set();
+
+function register_build_signal_handlers() {
+	const exit_after_cleanup = (exit_code) => {
+		terminate_build_children().finally(() => process.exit(exit_code));
+	};
+
+	const on_sigint = () => exit_after_cleanup(130);
+	const on_sigterm = () => exit_after_cleanup(143);
+
+	process.once("SIGINT", on_sigint);
+	process.once("SIGTERM", on_sigterm);
+
+	return () => {
+		process.removeListener("SIGINT", on_sigint);
+		process.removeListener("SIGTERM", on_sigterm);
+	};
+}
+
+async function run_build_command_for_apps(apps) {
+	BUILD_CHILDREN.clear();
+	const build_apps = [];
 	for (let app of apps) {
 		if (app === "frappe") continue;
 
 		let root_app_path = path.resolve(apps_path, app);
 		let package_json = path.resolve(root_app_path, "package.json");
-		let node_modules = path.resolve(root_app_path, "node_modules");
 
 		if (!fs.existsSync(package_json)) {
 			continue;
@@ -528,30 +646,304 @@ function run_build_command_for_apps(apps) {
 			continue;
 		}
 
-		process.chdir(root_app_path);
-		if (!fs.existsSync(node_modules)) {
-			log(
-				`\nInstalling dependencies for ${chalk.bold(app)} (because node_modules not found)`
-			);
-			execSync("yarn install --frozen-lockfile", { encoding: "utf8", stdio: "inherit" });
-		}
-
-		log("\nRunning build command for", chalk.bold(app));
-		execSync("yarn build", { encoding: "utf8", stdio: "inherit" });
+		build_apps.push({ app, root_app_path });
 	}
 
-	process.chdir(cwd);
+	if (!build_apps.length) {
+		return;
+	}
+
+	const concurrency = get_build_concurrency(build_apps.length);
+	const execution_mode =
+		concurrency === 1 ? "sequentially" : `in parallel (${concurrency} workers)`;
+	log(`Running build commands for ${build_apps.length} app(s) ${execution_mode}...`);
+
+	const tasks = build_apps.map(
+		({ app, root_app_path }) =>
+			() =>
+				run_app_build(app, root_app_path)
+	);
+
+	const unregister_signal_handlers = register_build_signal_handlers();
+	try {
+		await run_with_concurrency(tasks, concurrency);
+	} catch (error) {
+		await terminate_build_children();
+		const errors = error instanceof AggregateError ? error.errors : [error];
+		for (const err of errors) {
+			log_error(`${err.command} failed for ${err.app || "an app"}`);
+			if (VERBOSE) {
+				// Child output (if any) was already streamed by flush_verbose;
+				// surface the raw error so spawn/ENOENT failures aren't silent.
+				log(chalk.dim(err.stack || err.message || String(err)));
+			} else if (err.output) {
+				log(err.output.trim());
+			}
+		}
+		if (!VERBOSE && errors.some((e) => !e.output)) {
+			log_warn("Run again with --verbose for more details.");
+		}
+		// Prevent the top-level execute().catch from re-dumping the same error:
+		// verbose builds already streamed the child output, and non-verbose builds
+		// just printed a trimmed summary above.
+		error.reported = true;
+		throw error;
+	} finally {
+		unregister_signal_handlers();
+	}
+
+	log("Build commands finished.");
+}
+
+// The studio editor (studio/frontend/) and the flow page (flow/) are vite apps inside this
+// repo, built like app frontends; their output is part of frappe's assets, so a failure fails
+// the build.
+async function run_frontend_build(name, frontend_path) {
+	const unregister_signal_handlers = register_build_signal_handlers();
+	try {
+		await run_app_build(name, frontend_path);
+	} catch (error) {
+		await terminate_build_children();
+		log_error(`${error.command} failed for ${name}`);
+		if (VERBOSE) {
+			log(chalk.dim(error.stack || error.message || String(error)));
+		} else if (error.output) {
+			log(error.output.trim());
+		} else {
+			log_warn("Run again with --verbose for more details.");
+		}
+		error.reported = true;
+		throw error;
+	} finally {
+		unregister_signal_handlers();
+	}
+}
+
+async function run_app_build(app, root_app_path) {
+	const started = Date.now();
+	const commands = get_build_commands(root_app_path);
+	// every build, not only on a fresh checkout: an install made before an update lacks what the
+	// new lockfile adds. The install returns in under a second when it is current
+	await run_command(commands.install, { cwd: root_app_path, app, step: "install" });
+
+	await run_command(commands.build, { cwd: root_app_path, app, step: "build" });
+
+	if (!VERBOSE) {
+		const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+		log(`${chalk.green("✔")} ${chalk.bold(app)} built in ${elapsed}s`);
+	}
+}
+
+// An app with pnpm-lock.yaml installs with pnpm; Yarn 1 cannot read that lockfile or install
+// its workspace: dependencies. Every other app keeps Yarn.
+function get_build_commands(root_app_path) {
+	if (fs.existsSync(path.join(root_app_path, "pnpm-lock.yaml"))) {
+		return {
+			// the build has no terminal, so pnpm must not stop to ask before it recreates node_modules
+			install: "pnpm install --frozen-lockfile --config.confirm-modules-purge=false",
+			build: "pnpm build",
+		};
+	}
+	return { install: "yarn install --frozen-lockfile", build: "yarn build" };
+}
+
+function run_command(command, { cwd, app, step }) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, {
+			cwd,
+			shell: true,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: VERBOSE ? { ...process.env, FRAPPE_BUILD_VERBOSE: "1" } : process.env,
+		});
+
+		BUILD_CHILDREN.add(child);
+
+		const output_buffer = create_output_buffer({
+			max_bytes: VERBOSE ? Infinity : MAX_OUTPUT_BUFFER,
+		});
+		const on_data = (chunk) => output_buffer.append(chunk);
+		if (child.stdout) child.stdout.on("data", on_data);
+		if (child.stderr) child.stderr.on("data", on_data);
+
+		const flush_verbose = () => {
+			if (!VERBOSE || !output_buffer.length) return;
+			const banner = chalk.dim(`──── ${step} · ${chalk.bold(app)} ────`);
+			const text = output_buffer.toString();
+			const trailing = text.endsWith("\n") ? "" : "\n";
+			process.stdout.write(`\n${banner}\n${text}${trailing}`);
+		};
+
+		child.on("error", (error) => {
+			BUILD_CHILDREN.delete(child);
+			flush_verbose();
+			error.app = app;
+			error.command = command;
+			error.output = output_buffer.toString();
+			reject(error);
+		});
+
+		child.on("close", (code, signal) => {
+			BUILD_CHILDREN.delete(child);
+			flush_verbose();
+			if (code === 0) {
+				resolve();
+				return;
+			}
+
+			let exit_details = `exit code ${code}`;
+			if (signal) {
+				exit_details = `signal ${signal}`;
+			} else if (code === null) {
+				exit_details = "unknown exit status";
+			}
+
+			const error = new Error(`${step} command failed for ${app} (${exit_details})`);
+			error.app = app;
+			error.command = command;
+			error.output = output_buffer.toString();
+			reject(error);
+		});
+	});
+}
+
+function create_output_buffer({ max_bytes }) {
+	const chunks = [];
+	let size = 0;
+	let truncated = false;
+
+	const trim = () => {
+		if (max_bytes === Infinity) return;
+		while (size > max_bytes && chunks.length > 1) {
+			size -= chunks.shift().length;
+			truncated = true;
+		}
+		// A single remaining chunk can still exceed the cap; slice its tail.
+		if (chunks.length === 1 && size > max_bytes) {
+			const last = chunks[0];
+			chunks[0] = last.subarray(last.length - max_bytes);
+			size = chunks[0].length;
+			truncated = true;
+		}
+	};
+
+	return {
+		append(chunk) {
+			const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			chunks.push(buf);
+			size += buf.length;
+			trim();
+		},
+		toString() {
+			if (!chunks.length) return "";
+			const prefix = truncated ? "…(output truncated)…\n" : "";
+			return prefix + Buffer.concat(chunks, size).toString();
+		},
+		get length() {
+			return size;
+		},
+	};
+}
+
+function run_with_concurrency(tasks, concurrency) {
+	let index = 0;
+	let running = 0;
+	const errors = [];
+
+	return new Promise((resolve, reject) => {
+		const maybe_done = () => {
+			if (running !== 0) return;
+			if (errors.length === 1) reject(errors[0]);
+			else if (errors.length) reject(new AggregateError(errors, "One or more tasks failed"));
+			else resolve();
+		};
+
+		const schedule = () => {
+			if (errors.length) return;
+			while (running < concurrency && index < tasks.length) {
+				const task = tasks[index++];
+				running += 1;
+				Promise.resolve()
+					.then(task)
+					.then(() => {
+						running -= 1;
+						if (errors.length) maybe_done();
+						else if (index === tasks.length && running === 0) resolve();
+						else schedule();
+					})
+					.catch((error) => {
+						running -= 1;
+						errors.push(error);
+						maybe_done();
+					});
+			}
+		};
+
+		if (!tasks.length) {
+			resolve();
+			return;
+		}
+
+		schedule();
+	});
+}
+
+async function terminate_build_children({ grace_period_ms = 5000 } = {}) {
+	const victims = Array.from(BUILD_CHILDREN);
+	BUILD_CHILDREN.clear();
+
+	if (!victims.length) return;
+
+	for (const child of victims) {
+		try {
+			child.kill();
+		} catch (error) {
+			// no-op
+		}
+	}
+
+	await wait_for_children_exit(victims, grace_period_ms);
+
+	// Anything still alive after the grace period gets SIGKILL so we don't
+	// leave orphaned package-manager/esbuild processes when the parent exits.
+	for (const child of victims) {
+		if (child.exitCode !== null || child.signalCode !== null) continue;
+		try {
+			child.kill("SIGKILL");
+		} catch (error) {
+			// no-op
+		}
+	}
+}
+
+function wait_for_children_exit(children, timeout_ms) {
+	if (!children.length) return Promise.resolve();
+	return new Promise((resolve) => {
+		let remaining = children.length;
+		let settled = false;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve();
+		};
+		const done = () => {
+			remaining -= 1;
+			if (remaining <= 0) finish();
+		};
+		const timer = setTimeout(finish, timeout_ms);
+		timer.unref();
+		for (const child of children) {
+			if (child.exitCode !== null || child.signalCode !== null) {
+				done();
+			} else {
+				child.once("close", done);
+			}
+		}
+	});
 }
 
 async function notify_redis({ error, success, changed_files }) {
 	// notify redis which in turns tells socketio to publish this to browser
-	let subscriber = get_redis_subscriber("redis_queue");
-	try {
-		await subscriber.connect();
-	} catch (e) {
-		log_warn("Cannot connect to redis_queue for browser events");
-	}
-
 	let payload = null;
 	if (error) {
 		let formatted = await esbuild.formatMessages(error.errors, {
@@ -573,13 +965,20 @@ async function notify_redis({ error, success, changed_files }) {
 		};
 	}
 
-	await subscriber.publish(
-		"events",
-		JSON.stringify({
-			event: "build_event",
-			message: payload,
-		})
-	);
+	let subscriber = get_redis_subscriber("redis_queue");
+	try {
+		await subscriber.connect();
+		await subscriber.publish(
+			"events",
+			JSON.stringify({
+				event: "build_event",
+				message: payload,
+			})
+		);
+		await subscriber.quit();
+	} catch (e) {
+		log_warn("Cannot connect to redis_queue for browser events");
+	}
 }
 
 async function open_in_editor() {
@@ -589,6 +988,9 @@ async function open_in_editor() {
 	} catch (e) {
 		log_warn("Cannot connect to redis_queue for open_in_editor events");
 	}
+	subscriber.on("error", () =>
+		log_warn("Cannot connect to redis_queue for open_in_editor events")
+	);
 	subscriber.subscribe("open_in_editor", (file) => {
 		file = JSON.parse(file);
 		let file_path = path.resolve(file.file);

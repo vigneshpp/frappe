@@ -6,8 +6,6 @@ frappe.pages["permission-manager"].on_page_load = (wrapper) => {
 		single_column: true,
 	});
 
-	frappe.breadcrumbs.add("Setup");
-
 	$("<div class='perm-engine' style='min-height: 200px; padding: 15px;'></div>").appendTo(
 		page.main
 	);
@@ -536,11 +534,7 @@ frappe.PermissionEngine = class PermissionEngine {
 					d.get_input("role").prop("disabled", true);
 				}
 				d.set_value("permlevel", "0");
-				d.set_primary_action(__("Add"), () => {
-					let args = d.get_values();
-					if (!args) {
-						return;
-					}
+				d.set_primary_action(__("Add"), (args) => {
 					frappe.call({
 						module: "frappe.core",
 						page: "permission_manager",
@@ -558,7 +552,7 @@ frappe.PermissionEngine = class PermissionEngine {
 				});
 				d.show();
 			},
-			"small-add"
+			"plus"
 		);
 	}
 
@@ -601,7 +595,7 @@ frappe.PermissionEngine = class PermissionEngine {
 			"share",
 			"mask",
 		];
-		const STATUS_COLOR = { Added: "green", Removed: "red", Updated: "orange", Reset: "blue" };
+		const STATUS_COLOR = { Added: "green", Removed: "red", Updated: "amber", Reset: "blue" };
 
 		let doctype = this.get_doctype();
 		let show_doctype_column = !doctype;
@@ -673,7 +667,7 @@ frappe.PermissionEngine = class PermissionEngine {
 								"—";
 						}
 
-						let badge_color = STATUS_COLOR[log.status] || "grey";
+						let badge_color = STATUS_COLOR[log.status] || "gray";
 						let ts = frappe.datetime.comment_when(log.changed_at);
 						let user_display = log.changed_by || "—";
 
@@ -688,7 +682,7 @@ frappe.PermissionEngine = class PermissionEngine {
 
 						return `<tr>
 							<td>${user_display}</td>
-							<td><span class="indicator-pill ${badge_color}">${__(log.status)}</span></td>
+							<td>${frappe.ui.badge.html({ label: __(log.status), theme: badge_color })}</td>
 							<td>${__(role)}</td>
 							${doctype_cell}
 							<td class="small">${changes_text}</td>

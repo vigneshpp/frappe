@@ -11,6 +11,7 @@ class FileUploader {
 		doctype,
 		docname,
 		fieldname,
+		field_doctype,
 		files,
 		folder,
 		restrictions = {},
@@ -27,20 +28,28 @@ class FileUploader {
 		allow_toggle_private,
 		allow_toggle_optimize,
 		allow_google_drive,
+		keep_grid_form_open = false,
 	} = {}) {
-		frm && frm.attachments.max_reached(true);
+		frm?.attachments?.max_reached?.(true);
 
 		if (allow_toggle_private === undefined) {
 			allow_toggle_private = true;
 		}
 
+		const force_private = Boolean(
+			doctype && frappe.get_meta(doctype)?.force_private_attachments
+		);
+		if (force_private) {
+			make_attachments_public = 0;
+		}
+
 		allow_toggle_private = Boolean(
-			allow_toggle_private && frappe.utils.can_upload_public_files()
+			allow_toggle_private && !force_private && frappe.utils.can_upload_public_files()
 		);
 		this.can_toggle_private = allow_toggle_private;
 
 		if (!wrapper) {
-			this.make_dialog(dialog_title);
+			this.make_dialog(dialog_title, keep_grid_form_open);
 		} else {
 			this.wrapper = wrapper.get ? wrapper.get(0) : wrapper;
 		}
@@ -60,6 +69,7 @@ class FileUploader {
 			doctype,
 			docname,
 			fieldname,
+			field_doctype,
 			method,
 			folder,
 			on_success,
@@ -73,6 +83,7 @@ class FileUploader {
 			allow_web_link,
 			allow_take_photo,
 			allow_toggle_private,
+			force_private,
 			allow_toggle_optimize,
 			allow_google_drive,
 			additional_upload_handlers: this.constructor.UploadOptions.map((k) => ({
@@ -108,15 +119,6 @@ class FileUploader {
 		);
 
 		watch(
-			() => this.uploader.trigger_upload,
-			(trigger_upload) => {
-				if (trigger_upload) {
-					this.upload_files();
-				}
-			}
-		);
-
-		watch(
 			() => this.uploader.close_dialog,
 			(close_dialog) => {
 				if (close_dialog) {
@@ -128,13 +130,11 @@ class FileUploader {
 		watch(
 			() => this.uploader.hide_dialog_footer,
 			(hide_dialog_footer) => {
-				if (hide_dialog_footer) {
-					this.dialog && this.dialog.footer.addClass("hide");
-					this.dialog.$wrapper.data("bs.modal")._config.backdrop = "static";
-				} else {
-					this.dialog && this.dialog.footer.removeClass("hide");
-					this.dialog.$wrapper.data("bs.modal")._config.backdrop = true;
-				}
+				if (!this.dialog) return;
+				this.dialog.footer.toggleClass("hide", hide_dialog_footer);
+				this.dialog.$wrapper.data("bs.modal")._config.backdrop = hide_dialog_footer
+					? "static"
+					: true;
 			}
 		);
 
@@ -147,9 +147,10 @@ class FileUploader {
 		return this.uploader.upload_files(this.dialog);
 	}
 
-	make_dialog(title) {
+	make_dialog(title, keep_grid_form_open) {
 		const dialog_opts = {
 			title: title || __("Upload"),
+			keep_grid_form_open,
 			primary_action_label: __("Upload"),
 			primary_action_loading_label: __("Uploading"),
 			primary_action: () => this.upload_files(),

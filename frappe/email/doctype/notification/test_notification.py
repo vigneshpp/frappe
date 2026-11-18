@@ -3,6 +3,7 @@
 
 import json
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import frappe
 import frappe.utils
@@ -10,7 +11,7 @@ import frappe.utils.scheduler
 from frappe.desk.form import assign_to
 from frappe.tests import IntegrationTestCase
 
-from .notification import trigger_notifications
+from .notification import get_comments_for_context, get_context, trigger_notifications
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User", "Notification"]
 
@@ -22,7 +23,6 @@ def get_test_notification(config):
 		yield notification
 	finally:
 		notification.delete()
-		frappe.db.commit()
 
 
 @contextmanager
@@ -52,7 +52,6 @@ def get_test_doctype_with_attach_field(doctype_name="Test Attach Doctype"):
 	finally:
 		frappe.db.delete(doctype_name)
 		frappe.delete_doc_if_exists("DocType", doctype_name, force=1)
-		frappe.db.commit()
 
 
 @contextmanager
@@ -67,12 +66,11 @@ def create_test_file(file_name="test_attachment.txt", content="Test file content
 
 	finally:
 		frappe.delete_doc_if_exists("File", file_doc.name, force=1)
-		frappe.db.commit()
 
 
 class TestNotification(IntegrationTestCase):
 	def setUp(self):
-		frappe.db.delete("Email Queue")
+		self.enterContext(patch.object(frappe.db, "_disable_transaction_control", 1))
 		frappe.set_user("test@example.com")
 
 		if not frappe.db.exists("Notification", {"name": "ToDo Status Update"}, "name"):
@@ -120,7 +118,9 @@ class TestNotification(IntegrationTestCase):
 				},
 			)
 		)
-		frappe.db.delete("Email Queue")
+		frappe.db.delete(
+			"Email Queue", {"reference_doctype": "Communication", "reference_name": communication.name}
+		)
 
 		communication.reload()
 		communication.content = "test 2"
@@ -138,6 +138,29 @@ class TestNotification(IntegrationTestCase):
 		)
 
 		self.assertEqual(frappe.db.get_value("Communication", communication.name, "subject"), "__testing__")
+
+	def test_comments_in_context(self):
+		todo = frappe.get_doc(doctype="ToDo", description="comments context").insert()
+		self.assertIsNone(get_comments_for_context(todo))
+
+		comment = todo.add_comment("Comment", "hello")
+		email = frappe.get_doc(
+			doctype="Communication",
+			content="reply",
+			sender="a@example.com",
+			reference_doctype="ToDo",
+			reference_name=todo.name,
+		).insert()
+		self.assertEqual(
+			get_comments_for_context(todo),
+			[
+				{"comment": "hello", "by": comment.comment_email, "name": comment.name},
+				{"comment": "reply", "by": "a@example.com", "name": email.name},
+			],
+		)
+
+		todo.add_comment("Comment", "x" * 150)
+		self.assertEqual(get_comments_for_context(todo)[-1]["comment"], "x" * 97 + "...")
 
 	def test_condition(self):
 		"""Check notification is triggered based on a condition."""
@@ -184,10 +207,7 @@ class TestNotification(IntegrationTestCase):
 		notification.send_alert_on = "New"
 		notification.message = "test"
 
-		recipent = frappe.new_doc("Notification Recipient")
-		recipent.receiver_by_document_field = "owner"
-
-		notification.recipents = recipent
+		notification.append("recipients", {"receiver_by_document_field": "owner"})
 		notification.condition = "test"
 
 		self.assertRaises(frappe.ValidationError, notification.save)
@@ -257,6 +277,35 @@ class TestNotification(IntegrationTestCase):
 			# Check if the notification was triggered
 			self.assertEqual(1, frappe.db.count("Notification Log", {"subject": n.subject}))
 
+	def test_system_notification_sets_app_from_module(self):
+		"""A System Notification rule records its owning app (from `module`) on the log."""
+		from frappe.utils import add_to_date, now_datetime
+
+		event = frappe.new_doc("Event")
+		event.subject = "Test App From Module Event"
+		event.event_type = "Private"
+		event.starts_on = add_to_date(now_datetime(), minutes=14)
+		event.insert()
+
+		notification = {
+			"name": "Test App From Module",
+			"subject": "Test App From Module",
+			"document_type": "Event",
+			"module": "Core",  # owned by the frappe app
+			"event": "Minutes Before",
+			"datetime_changed": "starts_on",
+			"minutes_offset": 15,
+			"channel": "System Notification",
+			"notification_type": "Alert",
+			"recipients": [{"receiver_by_document_field": "owner"}],
+		}
+
+		with get_test_notification(notification) as n:
+			frappe.db.delete("Notification Log", {"title": n.subject})
+			trigger_notifications(None, "offset")
+			app = frappe.db.get_value("Notification Log", {"title": n.subject}, "app")
+			self.assertEqual(app, "frappe")
+
 	def test_minutes_negative_offset(self):
 		from frappe.utils import add_to_date, now_datetime
 
@@ -295,6 +344,7 @@ class TestNotification(IntegrationTestCase):
 		notification.event = "Minutes Before"
 		notification.datetime_changed = "starts_on"
 		notification.message = "Test message"
+		notification.append("recipients", {"receiver_by_document_field": "owner"})
 
 		# Test negative value
 		notification.minutes_offset = -5
@@ -327,7 +377,6 @@ class TestNotification(IntegrationTestCase):
 				"recipients": [{"receiver_by_document_field": "owner"}],
 			}
 		).insert()
-		frappe.db.commit()  # nosemgrep
 
 		event = frappe.new_doc("Event")
 		event.subject = "test-2"
@@ -398,8 +447,10 @@ class TestNotification(IntegrationTestCase):
 
 	def test_cc_jinja(self):
 		frappe.db.delete("User", {"email": "test_jinja@example.com"})
-		frappe.db.delete("Email Queue")
-		frappe.db.delete("Email Queue Recipient")
+		frappe.db.delete(
+			"Email Queue", {"reference_doctype": "User", "reference_name": "test_jinja@example.com"}
+		)
+		frappe.db.delete("Email Queue Recipient", {"recipient": "test_jinja@example.com"})
 
 		test_user = frappe.new_doc("User")
 		test_user.name = "test_jinja"
@@ -418,8 +469,10 @@ class TestNotification(IntegrationTestCase):
 		self.assertTrue(frappe.db.get_value("Email Queue Recipient", {"recipient": "test_jinja@example.com"}))
 
 		frappe.db.delete("User", {"email": "test_jinja@example.com"})
-		frappe.db.delete("Email Queue")
-		frappe.db.delete("Email Queue Recipient")
+		frappe.db.delete(
+			"Email Queue", {"reference_doctype": "User", "reference_name": "test_jinja@example.com"}
+		)
+		frappe.db.delete("Email Queue Recipient", {"recipient": "test_jinja@example.com"})
 
 	def test_notification_to_assignee(self):
 		todo = frappe.new_doc("ToDo")
@@ -485,6 +538,24 @@ class TestNotification(IntegrationTestCase):
 		self.assertTrue("test2@example.com" in recipients)
 		self.assertTrue("test1@example.com" in recipients)
 
+	def test_notification_to_administrator_owner(self):
+		frappe.set_user("Administrator")
+
+		notification = {
+			"document_type": "ToDo",
+			"subject": "ToDo created by Administrator",
+			"event": "New",
+			"message": "New ToDo",
+			"recipients": [{"receiver_by_document_field": "owner"}],
+		}
+
+		with get_test_notification(notification) as n:
+			todo = frappe.get_doc(doctype="ToDo", description="Review the quarterly report").insert()
+
+			recipients, _, _ = n.get_list_of_recipients(todo, get_context(todo))
+			todo.delete()
+			self.assertEqual(recipients, [frappe.db.get_value("User", "Administrator", "email")])
+
 	def test_notification_value_change_casted_types(self):
 		"""Make sure value change event dont fire because of incorrect type comparisons."""
 		frappe.set_user("Administrator")
@@ -512,8 +583,6 @@ class TestNotification(IntegrationTestCase):
 
 	def test_attach_files_from_field(self):
 		"""Test notification with 'From Field' attachment option."""
-		frappe.db.delete("Email Queue")
-
 		with get_test_doctype_with_attach_field("Test From Field Doctype") as test_doctype:
 			with create_test_file("from_field_test.txt", "Content from specific field") as test_file:
 				# Create notification with "From Field" attachment
@@ -561,8 +630,6 @@ class TestNotification(IntegrationTestCase):
 
 	def test_attach_files_all(self):
 		"""Test notification with 'All' attachment option."""
-		frappe.db.delete("Email Queue")
-
 		with get_test_doctype_with_attach_field("Test All Attachments Doctype") as test_doctype:
 			with create_test_file("all_test_1.txt", "First file content") as test_file1:
 				# Create notification with "All" attachment option
@@ -627,8 +694,6 @@ class TestNotification(IntegrationTestCase):
 
 	def test_attach_files_empty_option(self):
 		"""Test notification with empty attachment option (no attachments)."""
-		frappe.db.delete("Email Queue")
-
 		# Create notification with empty attach_files option
 		notification_config = {
 			"name": "Test No Attachments",
@@ -662,6 +727,32 @@ class TestNotification(IntegrationTestCase):
 
 			# Clean up
 			todo.delete(ignore_permissions=True)
+
+	def test_attach_print_uses_document_language(self):
+		user = frappe.get_doc("User", "test@example.com")
+		user.language = "de"
+
+		attachment = frappe.new_doc("Notification").get_print(user)
+
+		self.assertEqual(attachment["lang"], "de")
+
+	def test_attach_print_without_print_format_sets_no_language(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		user = frappe.get_doc("User", "test@example.com")
+		user.language = None
+
+		attachment = frappe.new_doc("Notification").get_print(user)
+
+		self.assertIsNone(attachment["lang"])
+
+	def test_attach_print_of_non_submittable_document(self):
+		user = frappe.get_doc("User", "test@example.com")
+
+		with self.change_settings("Print Settings", allow_print_for_draft=0):
+			attachment = frappe.new_doc("Notification").get_print(user)
+
+		self.assertEqual(attachment["name"], "test@example.com")
 
 	@classmethod
 	def tearDownClass(cls):
@@ -727,6 +818,103 @@ class TestNotification(IntegrationTestCase):
 		recipients = [d.recipient for d in email_queue.recipients]
 		self.assertTrue("test1@example.com" in recipients)
 		self.assertEqual(notification.enabled, 1)
+
+	def test_email_template_content_for_email_and_system_notification(self):
+		"""email_template should drive content for both the Email channel and the bell (Send System Notification)."""
+		frappe.delete_doc_if_exists("Email Template", "Test ToDo Email Template")
+		email_template = frappe.get_doc(
+			{
+				"doctype": "Email Template",
+				"name": "Test ToDo Email Template",
+				"subject": "ToDo update: {{ description }}",
+				"response": "<p>Status is now {{ status }}, no doc. prefix needed.</p>",
+			}
+		).insert()
+
+		frappe.delete_doc_if_exists("Notification", "Test Email Template Notification")
+		notification = frappe.get_doc(
+			{
+				"doctype": "Notification",
+				"name": "Test Email Template Notification",
+				"document_type": "ToDo",
+				"event": "Save",
+				"channel": "Email",
+				"email_template": email_template.name,
+				"send_system_notification": 1,
+				"recipients": [{"receiver_by_document_field": "owner"}],
+			}
+		).insert()
+
+		frappe.db.delete("Notification Log", {"subject": ["like", "ToDo update:%"]})
+
+		todo = frappe.new_doc("ToDo")
+		todo.description = "Checking email template content"
+		todo.status = "Open"
+		todo.save()
+
+		email_queue = frappe.get_doc(
+			"Email Queue", {"reference_doctype": "ToDo", "reference_name": todo.name}
+		)
+		self.assertIn("Checking email template content", email_queue.message)
+		self.assertIn("Status is now Open", email_queue.message)
+
+		notification_log = frappe.get_doc(
+			"Notification Log", {"subject": ["like", "ToDo update:%"], "for_user": frappe.session.user}
+		)
+		self.assertIn("Checking email template content", notification_log.subject)
+		self.assertIn("Status is now Open", notification_log.email_content)
+
+		todo.delete(ignore_permissions=True)
+		notification.delete()
+		email_template.delete()
+
+	def test_email_template_with_no_content_is_rejected_on_save(self):
+		"""A Notification pointing at an empty Email Template should fail at save, not silently fall back."""
+		frappe.delete_doc_if_exists("Email Template", "Test Empty Email Template")
+		email_template = frappe.get_doc(
+			{
+				"doctype": "Email Template",
+				"name": "Test Empty Email Template",
+				"subject": "x",
+				"use_html": 1,
+				"response_html": "",
+			}
+		).insert()
+
+		notification = frappe.new_doc("Notification")
+		notification.name = "Test Empty Email Template Notification"
+		notification.document_type = "ToDo"
+		notification.event = "Save"
+		notification.channel = "Email"
+		notification.email_template = email_template.name
+		notification.append("recipients", {"receiver_by_document_field": "owner"})
+
+		self.assertRaises(frappe.ValidationError, notification.insert)
+
+		email_template.delete()
+
+	def test_email_template_rejected_for_non_email_channel(self):
+		"""email_template is only meaningful for the Email channel and should be rejected elsewhere."""
+		frappe.delete_doc_if_exists("Email Template", "Test ToDo Email Template Channel")
+		email_template = frappe.get_doc(
+			{
+				"doctype": "Email Template",
+				"name": "Test ToDo Email Template Channel",
+				"subject": "x",
+				"response": "y",
+			}
+		).insert()
+
+		notification = frappe.new_doc("Notification")
+		notification.document_type = "ToDo"
+		notification.event = "Save"
+		notification.channel = "System Notification"
+		notification.email_template = email_template.name
+		notification.append("recipients", {"receiver_by_document_field": "owner"})
+
+		self.assertRaises(frappe.ValidationError, notification.insert)
+
+		email_template.delete()
 
 
 # ruff: noqa: RUF001

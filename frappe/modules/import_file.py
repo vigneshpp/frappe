@@ -6,7 +6,7 @@ import os
 import orjson
 
 import frappe
-from frappe.model.base_document import get_controller
+from frappe.model.document import get_controller
 from frappe.modules import get_module_path, scrub_dt_dn
 from frappe.query_builder import DocType
 from frappe.utils import get_datetime, now
@@ -26,14 +26,17 @@ def calculate_hash(path: str) -> str:
 
 
 ignore_values = {
-	"Report": ["disabled", "prepared_report", "add_total_row"],
+	"Report": ["disabled", "prepared_report", "add_total_row", "site_print_defaults"],
 	"Print Format": ["disabled"],
 	"Notification": ["enabled"],
 	"Print Style": ["disabled"],
 	"Module Onboarding": ["is_complete"],
 	"Onboarding Step": ["is_complete", "is_skipped"],
 	"Workspace": ["is_hidden"],
+	"Letter Head": ["is_default", "disabled"],
 }
+
+ignore_values_if_set = {"Report": {"site_print_defaults": ["default_print_format", "default_letter_head"]}}
 
 ignore_doctypes = [""]
 
@@ -125,6 +128,16 @@ def import_file_by_path(
 				get_datetime(doc.get("modified")) <= get_datetime(db_modified_timestamp)
 			)
 
+			# board names are global, so an app's board never replaces a site's own
+			if (
+				not force
+				and doc["doctype"] == "Kanban Board"
+				and db_modified_timestamp
+				and frappe.db.get_value("Kanban Board", doc["name"], "is_standard") != "Yes"
+			):
+				print(f"Skipping {path}: a Kanban Board named {doc['name']} already exists on this site")
+				continue
+
 			if not force and db_modified_timestamp:
 				stored_hash = None
 				if doc["doctype"] == "DocType":
@@ -160,7 +173,7 @@ def import_file_by_path(
 			new_modified_timestamp = doc.get("modified")
 
 			# if db timestamp is newer, hash must have changed, must update db timestamp
-			if is_db_timestamp_latest and doc["doctype"] == "DocType":
+			if is_db_timestamp_latest and doc["doctype"] == "DocType" and not data_import:
 				new_modified_timestamp = now()
 
 			if new_modified_timestamp:
@@ -172,7 +185,7 @@ def import_file_by_path(
 def read_doc_from_file(path):
 	doc = None
 	if os.path.exists(path):
-		with open(path) as f:
+		with open(path, encoding="utf-8") as f:
 			try:
 				doc = orjson.loads(f.read())
 			except ValueError:
@@ -262,6 +275,11 @@ def delete_old_doc(doc, reset_permissions):
 		# update ignore values
 		for key in ignore_values.get(doc.doctype) or []:
 			doc.set(key, old_doc.get(key))
+
+	for flag, keys in (ignore_values_if_set.get(doc.doctype) or {}).items():
+		if old_doc.get(flag):
+			for key in keys:
+				doc.set(key, old_doc.get(key))
 
 	# update ignored docs into new doc
 	for df in doc.meta.get_table_fields():

@@ -125,15 +125,17 @@ frappe.ui.form.ControlMultiCheck = class ControlMultiCheck extends frappe.ui.for
 	}
 
 	select_all(deselect = false) {
-		$(this.wrapper)
-			.find(`:checkbox`)
-			.prop("checked", function () {
-				if (this.disabled) {
-					return this.checked;
-				}
-				return deselect;
-			})
-			.trigger("click");
+		this.selected_options = [];
+		this.options.forEach((option) => {
+			const checkbox = option.$checkbox.find(":checkbox").get(0);
+			if (!checkbox.disabled) {
+				checkbox.checked = !deselect;
+			}
+			if (checkbox.checked) {
+				this.selected_options.push(option.value);
+			}
+		});
+		this.df.on_change && this.df.on_change();
 	}
 
 	select_options(selected_options) {
@@ -176,7 +178,7 @@ frappe.ui.form.ControlMultiCheck = class ControlMultiCheck extends frappe.ui.for
 			<div class="checkbox unit-checkbox">
 				<label title="${option.description || ""}" style="display: flex; align-items: center;">
 					<input type="checkbox" data-unit="${option.value}" style="flex-shrink: 0;">
-					<span class="label-area" data-unit="${option.value}">${
+					<span class="label-area ${option.label_class || ""}" data-unit="${option.value}">${
 			option.label
 		}${mandatory_marker}${warning_icon}</span>
 				</label>

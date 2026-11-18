@@ -41,6 +41,8 @@ The first application built on Framework was ERPNext, a beast with more than 700
 
 - **REST API**: Automatically generated RESTful API for all models, enabling easy integration with other systems and services.
 
+- **MCP Server**: Gives agents tools to discover schemas, read and change documents, and call existing methods as a site user.
+
 - **Customizable Forms and Views**: Flexible form and view customization using server-side scripting and client-side JavaScript.
 
 - **Report Builder**: Powerful reporting tool that allows users to create custom reports without writing any code.
@@ -132,6 +134,7 @@ To setup the repository locally follow the steps mentioned below:
 <div align="center">
 	<a href="https://frappe.io" target="_blank">
 		<picture>
+			<source media="(prefers-color-scheme: light)" srcset="https://frappe.io/files/Frappe-black.png">
 			<source media="(prefers-color-scheme: dark)" srcset="https://frappe.io/files/Frappe-white.png">
 			<img src="https://frappe.io/files/Frappe-black.png" alt="Frappe Technologies" height="28"/>
 		</picture>

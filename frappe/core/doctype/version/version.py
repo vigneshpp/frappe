@@ -10,9 +10,12 @@ from frappe.model.document import Document
 from frappe.utils import cstr
 
 FIELDTYPES_TO_IGNORE = frozenset(fieldtype for fieldtype in no_value_fields if fieldtype not in table_fields)
+STANDARD_VERSIONED_FIELDS = ("name", "docstatus")
 
 
 class Version(Document):
+	_DOCTYPE_NAME = "Version"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -35,7 +38,7 @@ class Version(Document):
 			return self.set_diff(old, new)
 
 	@staticmethod
-	def set_impersonator(data):
+	def set_session_context(data):
 		if not frappe.session:
 			return
 		if impersonator := frappe.session.data.get("impersonated_by"):
@@ -44,11 +47,14 @@ class Version(Document):
 		if audit_user := frappe.session.data.get("audit_user"):
 			data["audit_user"] = audit_user
 
+		if agent := frappe.session.data.get("agent"):
+			data["agent"] = agent
+
 	def set_diff(self, old: Document, new: Document) -> bool:
 		"""Set the data property with the diff of the docs if present"""
-		diff = get_diff(old, new)
+		diff = get_diff(old, new, include_ignored_fields=False)
 		if diff:
-			self.set_impersonator(diff)
+			self.set_session_context(diff)
 			self.ref_doctype = new.doctype
 			self.docname = new.name
 			self.data = frappe.as_json(diff, indent=None, separators=(",", ":"))
@@ -58,15 +64,13 @@ class Version(Document):
 
 	def for_insert(self, doc: Document) -> bool:
 		updater_reference = doc.flags.updater_reference
-		if not updater_reference:
+		if not (updater_reference or has_agent()):
 			return False
 
-		data = {
-			"creation": doc.creation,
-			"updater_reference": updater_reference,
-			"created_by": doc.owner,
-		}
-		self.set_impersonator(data)
+		data = {"creation": doc.creation, "created_by": doc.owner}
+		if updater_reference:
+			data["updater_reference"] = updater_reference
+		self.set_session_context(data)
 		self.ref_doctype = doc.doctype
 		self.docname = doc.name
 		self.data = frappe.as_json(data, indent=None, separators=(",", ":"))
@@ -99,7 +103,11 @@ class Version(Document):
 			self.set_onload("html_diffs", html_diffs)
 
 
-def get_diff(old, new, for_child=False, compare_cancelled=False):
+def has_agent() -> bool:
+	return bool(frappe.session and frappe.session.data.get("agent"))
+
+
+def get_diff(old, new, for_child=False, compare_cancelled=False, include_ignored_fields=True):
 	"""Get diff between 2 document objects
 
 	If there is a change, then returns a dict like:
@@ -114,8 +122,25 @@ def get_diff(old, new, for_child=False, compare_cancelled=False):
 	                ],
 
 	        }"""
+
+	def get_row_data(row) -> dict:
+		"""
+		Row data for the version log, without fields set to `Ignore Versioning`.
+		"""
+		data = row.as_dict()
+
+		if include_ignored_fields:
+			return data
+
+		for fieldname in row.meta.ignore_versioning_fields:
+			data.pop(fieldname, None)
+
+		return data
+
 	if not new:
 		return None
+
+	ignored_fields = set() if include_ignored_fields else new.meta.ignore_versioning_fields
 
 	blacklisted_fields = ["Markdown Editor", "Text Editor", "Code", "HTML Editor"]
 
@@ -138,6 +163,9 @@ def get_diff(old, new, for_child=False, compare_cancelled=False):
 
 	for df in new.meta.fields:
 		if df.fieldtype in FIELDTYPES_TO_IGNORE or getattr(df, "is_virtual", False):
+			continue
+
+		if df.fieldname in ignored_fields:
 			continue
 
 		old_value, new_value = old.get(df.fieldname), new.get(df.fieldname)
@@ -166,16 +194,21 @@ def get_diff(old, new, for_child=False, compare_cancelled=False):
 				if old_row_name and old_row_name in old_rows_by_name:
 					found_rows.add(old_row_name)
 
-					diff = get_diff(old_rows_by_name[old_row_name], d, for_child=True)
+					diff = get_diff(
+						old_rows_by_name[old_row_name],
+						d,
+						for_child=True,
+						include_ignored_fields=include_ignored_fields,
+					)
 					if diff and diff.changed:
 						out.row_changed.append((df.fieldname, i, d.name, diff.changed))
 				else:
-					out.added.append([df.fieldname, d.as_dict()])
+					out.added.append([df.fieldname, get_row_data(d)])
 
 			# check for deletions
 			for d in old_value:
 				if d.name not in found_rows:
-					out.removed.append([df.fieldname, d.as_dict()])
+					out.removed.append([df.fieldname, get_row_data(d)])
 
 		elif old_value != new_value:
 			if df.fieldtype not in blacklisted_fields:
@@ -211,7 +244,7 @@ def get_diff(old, new, for_child=False, compare_cancelled=False):
 
 	# name & docstatus
 	if not for_child:
-		for key in ("name", "docstatus"):
+		for key in STANDARD_VERSIONED_FIELDS:
 			old_value = getattr(old, key)
 			new_value = getattr(new, key)
 

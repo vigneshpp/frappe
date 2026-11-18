@@ -28,6 +28,7 @@ from frappe.tests import IntegrationTestCase
 from frappe.tests.test_helpers import setup_for_tests
 from frappe.tests.utils import make_test_records_for_doctype
 from frappe.utils.data import now_datetime
+from frappe.utils.user import UserPermissions
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User", "Contact", "Salutation"]
 
@@ -103,6 +104,52 @@ class TestPermissions(IntegrationTestCase):
 		self.assertNotEqual(permitted_record, full_record)
 		self.assertSequenceSubset(post.meta.default_fields + post.meta.get_search_fields(), permitted_record)
 
+	def test_owner_only_export_stays_in_can_export(self):
+		role_name = "Test Export Boot Role"
+		user_name = "test_export_boot@example.com"
+		owner_only_dt = "Test Owner Only Export Boot"
+		shared_dt = "Test Shared Export Boot"
+
+		frappe.set_user("Administrator")
+		frappe.delete_doc("User", user_name, ignore_missing=True, force=True)
+		for name in (owner_only_dt, shared_dt):
+			frappe.delete_doc("DocType", name, ignore_missing=True, force=True)
+		frappe.delete_doc("Role", role_name, ignore_missing=True, force=True)
+
+		def boot_perms():
+			frappe.clear_cache(user=user_name)
+			frappe.set_user(user_name)
+			perms = UserPermissions()
+			perms.build_permissions()
+			frappe.set_user("Administrator")
+			return perms
+
+		try:
+			frappe.get_doc(doctype="Role", role_name=role_name, desk_access=1).insert()
+
+			for name, if_owner in ((owner_only_dt, 1), (shared_dt, 0)):
+				new_doctype(
+					name,
+					fields=[{"fieldname": "title", "fieldtype": "Data", "label": "Title"}],
+					permissions=[{"role": role_name, "read": 1, "export": 1, "if_owner": if_owner}],
+				).insert()
+
+			user = frappe.get_doc(
+				doctype="User", email=user_name, first_name="Export Boot", send_welcome_email=0
+			).insert()
+			user.add_roles(role_name)
+
+			perms = boot_perms()
+			self.assertIn(owner_only_dt, perms.can_export)
+			self.assertIn(shared_dt, perms.can_export)
+		finally:
+			frappe.set_user("Administrator")
+			frappe.delete_doc("User", user_name, ignore_missing=True, force=True)
+			frappe.delete_doc("Role", role_name, ignore_missing=True, force=True)
+			for name in (owner_only_dt, shared_dt):
+				frappe.delete_doc("DocType", name, ignore_missing=True, force=True)
+			frappe.db.commit()
+
 	def test_user_permissions_in_doc(self):
 		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
 
@@ -116,6 +163,25 @@ class TestPermissions(IntegrationTestCase):
 		self.assertTrue(post1.has_permission("read"))
 		self.assertTrue(get_doc_permissions(post1).get("read"))
 
+	def test_user_permission_denial_is_explained(self):
+		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
+
+		with self.set_user("test2@example.com"):
+			frappe.local.message_log = []
+			post = frappe.get_doc("Test Blog Post", "_Test Blog Post")
+			self.assertRaises(frappe.PermissionError, post.check_permission, "read")
+
+			message = frappe.local.message_log[-1]["message"]
+			self.assertIn("Test Blog Category", message)
+			self.assertIn("_Test Blog Category", message)
+
+	def test_check_without_print_logs_leaves_outer_check_logs_alone(self):
+		frappe.flags.has_permission_check_logs = []
+		self.addCleanup(frappe.flags.pop, "has_permission_check_logs", None)
+
+		self.assertFalse(frappe.permissions.has_permission("ToDo", "submit", print_logs=False))
+		self.assertEqual(frappe.flags.has_permission_check_logs, [])
+
 	def test_user_permissions_in_report(self):
 		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
 
@@ -124,6 +190,25 @@ class TestPermissions(IntegrationTestCase):
 
 		self.assertTrue("_Test Blog Post 1" in names)
 		self.assertFalse("_Test Blog Post" in names)
+
+	def test_user_permissions_in_report_with_multiple_link_fields(self):
+		from frappe.desk.query_report import get_user_match_filters
+
+		add_user_permission("Test Blog Category", "_Test Blog Category 1", "test2@example.com")
+		add_user_permission("Test Blogger", "_Test Blogger 1", "test2@example.com")
+
+		frappe.set_user("test2@example.com")
+		match_filters = get_user_match_filters(["Test Blog Post"], "test2@example.com")
+
+		filter_list = match_filters["Test Blog Post"]
+		self.assertEqual(len(filter_list), 1)
+		self.assertEqual(
+			filter_list[0],
+			{
+				"Test Blog Category": ["_Test Blog Category 1"],
+				"Test Blogger": ["_Test Blogger 1"],
+			},
+		)
 
 	def test_default_values(self):
 		doc = frappe.new_doc("Test Blog Post")
@@ -556,6 +641,7 @@ class TestPermissions(IntegrationTestCase):
 		)
 
 		doc.insert()
+		self.addCleanup(frappe.db.delete, "Test Blog Post", {"name": doc.name})
 
 		getdoc("Test Blog Post", doc.name)
 		doclist = [d.name for d in frappe.response.docs]
@@ -575,7 +661,8 @@ class TestPermissions(IntegrationTestCase):
 			}
 		)
 
-		doc.insert(ignore_if_duplicate=True)
+		doc.insert()
+		self.addCleanup(frappe.delete_doc, doc.doctype, doc.name, delete_permanently=True)
 
 		update("Test Blog Post", "Blogger", 0, "if_owner", 1)
 		update("Test Blog Post", "Blogger", 0, "read", 1)
@@ -699,6 +786,48 @@ class TestPermissions(IntegrationTestCase):
 		user = frappe.get_doc("User", "Administrator")
 		doc = user.append("defaults")
 		self.assertRaises(frappe.PermissionError, doc.check_permission)
+
+	def test_child_permission_error_reports_parent_doctype(self):
+		with self.set_user("Administrator"):
+			child_doctype = new_doctype(istable=1).insert().name
+			parent_doctype = (
+				new_doctype(
+					fields=[
+						{
+							"label": "Rows",
+							"fieldname": "rows",
+							"fieldtype": "Table",
+							"options": child_doctype,
+							"permlevel": 1,
+						}
+					],
+					permissions=[{"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1}],
+				)
+				.insert()
+				.name
+			)
+			parent = frappe.new_doc(parent_doctype)
+			parent.append("rows", {})
+			parent.insert()
+
+		row = parent.rows[0]
+
+		# no access to the parent doctype at all
+		with self.set_user("test@example.com"):
+			frappe.local.message_log = []
+			self.assertRaises(frappe.PermissionError, row.check_permission, "delete")
+
+			self.assertIn(parent_doctype, frappe.local.message_log[-1]["message"])
+			self.assertIn(parent_doctype, frappe.flags.error_message)
+
+		# access to the parent doctype, denied on the table's permlevel
+		with self.set_user("test1@example.com"):
+			self.assertRaises(frappe.PermissionError, row.check_permission, "delete")
+
+			self.assertIn(parent_doctype, frappe.flags.error_message)
+			self.assertIn(parent.name, frappe.flags.error_message)
+			self.assertNotIn(child_doctype, frappe.flags.error_message)
+			self.assertNotIn(row.name, frappe.flags.error_message)
 
 	def test_select_user(self):
 		"""If test3@example.com is restricted by a User Permission to see only

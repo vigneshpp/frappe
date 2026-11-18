@@ -2,15 +2,19 @@
 # License: MIT. See LICENSE
 
 import os
+from datetime import datetime
 from urllib.parse import urlencode, urljoin
 
-from oauthlib.oauth2 import BackendApplicationClient
+from oauthlib.oauth2 import BackendApplicationClient, InvalidGrantError
 from requests_oauthlib import OAuth2Session
 
 import frappe
 from frappe import _
+from frappe.integrations.frappe_providers.email_oauth import FRAPPE_CLOUD_RELAY, relay_refresh
 from frappe.integrations.utils import make_get_request
 from frappe.model.document import Document
+from frappe.utils.synchronization import filelock
+from frappe.www.login import sanitize_redirect
 
 if any((os.getenv("CI"), frappe.conf.developer_mode, frappe.conf.allow_tests)):
 	# Disable mandatory TLS in developer mode and tests
@@ -20,6 +24,8 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
 
 class ConnectedApp(Document):
+	_DOCTYPE_NAME = "Connected App"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -50,6 +56,7 @@ class ConnectedApp(Document):
 
 	@frappe.whitelist()
 	def get_openid_configuration(self):
+		self.check_permission("write")
 		if not self.openid_configuration:
 			frappe.throw(_("Please enter OpenID Configuration URL"))
 		return make_get_request(self.openid_configuration)
@@ -60,6 +67,12 @@ class ConnectedApp(Document):
 			"/api/method/frappe.integrations.doctype.connected_app.connected_app.callback/" + self.name
 		)
 		self.redirect_uri = urljoin(base_url, callback_path)
+
+		if not self.is_new() and not self.client_id:
+			frappe.throw(
+				_("{0} is required").format(frappe.bold(_(self.meta.get_label("client_id")))),
+				frappe.MandatoryError,
+			)
 
 	def get_oauth2_session(self, user=None, init=False):
 		"""Return an auto-refreshing OAuth2 session which is an extension of a requests.Session()"""
@@ -91,6 +104,10 @@ class ConnectedApp(Document):
 	def initiate_web_application_flow(self, user: str | None = None, success_uri: str | None = None):
 		"""Return an authorization URL for the user. Save state in Token Cache."""
 		user = user or frappe.session.user
+		if user != frappe.session.user:
+			self.check_permission("write")
+		success_uri = sanitize_redirect(success_uri) if getattr(frappe.local, "request", None) else None
+
 		oauth = self.get_oauth2_session(user, init=True)
 		query_params = self.get_query_params()
 		authorization_url, state = oauth.authorization_url(self.authorization_uri, **query_params)
@@ -140,18 +157,35 @@ class ConnectedApp(Document):
 		user = user or frappe.session.user
 		token_cache = self.get_token_cache(user)
 		if token_cache and token_cache.is_expired():
-			oauth_session = self.get_oauth2_session(user)
-
 			try:
-				token = oauth_session.refresh_token(
-					body=f"redirect_uri={self.redirect_uri}",
-					token_url=self.token_uri,
-				)
-			except Exception:
-				self.log_error("Token Refresh Error")
-				return None
+				with filelock(f"token_cache_{token_cache.name}"):
+					# Another worker may have refreshed while we waited for the lock.
+					token_cache.reload()
+					if not token_cache.is_expired():
+						return token_cache
 
-			token_cache.update_data(token)
+					if (self.token_uri or "").startswith(FRAPPE_CLOUD_RELAY):
+						token = relay_refresh(self, token_cache)
+					else:
+						oauth_session = self.get_oauth2_session(user)
+						token = oauth_session.refresh_token(
+							body=f"redirect_uri={self.redirect_uri}",
+							token_url=self.token_uri,
+						)
+					token_cache.update_data(token)
+			except Exception as e:
+				self.log_error("Token Refresh Error")
+				# Central passes on the provider's error code as the message
+				if isinstance(e, InvalidGrantError) or str(e) == "invalid_grant":
+					# in a job, so neither the caller's rollback nor another worker's row lock gets in the way
+					frappe.enqueue(  # not after commit: a rolled-back caller would drop the job  # nosemgrep
+						"frappe.integrations.doctype.connected_app.connected_app.delete_token_cache",
+						job_id=f"delete_token_cache:{token_cache.name}",
+						deduplicate=True,
+						name=token_cache.name,
+						modified=token_cache.modified,
+					)
+				return None
 
 		return token_cache
 
@@ -183,7 +217,9 @@ class ConnectedApp(Document):
 		return token_cache
 
 
-@frappe.whitelist(methods=["GET"], allow_guest=True)
+# OAuth providers must be able to return here before authentication; guests are redirected
+# to login below, and authenticated callbacks must match the stored OAuth state.
+@frappe.whitelist(methods=["GET"], allow_guest=True)  # nosemgrep: guest-whitelisted-method
 def callback(code: str | None = None, state: str | None = None):
 	"""Handle client's code.
 
@@ -209,10 +245,15 @@ def callback(code: str | None = None, state: str | None = None):
 
 	oauth_session = connected_app.get_oauth2_session(init=True)
 	query_params = connected_app.get_query_params()
+	client_secret = connected_app.get_password("client_secret")
+	if frappe.db.db_type == "sqlite":
+		# The token endpoint can write through another connection. End this read-only
+		# snapshot first so saving the returned token starts from the latest database state.
+		frappe.db.rollback()
 	token = oauth_session.fetch_token(
 		connected_app.token_uri,
 		code=code,
-		client_secret=connected_app.get_password("client_secret"),
+		client_secret=client_secret,
 		include_client_id=True,
 		**query_params,
 	)
@@ -222,8 +263,19 @@ def callback(code: str | None = None, state: str | None = None):
 	frappe.local.response["location"] = token_cache.get("success_uri") or connected_app.get_url()
 
 
+def delete_token_cache(name: str, modified: datetime) -> None:
+	# a reconnect may have saved a new token under the same name since
+	if frappe.db.get_value("Token Cache", {"name": name, "modified": modified}, for_update=True):
+		frappe.delete_doc("Token Cache", name, ignore_permissions=True)
+
+
 @frappe.whitelist()
 def has_token(connected_app: str, connected_user: str | None = None):
+	connected_user = connected_user or frappe.session.user
+	if connected_user != frappe.session.user and not frappe.get_list(
+		"Email Account", filters={"connected_app": connected_app, "connected_user": connected_user}, limit=1
+	):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
 	app = frappe.get_doc("Connected App", connected_app)
-	token_cache = app.get_token_cache(connected_user or frappe.session.user)
+	token_cache = app.get_token_cache(connected_user)
 	return bool(token_cache and token_cache.get_password("access_token", False))

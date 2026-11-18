@@ -11,6 +11,8 @@ from frappe.utils.modules import get_modules_from_app
 
 
 class UserType(Document):
+	_DOCTYPE_NAME = "User Type"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -35,8 +37,24 @@ class UserType(Document):
 	# end: auto-generated types
 
 	def validate(self):
+		self.validate_mandatory_for_custom_type()
 		self.set_modules()
 		self.add_select_perm_doctypes()
+
+	def validate_mandatory_for_custom_type(self):
+		if self.is_standard:
+			return
+
+		required = ["role"]
+		if self.apply_user_permission_on:
+			required.append("user_id_field")
+
+		for fieldname in required:
+			if not self.get(fieldname):
+				frappe.throw(
+					_("{0} is required").format(frappe.bold(_(self.meta.get_label(fieldname)))),
+					frappe.MandatoryError,
+				)
 
 	def clear_cache(self):
 		super().clear_cache()
@@ -48,7 +66,6 @@ class UserType(Document):
 		if self.is_standard:
 			return
 
-		self.validate_role()
 		self.add_role_permissions_for_user_doctypes()
 		self.add_role_permissions_for_select_doctypes()
 		self.add_role_permissions_for_file()
@@ -73,17 +90,6 @@ class UserType(Document):
 		self.set("user_type_modules", [])
 		for module in modules:
 			self.append("user_type_modules", {"module": module})
-
-	def validate_role(self):
-		if not self.role:
-			frappe.throw(_("The field {0} is mandatory").format(frappe.bold(_("Role"))))
-
-		if not frappe.db.get_value("Role", self.role, "is_custom"):
-			frappe.throw(
-				_("The role {0} should be a custom role.").format(
-					frappe.bold(get_link_to_form("Role", self.role))
-				)
-			)
 
 	def update_users(self):
 		for row in frappe.get_all("User", filters={"user_type": self.name}):

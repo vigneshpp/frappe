@@ -1,4 +1,5 @@
 # imports - standard imports
+import getpass
 import os
 import shutil
 import sys
@@ -56,7 +57,12 @@ from frappe.utils.bench_helper import CliCtxObj
 @click.option("--admin-password", help="Administrator password for new site", default=None)
 @click.option("--verbose", is_flag=True, default=False, help="Verbose")
 @click.option("--force", help="Force restore if site/database already exists", is_flag=True, default=False)
-@click.option("--source-sql", "--source_sql", help="Initiate database with a SQL file")
+@click.option(
+	"--source-sql",
+	"--source_sql",
+	type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+	help="Initiate database with a SQL file",
+)
 @click.option("--install-app", multiple=True, help="Install app after installation")
 @click.option("--set-default", is_flag=True, default=False, help="Set the new site as default site")
 @click.option(
@@ -157,7 +163,10 @@ def new_site(
 
 
 @click.command("restore")
-@click.argument("sql-file-path")
+@click.argument(
+	"sql-file-path",
+	type=click.Path(dir_okay=False, resolve_path=True),
+)
 @click.option(
 	"--db-root-username",
 	"--mariadb-root-username",
@@ -167,9 +176,14 @@ def new_site(
 @click.option("--db-name", help="Database name for site in case it is a new one")
 @click.option("--admin-password", help="Administrator password for new site")
 @click.option("--install-app", multiple=True, help="Install app after installation")
-@click.option("--with-public-files", help="Restores the public files of the site, given path to its tar file")
+@click.option(
+	"--with-public-files",
+	type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+	help="Restores the public files of the site, given path to its tar file",
+)
 @click.option(
 	"--with-private-files",
+	type=click.Path(exists=True, dir_okay=False, resolve_path=True),
 	help="Restores the private files of the site, given path to its tar file",
 )
 @click.option(
@@ -178,12 +192,24 @@ def new_site(
 	default=False,
 	help="Ignore the validations and downgrade warnings. This action is not recommended",
 )
-@click.option("--encryption-key", help="Backup encryption key")
+@click.option(
+	"--encryption-key",
+	envvar="FRAPPE_BACKUP_ENCRYPTION_KEY",
+	show_envvar=True,
+	help="Backup encryption key",
+)
+@click.option(
+	"--non-interactive",
+	is_flag=True,
+	default=False,
+	help="Fail instead of prompting for a missing encryption key",
+)
 @pass_context
 def restore(
 	context: CliCtxObj,
 	sql_file_path,
 	encryption_key=None,
+	non_interactive=False,
 	db_root_username=None,
 	db_root_password=None,
 	db_name=None,
@@ -206,6 +232,7 @@ def restore(
 			site=site,
 			sql_file_path=sql_file_path,
 			encryption_key=encryption_key,
+			non_interactive=non_interactive,
 			db_root_username=db_root_username,
 			db_root_password=db_root_password,
 			verbose=context.verbose or verbose,
@@ -222,6 +249,7 @@ def _restore(
 	site=None,
 	sql_file_path=None,
 	encryption_key=None,
+	non_interactive=False,
 	db_root_username=None,
 	db_root_password=None,
 	verbose=None,
@@ -234,21 +262,17 @@ def _restore(
 	from pathlib import Path
 
 	from frappe.installer import extract_files
-	from frappe.utils.backups import decrypt_backup, get_or_generate_backup_encryption_key
+	from frappe.utils.backups import decrypt_backup
 
 	# Check for the backup file in the backup directory, as well as the main bench directory
 	dirs = (f"{site}/private/backups", "..")
-
-	# Try to resolve path to the file if we can't find it directly
 	if not Path(sql_file_path).exists():
-		click.secho(
-			f"File {sql_file_path} not found. Trying to check in alternative directories.", fg="yellow"
-		)
+		click.secho(f"File {sql_file_path} not found. Trying alternative directories.", fg="yellow")
 		for dir in dirs:
 			potential_path = Path(dir) / Path(sql_file_path)
 			if potential_path.exists():
 				sql_file_path = str(potential_path.resolve())
-				click.secho(f"File {sql_file_path} found.", fg="green")
+				click.secho(f"Found at {sql_file_path}", fg="green")
 				break
 		else:
 			click.secho(f"File {sql_file_path} not found.", fg="red")
@@ -258,21 +282,33 @@ def _restore(
 	if err:
 		click.secho("Failed to detect type of backup file", fg="red")
 		sys.exit(1)
+	is_encrypted = "encrypted data" in out.decode().split(":")[-1].strip()
 
-	if "AES" in out.decode().split(":")[-1].strip():
-		if encryption_key:
-			click.secho("Encrypted backup file detected. Decrypting using provided key.", fg="yellow")
+	# ---- Progress reporting: total = 2 mandatory (locate + restore) + optional phases
 
-		else:
-			click.secho("Encrypted backup file detected. Decrypting using site config.", fg="yellow")
-			encryption_key = get_or_generate_backup_encryption_key()
+	total_phases = 2 + int(is_encrypted) + int(bool(with_public_files)) + int(bool(with_private_files))
+	phase = 0
+
+	def _phase(msg: str, colour: str = "cyan") -> None:
+		nonlocal phase
+		phase += 1
+		click.secho(f"[{phase}/{total_phases}] {msg}", fg=colour)
+
+	_phase("Located backup file")
+	backup_size = frappe.utils.get_file_size(sql_file_path, format=True)
+	click.secho(f"      {os.path.basename(sql_file_path)} ({backup_size})", fg="green")
+
+	if is_encrypted:
+		_phase("Decrypting backup", colour="yellow")
+		encryption_key = _get_encryption_key(provided_key=encryption_key, non_interactive=non_interactive)
 
 		with decrypt_backup(sql_file_path, encryption_key):
 			# Rollback on unsuccessful decryption
 			if not os.path.exists(sql_file_path):
-				click.secho("Decryption failed. Please provide a valid key and try again.", fg="red")
+				click.secho("      Decryption failed. Please provide a valid key and try again.", fg="red")
 				sys.exit(1)
 
+			_phase("Restoring database")
 			restore_backup(
 				sql_file_path,
 				site,
@@ -284,6 +320,7 @@ def _restore(
 				force,
 			)
 	else:
+		_phase("Restoring database")
 		restore_backup(
 			sql_file_path,
 			site,
@@ -295,28 +332,24 @@ def _restore(
 			force,
 		)
 
-	# Extract public and/or private files to the restored site, if user has given the path
+	# Extract public and/or private files to the restored site, if user has given the path.
+	# extract_files now extracts directly from the source archive — no copy is made into
+	# the site dir, so no post-extract os.remove() is needed here.
 	if with_public_files:
-		# Decrypt data if there is a Key
+		_phase("Restoring public files")
 		if encryption_key:
 			with decrypt_backup(with_public_files, encryption_key):
-				public = extract_files(site, with_public_files)
+				extract_files(site, with_public_files)
 		else:
-			public = extract_files(site, with_public_files)
-
-		# Removing temporarily created file
-		os.remove(public)
+			extract_files(site, with_public_files)
 
 	if with_private_files:
-		# Decrypt data if there is a Key
+		_phase("Restoring private files")
 		if encryption_key:
 			with decrypt_backup(with_private_files, encryption_key):
-				private = extract_files(site, with_private_files)
+				extract_files(site, with_private_files)
 		else:
-			private = extract_files(site, with_private_files)
-
-		# Removing temporarily created file
-		os.remove(private)
+			extract_files(site, with_private_files)
 
 	success_message = "Site {} has been restored{}".format(
 		site, " with files" if (with_public_files or with_private_files) else ""
@@ -379,17 +412,27 @@ def restore_backup(
 
 
 @click.command("partial-restore")
-@click.argument("sql-file-path")
+@click.argument(
+	"sql-file-path",
+	type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+)
 @click.option("--verbose", "-v", is_flag=True)
-@click.option("--encryption-key", help="Backup encryption key")
+@click.option(
+	"--encryption-key",
+	envvar="FRAPPE_BACKUP_ENCRYPTION_KEY",
+	show_envvar=True,
+	help="Backup encryption key",
+)
+@click.option(
+	"--non-interactive",
+	is_flag=True,
+	default=False,
+	help="Fail instead of prompting for a missing encryption key",
+)
 @pass_context
-def partial_restore(context: CliCtxObj, sql_file_path, verbose, encryption_key=None):
+def partial_restore(context: CliCtxObj, sql_file_path, verbose, encryption_key=None, non_interactive=False):
 	from frappe.installer import is_partial, partial_restore
-	from frappe.utils.backups import decrypt_backup, get_or_generate_backup_encryption_key
-
-	if not os.path.exists(sql_file_path):
-		print("Invalid path", sql_file_path)
-		sys.exit(1)
+	from frappe.utils.backups import decrypt_backup
 
 	site = get_site(context)
 	verbose = context.verbose or verbose
@@ -405,14 +448,8 @@ def partial_restore(context: CliCtxObj, sql_file_path, verbose, encryption_key=N
 		click.secho("Failed to detect type of backup file", fg="red")
 		sys.exit(1)
 
-	if "cipher" in out.decode().split(":")[-1].strip():
-		if encryption_key:
-			click.secho("Encrypted backup file detected. Decrypting using provided key.", fg="yellow")
-			key = encryption_key
-
-		else:
-			click.secho("Encrypted backup file detected. Decrypting using site config.", fg="yellow")
-			key = get_or_generate_backup_encryption_key()
+	if "encrypted data" in out.decode().split(":")[-1].strip():
+		key = _get_encryption_key(provided_key=encryption_key, non_interactive=non_interactive)
 
 		with decrypt_backup(sql_file_path, key):
 			if not is_partial(sql_file_path):
@@ -439,6 +476,27 @@ def partial_restore(context: CliCtxObj, sql_file_path, verbose, encryption_key=N
 
 		partial_restore(sql_file_path, verbose)
 	frappe.destroy()
+
+
+def _get_encryption_key(provided_key: str | None = None, non_interactive: bool = False) -> str:
+	from frappe.utils.backups import BACKUP_ENCRYPTION_CONFIG_KEY
+
+	if provided_key:
+		click.secho("Encrypted backup file detected. Decrypting using provided key.", fg="yellow")
+		return provided_key
+
+	if site_config_key := frappe.conf.get(BACKUP_ENCRYPTION_CONFIG_KEY):
+		click.secho("Encrypted backup file detected. Decrypting using site config.", fg="yellow")
+		return site_config_key
+
+	may_prompt = not non_interactive and not os.environ.get("CI")
+	if may_prompt and sys.__stdin__ and sys.__stdin__.isatty():
+		click.secho("Encryption key is required to decrypt the backup file.", fg="yellow")
+		if prompted_key := getpass.getpass("Enter encryption key: "):
+			return prompted_key
+
+	click.secho("Encryption key is required to decrypt the backup file.", fg="red")
+	sys.exit(1)
 
 
 @click.command("reinstall")
@@ -551,7 +609,8 @@ def list_apps(context: CliCtxObj, format):
 		name_len = max(len(app.app_name) for app in apps)
 		ver_len = max(len(app.app_version) for app in apps)
 		template = f"{{0:{name_len}}} {{1:{ver_len}}} {{2}}"
-		return template.format(app.app_name, app.app_version, app.git_branch)
+		row = template.format(app.app_name, app.app_version, app.git_branch)
+		return f"{row} (disabled)" if app.get("disabled") else row
 
 	for site in context.sites:
 		frappe.init(site)
@@ -706,24 +765,43 @@ def disable_user(context: CliCtxObj, email):
 
 @click.command("migrate")
 @click.option("--skip-failing", is_flag=True, help="Skip patches that fail to run")
-@click.option("--skip-search-index", is_flag=True, help="Skip search indexing for web documents")
+@click.option(
+	"--skip-search-index",
+	is_flag=True,
+	help=(
+		"Deprecated and ignored because website search indexing has been removed. Remove this option from "
+		"migration scripts; it will be removed in v17."
+	),
+)
 @click.option("--skip-fixtures", is_flag=True, help="Skip loading fixtures")
 @pass_context
 def migrate(context: CliCtxObj, skip_failing=False, skip_search_index=False, skip_fixtures=False):
 	"Run patches, sync schema and rebuild files/translations"
+	if skip_search_index:
+		click.secho(
+			"Warning: --skip-search-index is deprecated and has no effect because website search indexing "
+			"has been removed. Remove it from your migration command; it will be removed in v17.",
+			fg="yellow",
+			err=True,
+		)
 
 	from frappe.migrate import SiteMigration
 
 	for site in context.sites:
 		click.secho(f"Migrating {site}", fg="green")
 		try:
-			SiteMigration(
-				skip_failing=skip_failing, skip_search_index=skip_search_index, skip_fixtures=skip_fixtures
-			).run(site=site)
+			SiteMigration(skip_failing=skip_failing, skip_fixtures=skip_fixtures).run(site=site)
 		finally:
 			print()
 	if not context.sites:
 		raise SiteNotSpecifiedError
+
+
+@click.command("build-search-index")
+@pass_context
+def build_search_index(context: CliCtxObj):
+	"""Kept for compatibility; website search indexing has been removed."""
+	get_site(context)
 
 
 @click.command("migrate-to")
@@ -835,11 +913,36 @@ def use(site, sites_path="."):
 	type=str,
 	help="Specify the DocTypes to not backup seperated by commas",
 )
-@click.option("--backup-path", default=None, help="Set path for saving all the files in this operation")
-@click.option("--backup-path-db", default=None, help="Set path for saving database file")
-@click.option("--backup-path-files", default=None, help="Set path for saving public file")
-@click.option("--backup-path-private-files", default=None, help="Set path for saving private file")
-@click.option("--backup-path-conf", default=None, help="Set path for saving config file")
+@click.option(
+	"--backup-path",
+	default=None,
+	type=click.Path(dir_okay=True, file_okay=False, resolve_path=True),
+	help="Set path for saving all the files in this operation",
+)
+@click.option(
+	"--backup-path-db",
+	default=None,
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Set path for saving database file",
+)
+@click.option(
+	"--backup-path-files",
+	default=None,
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Set path for saving public file",
+)
+@click.option(
+	"--backup-path-private-files",
+	default=None,
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Set path for saving private file",
+)
+@click.option(
+	"--backup-path-conf",
+	default=None,
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Set path for saving config file",
+)
 @click.option(
 	"--ignore-backup-conf",
 	default=False,
@@ -894,9 +997,10 @@ def backup(
 				old_backup_metadata=old_backup_metadata,
 				rollback_callback=rollback_callback,
 			)
-		except Exception:
+		except Exception as e:
+			error_msg = str(e).strip() or "Database or site_config.json may be corrupted"
 			click.secho(
-				f"Backup failed for Site {site}. Database or site_config.json may be corrupted",
+				f"Backup failed for Site {site}: {error_msg}",
 				fg="red",
 			)
 			if rollback_callback:
@@ -940,6 +1044,43 @@ def remove_from_installed_apps(context: CliCtxObj, app):
 			frappe.init(site)
 			frappe.connect()
 			remove_from_installed_apps(app)
+		finally:
+			frappe.destroy()
+	if not context.sites:
+		raise SiteNotSpecifiedError
+
+
+@click.command("enable-app")
+@click.argument("app")
+@pass_context
+def enable_app(context: CliCtxObj, app):
+	"Enable an app that was disabled on site"
+	from frappe.installer import enable_app as _enable_app
+
+	for site in context.sites:
+		try:
+			frappe.init(site)
+			frappe.connect()
+			_enable_app(app)
+		finally:
+			frappe.destroy()
+	if not context.sites:
+		raise SiteNotSpecifiedError
+
+
+@click.command("disable-app")
+@click.argument("app")
+@pass_context
+def disable_app(context: CliCtxObj, app):
+	"Disable an app on site, keeping its schema and data intact"
+	ensure_app_not_frappe(app)
+	from frappe.installer import disable_app as _disable_app
+
+	for site in context.sites:
+		try:
+			frappe.init(site)
+			frappe.connect()
+			_disable_app(app)
 		finally:
 			frappe.destroy()
 	if not context.sites:
@@ -991,7 +1132,10 @@ def uninstall(context: CliCtxObj, app, dry_run, yes, no_backup, force):
 	"--root-password",
 	help="Root password for MariaDB or PostgreSQL",
 )
-@click.option("--archived-sites-path")
+@click.option(
+	"--archived-sites-path",
+	type=click.Path(dir_okay=True, file_okay=False, resolve_path=True),
+)
 @click.option("--no-backup", is_flag=True, default=False)
 @click.option("--force", help="Force drop-site even if an error is encountered", is_flag=True, default=False)
 def drop_site(
@@ -1040,6 +1184,7 @@ def _drop_site(
 			sys.exit(1)
 
 	click.secho("Dropping site database and user", fg="green")
+	frappe.db.close()
 
 	frappe.flags.root_login = db_root_username
 	frappe.flags.root_password = db_root_password
@@ -1105,8 +1250,6 @@ def set_admin_password(context: CliCtxObj, admin_password=None, logout_all_sessi
 
 
 def set_user_password(site, user, password, logout_all_sessions=False):
-	import getpass
-
 	from frappe.utils.password import update_password
 
 	try:
@@ -1121,6 +1264,7 @@ def set_user_password(site, user, password, logout_all_sessions=False):
 			sys.exit(1)
 
 		update_password(user=user, pwd=password, logout_all_sessions=logout_all_sessions)
+		frappe.db.set_value("User", user, "last_password_reset_date", frappe.utils.today())
 		frappe.db.commit()
 	finally:
 		frappe.destroy()
@@ -1186,28 +1330,34 @@ def publish_realtime(context: CliCtxObj, event, message, room, user, doctype, do
 @click.argument("site", required=False)
 @click.option("--user", required=False, help="Login as user")
 @click.option(
+	"--sid", "print_sid", is_flag=True, help="Print the generated session id instead of opening the browser"
+)
+@click.option(
 	"--session-end",
 	required=False,
 	help="Session end (in ISO8601 format and timezone-aware - 2025-01-24T12:26:29.200853+00:00)",
 )
 @click.option("--user-for-audit", required=False, help="The user to mention in audit trail")
+@click.option("--dev", is_flag=True, help="Force the port in the URL, for a development server")
 @pass_context
 def browse(
 	context: CliCtxObj,
 	site,
 	user: str | None = None,
+	print_sid: bool = False,
 	session_end: str | None = None,
 	user_for_audit: str | None = None,
+	dev: bool = False,
 ):
 	"""Opens the site on web browser"""
+	import webbrowser
+	from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
 	from frappe.auth import CookieManager, LoginManager
 
-	site = get_site(context, raise_err=False) or site
+	site = site or get_site(context)
 
-	if not site:
-		raise SiteNotSpecifiedError
-
-	if site not in frappe.utils.get_sites():
+	if site not in frappe.utils.get_sites() and not os.path.isfile(os.path.join(site, "site_config.json")):
 		click.echo(f"\nSite named {click.style(site, bold=True)} doesn't exist\n", err=True)
 		sys.exit(1)
 
@@ -1215,6 +1365,7 @@ def browse(
 	frappe.connect()
 
 	sid = ""
+	login_path = ""
 	if user:
 		if not frappe.db.exists("User", user):
 			click.echo(f"User {user} does not exist")
@@ -1225,16 +1376,30 @@ def browse(
 			frappe.local.cookie_manager = CookieManager()
 			frappe.local.login_manager = LoginManager()
 			frappe.local.login_manager.login_as(user, session_end, user_for_audit)
-			sid = f"/app?sid={frappe.session.sid}"
+			sid = frappe.session.sid
+			# frappe.local.response.home_page is set in LoginManager.login_as()
+			home_page = urlparse(frappe.local.response.home_page)
+			query = urlencode(dict(parse_qsl(home_page.query)) | {"sid": sid})
+			login_path = urlunparse(home_page._replace(query=query))
 		else:
-			click.echo("Please enable developer mode to login as a user")
+			click.echo(
+				"Only browsing as Administrator is supported outside development environments.", err=True
+			)
+			sys.exit(1)
 
-	url = f"{frappe.utils.get_site_url(site)}{sid}"
+	if print_sid:
+		if not sid:
+			click.echo("--sid requires --user and a generated session id", err=True)
+			sys.exit(1)
+		click.echo(sid)
+		return
 
-	if user == "Administrator":
-		click.echo(f"Login URL: {url}")
+	url = frappe.utils.get_url(login_path, allow_header_override=False, for_dev_server=dev)
 
-	click.launch(url)
+	click.echo(f"URL: {url}")
+
+	if not os.environ.get("SSH_CONNECTION"):
+		webbrowser.open(url)
 
 
 @click.command("start-recording")
@@ -1310,25 +1475,6 @@ def start_ngrok(context: CliCtxObj, bind_tls, use_default_authtoken):
 		ngrok.kill()
 
 
-@click.command("build-search-index")
-@pass_context
-def build_search_index(context):
-	"""Rebuild search index used by global search."""
-	from frappe.search.website_search import build_index_for_all_routes
-
-	site = get_site(context)
-	if not site:
-		raise SiteNotSpecifiedError
-
-	print(f"Building search index for {site}")
-	frappe.init(site)
-	frappe.connect()
-	try:
-		build_index_for_all_routes()
-	finally:
-		frappe.destroy()
-
-
 @click.command("clear-log-table")
 @click.option("--doctype", required=True, type=str, help="Log DocType")
 @click.option("--days", type=int, help="Keep records for days")
@@ -1344,6 +1490,7 @@ def clear_log_table(context: CliCtxObj, doctype, days, no_backup):
 	"""
 	from frappe.core.doctype.log_settings.log_settings import clear_log_table as clear_logs
 	from frappe.utils.backups import scheduled_backup
+	from frappe.utils.logging import is_log_doctype
 
 	if not context.sites:
 		raise SiteNotSpecifiedError
@@ -1355,17 +1502,25 @@ def clear_log_table(context: CliCtxObj, doctype, days, no_backup):
 		if doctype not in frappe.get_hooks("default_log_clearing_doctypes", {}):
 			raise frappe.ValidationError(f"Unsupported logging DocType: {doctype}")
 
+		stored_in_log_db = is_log_doctype(doctype)
+
 		if not no_backup:
-			scheduled_backup(
-				ignore_conf=False,
-				include_doctypes=doctype,
-				ignore_files=True,
-				force=True,
-			)
-			click.echo(f"Backed up {doctype}")
+			if stored_in_log_db:
+				# `scheduled_backup` dumps tables out of the site's primary database, and a
+				# log DocType has none there -- asking for one aborts the whole command.
+				click.echo(f"Skipping backup: {doctype} is stored in the site's log database")
+			else:
+				scheduled_backup(
+					ignore_conf=False,
+					include_doctypes=doctype,
+					ignore_files=True,
+					force=True,
+				)
+				click.echo(f"Backed up {doctype}")
 
 		try:
-			click.echo(f"Copying {doctype} records from last {days} days to temporary table.")
+			if not stored_in_log_db:
+				click.echo(f"Copying {doctype} records from last {days} days to temporary table.")
 			clear_logs(doctype, days=days)
 		except Exception as e:
 			click.echo(f"Log cleanup for {doctype} failed:\n{e}")
@@ -1399,25 +1554,7 @@ def trim_database(context: CliCtxObj, dry_run, format, no_backup, yes=False):
 		frappe.init(site)
 		frappe.connect()
 
-		TABLES_TO_DROP = []
-		STANDARD_TABLES = get_standard_tables()
-		information_schema = frappe.qb.Schema("information_schema")
-		table_name = frappe.qb.Field("table_name").as_("name")
-
-		database_tables: list[str] = (
-			frappe.qb.from_(information_schema.tables)
-			.select(table_name)
-			.where(information_schema.tables.table_schema == frappe.conf.db_name)
-			.where(information_schema.tables.table_type == "BASE TABLE")
-			.run(pluck=True)
-		)
-		doctype_tables = frappe.get_all("DocType", pluck="name")
-
-		for table_name in database_tables:
-			if not table_name.startswith("tab"):
-				continue
-			if table_name.replace("tab", "", 1) not in doctype_tables and table_name not in STANDARD_TABLES:
-				TABLES_TO_DROP.append(table_name)
+		TABLES_TO_DROP = get_ghost_tables()
 
 		if not TABLES_TO_DROP:
 			if format == "text":
@@ -1452,6 +1589,7 @@ def trim_database(context: CliCtxObj, dry_run, format, no_backup, yes=False):
 					print(f"* Dropping Table '{table}'...")
 				frappe.db.sql_ddl(f"drop table `{table}`")
 
+			frappe.db.commit()  # nosemgrep: frappe-semgrep-rules.rules.frappe-manual-commit
 			ALL_DATA[frappe.local.site] = TABLES_TO_DROP
 		frappe.destroy()
 
@@ -1459,6 +1597,40 @@ def trim_database(context: CliCtxObj, dry_run, format, no_backup, yes=False):
 		import json
 
 		print(json.dumps(ALL_DATA, indent=1))
+
+
+def get_ghost_tables() -> list[str]:
+	"""Return tables of DocTypes that no longer exist."""
+	ghost_tables = []
+	standard_tables = get_standard_tables()
+	doctype_tables = [
+		f"tab{doctype}"[: frappe.db.MAX_COLUMN_LENGTH] for doctype in frappe.get_all("DocType", pluck="name")
+	]
+
+	for table_name in get_base_tables():
+		if not table_name.startswith("tab"):
+			continue
+		if table_name not in doctype_tables and table_name not in standard_tables:
+			ghost_tables.append(table_name)
+
+	return ghost_tables
+
+
+def get_base_tables() -> list[str]:
+	"""Return database tables, leaving out views and sequences."""
+	if frappe.db.db_type != "mariadb":
+		return frappe.db.get_tables(cached=False)
+
+	information_schema = frappe.qb.Schema("information_schema")
+	table_name = frappe.qb.Field("table_name").as_("name")
+
+	return (
+		frappe.qb.from_(information_schema.tables)
+		.select(table_name)
+		.where(information_schema.tables.table_schema == frappe.conf.db_name)
+		.where(information_schema.tables.table_type == "BASE TABLE")
+		.run(pluck=True)
+	)
 
 
 def get_standard_tables():
@@ -1600,31 +1772,28 @@ def bypass_patch(context: CliCtxObj, patch_name: str, yes: bool):
 @click.command("sync-desktop-icons")
 @pass_context
 def sync_desktop_icons(context: CliCtxObj):
-	from frappe.model.sync import import_file_by_path
-	from frappe.modules.utils import get_app_level_directory_path
-	from frappe.utils import update_progress_bar
+	from frappe.desk.doctype.desktop_icon.desktop_icon import import_desktop_icon_fixtures
+	from frappe.desk.doctype.desktop_settings.desktop_settings import is_desktop_icons_page
 
-	files = []
-	app_level_folders = ["desktop_icon"]
 	for site in context.sites:
-		print("Sycning icons for " + site)
-		frappe.init(site)
-		frappe.connect()
-		for app_name in frappe.get_installed_apps():
-			for folder_name in app_level_folders:
-				directory_path = get_app_level_directory_path(folder_name, app_name)
-				if os.path.exists(directory_path):
-					icon_files = [
-						os.path.join(directory_path, filename) for filename in os.listdir(directory_path)
-					]
-					for doc_path in icon_files:
-						files.append(doc_path)
-		for i, doc_path in enumerate(files):
-			imported = import_file_by_path(doc_path, force=True, ignore_version=True)
-			if imported:
-				frappe.db.commit(chain=True)
+		try:
+			frappe.init(site)
+			frappe.connect()
 
-			update_progress_bar("Updating Desktop Icons", i, len(files))
+			# The import carries the desktop-mode guard, so say why nothing happened rather
+			# than reporting a sync that imported nothing.
+			if not is_desktop_icons_page():
+				click.secho(
+					f"{site} is on the Apps desktop and holds no icon rows; "
+					"switch Desktop Settings -> Desktop Page to sync icons.",
+					fg="yellow",
+				)
+				continue
+
+			click.secho(f"Syncing icons for {site}")
+			import_desktop_icon_fixtures(force=True)
+		finally:
+			frappe.destroy()
 
 
 commands = [
@@ -1634,6 +1803,8 @@ commands = [
 	describe_database_table,
 	backup,
 	drop_site,
+	disable_app,
+	enable_app,
 	install_app,
 	list_apps,
 	migrate,

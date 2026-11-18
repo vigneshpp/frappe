@@ -4,12 +4,14 @@ import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.permissions import add_permission, update_permission_property
 from frappe.query_builder import Field
-from frappe.query_builder.functions import Abs, Count, Ifnull, Max, Now, Timestamp
+from frappe.query_builder.functions import Abs, Cast, Count, Ifnull, Max, Now, Timestamp
 from frappe.tests import IntegrationTestCase
 from frappe.tests.classes.context_managers import enable_safe_exec
 from frappe.tests.test_db_query import (
 	create_nested_doctype,
 	create_nested_doctype_records,
+	setup_autoincrement_link_doctypes,
+	setup_autoincrement_parent_doctypes,
 	setup_patched_blog_post,
 	setup_test_user,
 )
@@ -64,7 +66,9 @@ def create_tree_docs():
 
 
 class TestQuery(IntegrationTestCase):
-	def setUp(self):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
 		setup_for_tests()
 
 	def ensure_system_manager(self, user_doc, should_have: bool):
@@ -92,6 +96,16 @@ class TestQuery(IntegrationTestCase):
 			).get_sql(),
 			query,
 		)
+
+	def test_like_filter_on_non_text_field(self):
+		query = frappe.qb.get_query("DocType", fields=["name"], filters={"docstatus": ["like", "0"]})
+		names = query.run(pluck=True)
+
+		self.assertIn("DocType", names)
+		if frappe.db.db_type == "postgres":
+			self.assertIn('CAST("DOCSTATUS" AS VARCHAR) ILIKE', query.get_sql().upper())
+		else:
+			self.assertNotIn("CAST(", query.get_sql().upper())
 
 	def test_string_fields(self):
 		self.assertEqual(
@@ -371,10 +385,10 @@ class TestQuery(IntegrationTestCase):
 				fields=["name"],
 				filters={"module.app_name": "frappe"},
 			).get_sql(),
-			"SELECT `tabDocType`.`name` FROM `tabDocType` LEFT JOIN `tabModule Def` ON `tabModule Def`.`name`=`tabDocType`.`module` WHERE `tabModule Def`.`app_name`='frappe'",
+			"SELECT `tabDocType`.`name` FROM `tabDocType` LEFT JOIN `tabModule Def` `tab_Module Def_1` ON `tab_Module Def_1`.`name`=`tabDocType`.`module` WHERE `tab_Module Def_1`.`app_name`='frappe'",
 		)
 
-		query = "SELECT `tabDocType`.`name` FROM `tabDocType` LEFT JOIN `tabModule Def` ON `tabModule Def`.`name`=`tabDocType`.`module` WHERE `tabModule Def`.`app_name` LIKE 'frap%'"
+		query = "SELECT `tabDocType`.`name` FROM `tabDocType` LEFT JOIN `tabModule Def` `tab_Module Def_1` ON `tab_Module Def_1`.`name`=`tabDocType`.`module` WHERE `tab_Module Def_1`.`app_name` LIKE 'frap%'"
 		query = query.replace("LIKE", "ILIKE" if frappe.db.db_type == "postgres" else "LIKE")
 		self.assertQueryEqual(
 			frappe.qb.get_query(
@@ -756,7 +770,7 @@ class TestQuery(IntegrationTestCase):
 				"DocType",
 				fields=["name", "module.app_name as app_name"],
 			).get_sql(),
-			"SELECT `tabDocType`.`name`,`tabModule Def`.`app_name` `app_name` FROM `tabDocType` LEFT JOIN `tabModule Def` ON `tabModule Def`.`name`=`tabDocType`.`module`",
+			"SELECT `tabDocType`.`name`,`tab_Module Def_1`.`app_name` `app_name` FROM `tabDocType` LEFT JOIN `tabModule Def` `tab_Module Def_1` ON `tab_Module Def_1`.`name`=`tabDocType`.`module`",
 		)
 
 	# fields now has strict validation, so this test is not valid anymore
@@ -780,6 +794,15 @@ class TestQuery(IntegrationTestCase):
 		# Format decendants result
 		descendants_result = list(itertools.chain.from_iterable(descendants_result))
 		self.assertListEqual(descendants_result, get_descendants_of("Test Tree DocType", "Parent 1"))
+		self.assertListEqual(
+			frappe.get_all(
+				"Test Tree DocType",
+				filters={"name": ("Descendants Of", "Parent 1")},
+				order_by="creation desc",
+				pluck="name",
+			),
+			get_descendants_of("Test Tree DocType", "Parent 1"),
+		)
 
 		ancestors_result = frappe.qb.get_query(
 			"Test Tree DocType",
@@ -1148,6 +1171,60 @@ class TestQuery(IntegrationTestCase):
 		).run(as_dict=True)
 		self.assertTrue(len(result) > 0, "Should be able to filter User by user_type and enabled")
 
+	def test_core_doctype_filterable_fields_with_read_and_select_permission(self):
+		"""Read+select on User should still allow filtering by user_type."""
+		test_role = "CoreReadSelectTestRole"
+		test_user_email = "test2@example.com"
+
+		frappe.set_user("Administrator")
+		test_user = frappe.get_doc("User", test_user_email)
+		test_user.remove_roles(test_role)
+		frappe.delete_doc("Role", test_role, ignore_missing=True, force=True)
+
+		frappe.get_doc({"doctype": "Role", "role_name": test_role}).insert(ignore_if_duplicate=True)
+		# read defaults to 1 on a new Custom DocPerm row — leave it on, unlike the
+		# select-only test above, so both read and select are granted at once.
+		add_permission("User", test_role, 0, ptype="select")
+		test_user.add_roles(test_role)
+
+		def cleanup():
+			frappe.set_user("Administrator")
+			test_user.remove_roles(test_role)
+			frappe.delete_doc("Role", test_role, ignore_missing=True, force=True)
+
+		self.addCleanup(cleanup)
+
+		frappe.set_user(test_user_email)
+
+		self.assertFalse(
+			frappe.only_has_select_perm("User"),
+			"Sanity check: user should have read as well as select, not select-only",
+		)
+
+		# filter by user_type and enabled — the exact filters used by search_link for assignment
+		result = frappe.qb.get_query(
+			"User",
+			filters={"user_type": "System User", "enabled": 1},
+			fields=["name"],
+			ignore_permissions=False,
+		).run(as_dict=True)
+		self.assertTrue(
+			len(result) > 0,
+			"Should be able to filter User by user_type and enabled with read+select permission",
+		)
+
+		# the exemption is filter-only - explicitly requesting user_type as an output
+		# field should not return its value (field-level read permission drops it silently)
+		qb_result = frappe.qb.get_query("User", fields=["name", "user_type"], ignore_permissions=False).run(
+			as_dict=True
+		)
+		self.assertTrue(qb_result)
+		self.assertNotIn("user_type", qb_result[0])
+
+		list_result = frappe.get_list("User", fields=["name", "user_type"], limit=3)
+		self.assertTrue(list_result)
+		self.assertNotIn("user_type", list_result[0])
+
 	def test_nested_permission(self):
 		"""Test permission on nested doctypes"""
 		frappe.set_user("Administrator")
@@ -1198,6 +1275,58 @@ class TestQuery(IntegrationTestCase):
 		result = frappe.qb.get_query("DocType", filters={"autoname": ["is", "set"]}).run(as_dict=1)
 		self.assertFalse(any(d.name == "Property Setter" for d in result))
 
+	def test_is_set_is_not_set_on_non_text_fields(self):
+		values = {
+			"Int": 1,
+			"Float": 1.5,
+			"Check": 1,
+			"Rating": 0.6,
+			"Duration": 3600,
+			"Date": "2026-09-29",
+			"Datetime": "2026-09-29 10:00:00",
+			"Time": "10:00:00",
+		}
+		fieldnames = {fieldtype: f"{frappe.scrub(fieldtype)}_field" for fieldtype in values}
+		doctype = new_doctype(
+			fields=[{"fieldname": fieldnames[fieldtype], "fieldtype": fieldtype} for fieldtype in values]
+		).insert()
+		filled = frappe.get_doc(
+			{"doctype": doctype.name, **{fieldnames[fieldtype]: value for fieldtype, value in values.items()}}
+		).insert()
+		empty = frappe.get_doc({"doctype": doctype.name}).insert()
+
+		for fieldname in fieldnames.values():
+			for value, expected in (("set", filled.name), ("not set", empty.name)):
+				with self.subTest(fieldname=fieldname, value=value):
+					query = frappe.qb.get_query(doctype.name, filters={fieldname: ["is", value]})
+					self.assertEqual(query.run(pluck="name"), [expected])
+
+		self.assertFalse(frappe.qb.get_query(doctype.name, filters={"docstatus": ["is", "set"]}).run())
+		self.assertFalse(frappe.qb.get_query(doctype.name, filters={"modified": ["is", "not set"]}).run())
+
+	def test_ifnull_filters_on_numeric_fields(self):
+		fieldtypes = ("Rating", "Duration")
+		fieldnames = {fieldtype: f"{frappe.scrub(fieldtype)}_field" for fieldtype in fieldtypes}
+		doctype = new_doctype(
+			fields=[
+				{"fieldname": fieldname, "fieldtype": fieldtype}
+				for fieldtype, fieldname in fieldnames.items()
+			]
+		).insert()
+		filled = frappe.get_doc({"doctype": doctype.name, **dict.fromkeys(fieldnames.values(), 1)}).insert()
+		empty = frappe.get_doc({"doctype": doctype.name}).insert()
+
+		for fieldname in fieldnames.values():
+			for operator, value, expected in (
+				("<", 1, empty.name),
+				("=", 0, empty.name),
+				("!=", 0, filled.name),
+				("!=", None, filled.name),
+			):
+				with self.subTest(fieldname=fieldname, operator=operator, value=value):
+					filters = {fieldname: [operator, value]}
+					self.assertEqual(frappe.get_all(doctype.name, filters=filters, pluck="name"), [expected])
+
 	def test_permission_query_condition(self):
 		"""Test permission query condition being applied from hooks and server script"""
 		from frappe.desk.doctype.dashboard_settings.dashboard_settings import create_dashboard_settings
@@ -1238,6 +1367,46 @@ class TestQuery(IntegrationTestCase):
 		script.delete()
 		frappe.clear_cache()
 		frappe.hooks.permission_query_conditions = original_hooks
+
+	def test_permission_query_condition_supports_pypika(self):
+		"""A permission_query_conditions hook may return a pypika criterion, not just a SQL string."""
+		from frappe.desk.doctype.dashboard_settings.dashboard_settings import create_dashboard_settings
+
+		self.user = "test@example.com"
+		create_dashboard_settings(self.user)
+
+		with self.patch_hooks(
+			{
+				"permission_query_conditions": {
+					"Dashboard Settings": ["frappe.tests.test_query.test_permission_hook_criterion"]
+				}
+			}
+		):
+			query = frappe.qb.get_query("Dashboard Settings", user=self.user, ignore_permissions=False)
+
+			# The criterion must render to valid SQL that matches the user's own record.
+			# Before pypika support, the term was str()-coerced into a string-literal
+			# comparison (e.g. "name"='...') that never matched, so the row went missing.
+			names = [d.name for d in query.run(as_dict=True)]
+			self.assertIn(self.user, names)
+
+	def test_match_conditions_escape_hook_values(self):
+		frappe.get_doc(doctype="ToDo", description="_Test Unrelated").insert()
+		self.assertEqual(self.get_todos_matching("frappe.tests.test_query.todo_breakout_hook"), [])
+
+	def test_match_conditions_keep_hook_values(self):
+		todo = frappe.get_doc(doctype="ToDo", description="back\\slash' 100%").insert()
+		self.assertEqual(self.get_todos_matching("frappe.tests.test_query.todo_backslash_hook"), [todo.name])
+
+	def get_todos_matching(self, hook):
+		from frappe.database.query import Engine
+
+		with self.patch_hooks({"permission_query_conditions": {"ToDo": [hook]}}):
+			engine = Engine()
+			engine.get_query("ToDo", user="test@example.com", db_query_compat=True)
+			condition = engine.build_match_conditions()
+
+		return frappe.db.sql(f"select name from `tabToDo` where {condition}", pluck=True)
 
 	def test_link_field_target_permission(self):
 		"""Test that accessing link_field.target_field respects target field's permlevel."""
@@ -1349,6 +1518,281 @@ class TestQuery(IntegrationTestCase):
 		test_user_doc.remove_roles(test_role)
 		frappe.delete_doc("Role", test_role, force=True)
 
+	def test_link_table_field_optional_link_not_filtered_by_target_permission_conditions(self):
+		"""An optional (empty) Link field fetched via dot-notation must not cause the
+		parent row to disappear because of the *target* doctype's permission_query_conditions.
+
+		LinkTableField.apply_join LEFT JOINs the linked doctype and applies the target's
+		permission_query_conditions as a WHERE clause. When the link value is empty, the
+		joined row is entirely NULL, so any non-trivial condition on it evaluates false and
+		silently drops the parent row -- even though the parent row never referenced
+		anything the user isn't allowed to see. The condition belongs in the JOIN's ON
+		clause, where it only ever affects what gets attached, never whether the parent
+		row survives.
+		"""
+		target_dt_name = "TargetDocForOptionalLink"
+		source_dt_name = "SourceDocForOptionalLink"
+		test_role = "OptionalLinkPermTestRole"
+		test_user = "test3@example.com"
+
+		# Cleanup previous runs
+		frappe.set_user("Administrator")
+		frappe.delete_doc("DocType", source_dt_name, ignore_missing=True, force=True)
+		frappe.delete_doc("DocType", target_dt_name, ignore_missing=True, force=True)
+		frappe.delete_doc("Role", test_role, ignore_missing=True, force=True)
+		test_user_doc = frappe.get_doc("User", test_user)
+		test_user_doc.remove_roles(test_role)
+
+		# Create Doctypes: source has an OPTIONAL link to target
+		target_dt = new_doctype(
+			target_dt_name,
+			fields=[{"fieldname": "value", "fieldtype": "Data", "label": "Value"}],
+		).insert(ignore_if_duplicate=True)
+
+		source_dt = new_doctype(
+			source_dt_name,
+			fields=[
+				{
+					"fieldname": "link_field",
+					"fieldtype": "Link",
+					"options": target_dt_name,
+					"label": "Link Field",
+					"reqd": 0,
+				}
+			],
+		).insert(ignore_if_duplicate=True)
+
+		# Setup Role and Permissions
+		frappe.get_doc({"doctype": "Role", "role_name": test_role}).insert(ignore_if_duplicate=True)
+		add_permission(source_dt_name, test_role, 0, ptype="read")
+		add_permission(target_dt_name, test_role, 0, ptype="read")
+		test_user_doc.add_roles(test_role)
+
+		# Create records: one source doc points at a target, the other has no link at all
+		target_doc = frappe.get_doc(doctype=target_dt_name, value="Secret Data").insert(
+			ignore_permissions=True
+		)
+		linked_source = frappe.get_doc(doctype=source_dt_name, link_field=target_doc.name).insert(
+			ignore_permissions=True
+		)
+		unlinked_source = frappe.get_doc(doctype=source_dt_name).insert(ignore_permissions=True)
+
+		# Target doctype's permission_query_conditions denies every row for every user,
+		# simulating "the user can't see the specific document this field would point to".
+		with self.patch_hooks(
+			{
+				"permission_query_conditions": {
+					target_dt_name: ["frappe.tests.test_query.test_deny_all_permission_hook"]
+				}
+			}
+		):
+			frappe.set_user(test_user)
+			result = frappe.qb.get_query(
+				source_dt_name,
+				filters={"name": ["in", [linked_source.name, unlinked_source.name]]},
+				fields=["name", "link_field.value as linked_value"],
+				ignore_permissions=False,
+			).run(as_dict=True)
+
+			by_name = {d.name: d for d in result}
+			self.assertIn(
+				unlinked_source.name,
+				by_name,
+				"A row with no link at all must not be filtered out by an unrelated "
+				"doctype's permission condition.",
+			)
+			self.assertIsNone(by_name[unlinked_source.name].linked_value)
+
+			# The row that *does* link to an inaccessible target should still be visible
+			# (its own permissions are unaffected) but must not leak the target's data.
+			self.assertIn(linked_source.name, by_name)
+			self.assertIsNone(by_name[linked_source.name].linked_value)
+
+		# Cleanup
+		frappe.set_user("Administrator")
+		linked_source.delete(ignore_permissions=True)
+		unlinked_source.delete(ignore_permissions=True)
+		target_doc.delete(ignore_permissions=True)
+		source_dt.delete()
+		target_dt.delete()
+		test_user_doc.remove_roles(test_role)
+		frappe.delete_doc("Role", test_role, force=True)
+
+	def test_multiple_link_fields_to_same_target_fetch_distinct_titles(self):
+		"""Two Link fields on the same doctype pointing at the same target must each
+		fetch their value from their own joined row. Without a per-field join alias the
+		second field silently reuses the first field's join and shows the wrong value.
+		"""
+		target_dt_name = "TargetDocForDualLink"
+		source_dt_name = "SourceDocForDualLink"
+
+		frappe.set_user("Administrator")
+		frappe.delete_doc("DocType", source_dt_name, ignore_missing=True, force=True)
+		frappe.delete_doc("DocType", target_dt_name, ignore_missing=True, force=True)
+
+		target_dt = new_doctype(
+			target_dt_name,
+			fields=[{"fieldname": "value", "fieldtype": "Data", "label": "Value"}],
+		).insert(ignore_if_duplicate=True)
+		source_dt = new_doctype(
+			source_dt_name,
+			fields=[
+				{"fieldname": "origin", "fieldtype": "Link", "options": target_dt_name, "label": "Origin"},
+				{
+					"fieldname": "destination",
+					"fieldtype": "Link",
+					"options": target_dt_name,
+					"label": "Destination",
+				},
+			],
+		).insert(ignore_if_duplicate=True)
+
+		origin_doc = frappe.get_doc(doctype=target_dt_name, value="Origin Value").insert(
+			ignore_permissions=True
+		)
+		destination_doc = frappe.get_doc(doctype=target_dt_name, value="Destination Value").insert(
+			ignore_permissions=True
+		)
+		source_doc = frappe.get_doc(
+			doctype=source_dt_name, origin=origin_doc.name, destination=destination_doc.name
+		).insert(ignore_permissions=True)
+
+		result = frappe.qb.get_query(
+			source_dt_name,
+			filters={"name": source_doc.name},
+			fields=["name", "origin.value as origin_value", "destination.value as destination_value"],
+			ignore_permissions=True,
+		).run(as_dict=True)
+
+		self.assertEqual(len(result), 1)
+		self.assertEqual(result[0].origin_value, "Origin Value")
+		self.assertEqual(result[0].destination_value, "Destination Value")
+
+		# Cleanup
+		source_doc.delete(ignore_permissions=True)
+		origin_doc.delete(ignore_permissions=True)
+		destination_doc.delete(ignore_permissions=True)
+		source_dt.delete()
+		target_dt.delete()
+
+	def test_link_field_permission_hook_referencing_target_table(self):
+		"""A target doctype's permission_query_conditions hook may return a raw SQL
+		string that references its own `tabDoctype`. When the target is joined under an
+		alias (link field fetched via dot-notation), that table isn't in scope, so the
+		condition must still apply to the aliased join.
+		"""
+		target_dt_name = "TargetDocForHookAlias"
+		source_dt_name = "SourceDocForHookAlias"
+
+		frappe.set_user("Administrator")
+		frappe.delete_doc("DocType", source_dt_name, ignore_missing=True, force=True)
+		frappe.delete_doc("DocType", target_dt_name, ignore_missing=True, force=True)
+
+		target_dt = new_doctype(
+			target_dt_name,
+			fields=[{"fieldname": "value", "fieldtype": "Data", "label": "Value"}],
+		).insert(ignore_if_duplicate=True)
+		source_dt = new_doctype(
+			source_dt_name,
+			fields=[
+				{
+					"fieldname": "link_field",
+					"fieldtype": "Link",
+					"options": target_dt_name,
+					"label": "Link Field",
+				}
+			],
+		).insert(ignore_if_duplicate=True)
+
+		allowed_value = f"Allowed tab{target_dt_name} batch"
+		allowed = frappe.get_doc(doctype=target_dt_name, value=allowed_value).insert(ignore_permissions=True)
+		denied = frappe.get_doc(doctype=target_dt_name, value="Denied").insert(ignore_permissions=True)
+		src_allowed = frappe.get_doc(doctype=source_dt_name, link_field=allowed.name).insert(
+			ignore_permissions=True
+		)
+		src_denied = frappe.get_doc(doctype=source_dt_name, link_field=denied.name).insert(
+			ignore_permissions=True
+		)
+
+		with self.patch_hooks(
+			{
+				"permission_query_conditions": {
+					target_dt_name: ["frappe.tests.test_query.allow_named_target_hook"]
+				}
+			}
+		):
+			result = frappe.qb.get_query(
+				source_dt_name,
+				filters={"name": ["in", [src_allowed.name, src_denied.name]]},
+				fields=["name", "link_field.value as linked_value"],
+				ignore_permissions=False,
+			).run(as_dict=True)
+
+		by_name = {d.name: d for d in result}
+		# The hook lives in the JOIN's ON clause, so both parent rows survive; it only
+		# governs which linked row attaches.
+		self.assertIn(src_allowed.name, by_name)
+		self.assertIn(src_denied.name, by_name)
+		self.assertEqual(by_name[src_allowed.name].linked_value, allowed_value)
+		self.assertIsNone(by_name[src_denied.name].linked_value)
+
+		# Cleanup
+		src_allowed.delete(ignore_permissions=True)
+		src_denied.delete(ignore_permissions=True)
+		allowed.delete(ignore_permissions=True)
+		denied.delete(ignore_permissions=True)
+		source_dt.delete()
+		target_dt.delete()
+
+	def test_autoincrement_link_field_join(self):
+		with setup_autoincrement_link_doctypes() as (
+			_target_dt_name,
+			source_dt_name,
+			target_doc,
+			source_doc,
+		):
+			query = frappe.qb.get_query(
+				source_dt_name,
+				fields=["name", "link_field.target_title"],
+				filters={"name": source_doc.name},
+			)
+			result = query.run(as_dict=True)
+
+			self.assertEqual(result[0].target_title, target_doc.target_title)
+			if frappe.db.db_type == "postgres":
+				self.assertIn(
+					'CAST("TAB_TEST AUTO LINK TARGET_1"."NAME" AS VARCHAR)', query.get_sql().upper()
+				)
+			else:
+				self.assertNotIn("CAST(", query.get_sql().upper())
+
+	def test_autoincrement_child_table_join(self):
+		with setup_autoincrement_parent_doctypes() as (parent_dt_name, _child_dt_name, parent_doc):
+			query = frappe.qb.get_query(
+				parent_dt_name,
+				fields=["name", "child_table.child_value"],
+				filters={"name": parent_doc.name, "child_table.child_value": "Child"},
+			)
+			result = query.run(as_dict=True)
+
+			self.assertEqual(len(result), 1)
+			self.assertEqual(result[0].child_value, "Child")
+			if frappe.db.db_type == "postgres":
+				self.assertIn('CAST("TABTEST AUTO PARENT"."NAME" AS VARCHAR)', query.get_sql().upper())
+			else:
+				self.assertNotIn("CAST(", query.get_sql().upper())
+
+	def test_autoincrement_child_query(self):
+		with setup_autoincrement_parent_doctypes() as (parent_dt_name, _child_dt_name, parent_doc):
+			result = frappe.qb.get_query(
+				parent_dt_name,
+				fields=["name", {"child_table": ["child_value"]}],
+				filters={"name": parent_doc.name},
+			).run(as_dict=True)
+
+			self.assertEqual(len(result), 1)
+			self.assertEqual(result[0].child_table[0].child_value, "Child")
+
 	def test_filter_direct_field_permission(self):
 		"""Test that filtering is only allowed on permitted direct fields."""
 		with setup_patched_blog_post(), setup_test_user(set_user=True) as user:
@@ -1389,6 +1833,20 @@ class TestQuery(IntegrationTestCase):
 			# Cleanup
 			frappe.set_user("Administrator")
 			test_post.delete()
+
+	def test_filter_nonexistent_field_raises_validation_error(self):
+		"""Test that filtering on a nonexistent field raises ValidationError, not PermissionError."""
+		with self.assertRaises(frappe.ValidationError) as cm:
+			frappe.get_list("ToDo", filters={"totally_bogus_xyz": 1})
+		self.assertIn("Field not found", str(cm.exception))
+
+		with self.assertRaises(frappe.ValidationError) as cm:
+			frappe.qb.get_query(
+				"ToDo",
+				filters={"totally_bogus_xyz": 1},
+				ignore_permissions=False,
+			).run()
+		self.assertIn("Field not found", str(cm.exception))
 
 	def test_filter_linked_field_permission(self):
 		"""Test that filtering is only allowed on permitted linked fields."""
@@ -1758,6 +2216,63 @@ class TestQuery(IntegrationTestCase):
 		test_user_doc.remove_roles(test_role)
 		frappe.delete_doc("Role", test_role, force=True)
 
+	def test_child_table_queried_directly_checks_parent_permissions(self):
+		child_dt = new_doctype(
+			fields=[
+				{"fieldname": "public_field", "fieldtype": "Int", "label": "Public"},
+				{"fieldname": "restricted_field", "fieldtype": "Int", "permlevel": 1, "label": "Restricted"},
+			],
+			istable=1,
+		).insert()
+		parent_dt = new_doctype(
+			fields=[{"fieldname": "items", "fieldtype": "Table", "options": child_dt.name, "label": "Items"}]
+		).insert()
+		role = frappe.get_doc({"doctype": "Role", "role_name": "Direct Child Query Role"}).insert(
+			ignore_if_duplicate=True
+		)
+		user = frappe.get_doc("User", "test2@example.com")
+		add_permission(parent_dt.name, role.name, 0, ptype="read")
+		user.add_roles(role.name)
+		self.addCleanup(frappe.delete_doc, "Role", role.name, force=True)
+		self.addCleanup(child_dt.delete)
+		self.addCleanup(parent_dt.delete)
+		self.addCleanup(user.remove_roles, role.name)
+
+		def build_child_query(query):
+			frappe.qb.get_query(
+				child_dt.name, parent_doctype=parent_dt.name, ignore_permissions=False, **query
+			).get_sql()
+
+		def build_parent_query(query):
+			frappe.qb.get_query(parent_dt.name, ignore_permissions=False, **query).get_sql()
+
+		def assert_queries(fieldname, allowed, build=build_child_query):
+			for query in (
+				{"fields": [{"MAX": fieldname}]},
+				{"filters": {fieldname: 1}},
+				{"or_filters": {fieldname: [">", 1]}},
+				{"order_by": f"{fieldname} desc"},
+				{"fields": [{"COUNT": "*"}], "group_by": fieldname},
+			):
+				with self.subTest(fieldname=fieldname, query=query), self.set_user(user.name):
+					if allowed:
+						build(query)
+					else:
+						self.assertRaises(frappe.PermissionError, build, query)
+
+		def child_ref(fieldname):
+			return f"`tab{child_dt.name}`.`{fieldname}`"
+
+		assert_queries("public_field", allowed=True)
+		assert_queries("restricted_field", allowed=False)
+		assert_queries(child_ref("public_field"), allowed=True, build=build_parent_query)
+		assert_queries(child_ref("restricted_field"), allowed=False, build=build_parent_query)
+
+		update_permission_property(parent_dt.name, role.name, 0, "select", 1, validate=False)
+		update_permission_property(parent_dt.name, role.name, 0, "read", 0, validate=False)
+		assert_queries("public_field", allowed=False)
+		assert_queries(child_ref("public_field"), allowed=False, build=build_parent_query)
+
 	def test_group_by_order_by_validation_errors(self):
 		"""Test validation errors for invalid GROUP BY and ORDER BY fields."""
 		invalid_group_by_fields = [
@@ -1841,6 +2356,21 @@ class TestQuery(IntegrationTestCase):
 		sql = query.get_sql()
 		self.assertIn(self.normalize_sql("MAX(`creation`) `latest_user`"), sql)
 
+		# Test YEAR function
+		query = frappe.qb.get_query(
+			"User", fields=[{"YEAR": "creation", "as": "creation_year"}], group_by="creation_year"
+		)
+		sql = query.get_sql()
+		if frappe.db.db_type == "postgres":
+			self.assertIn("CAST(date_part('year'", sql)
+			self.assertIn('"creation_year"', sql)
+		elif frappe.db.db_type == "sqlite":
+			self.assertIn("CAST(STRFTIME('%Y'", sql)
+			self.assertIn('"creation_year"', sql)
+		else:
+			self.assertIn(self.normalize_sql("YEAR(`creation`) `creation_year`"), sql)
+		self.assertIn(self.normalize_sql("GROUP BY `creation_year`"), self.normalize_sql(sql))
+
 		# Test MIN function
 		query = frappe.qb.get_query(
 			"User", fields=[{"MIN": "creation", "as": "earliest_user"}], group_by="user_type"
@@ -1872,7 +2402,8 @@ class TestQuery(IntegrationTestCase):
 		# Test TIMESTAMP function
 		query = frappe.qb.get_query("User", fields=[{"TIMESTAMP": "creation", "as": "ts"}])
 		sql = query.get_sql()
-		self.assertIn(self.normalize_sql("TIMESTAMP(`creation`) `ts`"), self.normalize_sql(sql))
+		expected_function = "DATETIME" if frappe.db.db_type == "sqlite" else "TIMESTAMP"
+		self.assertIn(self.normalize_sql(f"{expected_function}(`creation`) `ts`"), self.normalize_sql(sql))
 
 		# Test mixed regular fields and function fields
 		query = frappe.qb.get_query(
@@ -2065,6 +2596,39 @@ class TestQuery(IntegrationTestCase):
 			"SELECT `tabDocType`.* FROM `tabDocType` LEFT JOIN `tabDocField` ON `tabDocField`.`parent`=`tabDocType`.`name` AND `tabDocField`.`parenttype`='DocType' AND `tabDocField`.`parentfield`='fields' WHERE `tabDocField`.`name` IS NULL AND `tabDocType`.`parent`<>''",
 		)
 
+	def test_none_inside_in_list(self):
+		self.assertQueryEqual(
+			frappe.qb.get_query(
+				"ToDo", filters=[["status", "not in", ["Cancelled", None]]], db_query_compat=True
+			).get_sql(),
+			"SELECT `name` FROM `tabToDo` WHERE IFNULL(`status`,'') NOT IN ('Cancelled','')",
+		)
+
+		self.assertIn("IS NULL", frappe.qb.get_query("ToDo", filters=[["date", "in", [None]]]).get_sql())
+
+		with self.set_user("test2@example.com"):
+			todo = frappe.get_doc(
+				{
+					"doctype": "ToDo",
+					"description": "None in list",
+					"status": "Open",
+					"date": frappe.utils.today(),
+				}
+			).insert()
+			self.addCleanup(todo.delete)
+
+			for fieldname, operator, value, matches in (
+				("status", "not in", ["Cancelled", None], True),
+				("status", "in", ["Open", None], True),
+				("status", "in", [None], False),
+				("date", "not in", [None], True),
+			):
+				with self.subTest(fieldname=fieldname, operator=operator, value=value):
+					names = frappe.get_list(
+						"ToDo", filters=[["name", "=", todo.name], [fieldname, operator, value]], pluck="name"
+					)
+					self.assertEqual(bool(names), matches)
+
 	def test_field_alias_in_group_by(self):
 		query = frappe.qb.get_query(
 			"User",
@@ -2081,6 +2645,138 @@ class TestQuery(IntegrationTestCase):
 			self.assertIn(self.normalize_sql("ORDER BY `created_date`"), self.normalize_sql(sql))
 		self.assertIn(self.normalize_sql("`creation` `created_date`"), self.normalize_sql(sql))
 
+	def test_order_by_expression_alias_with_group_by(self):
+		with self.set_user("test2@example.com"):
+			for priority, count in (("Low", 1), ("Medium", 2), ("High", 3)):
+				for _ in range(count):
+					frappe.get_doc(
+						{"doctype": "ToDo", "description": "_Test alias order", "priority": priority}
+					).insert()
+
+			for expression, expected in (
+				({"SUB": [{"SUM": "idx"}, {"COUNT": "name"}], "as": "score"}, ["Low", "Medium", "High"]),
+				({"IFNULL": [{"COUNT": "name"}, 0], "as": "score"}, ["High", "Medium", "Low"]),
+			):
+				with self.subTest(expression=expression):
+					rows = frappe.get_list(
+						"ToDo",
+						fields=["priority", expression],
+						filters={"description": "_Test alias order"},
+						group_by="priority",
+						order_by="score desc",
+					)
+					self.assertEqual([row.priority for row in rows], expected)
+
+	def test_distinct_keeps_valid_order_by(self):
+		for field, order_by in (
+			("user_type", "user_type asc"),
+			("user_type as type", "type asc"),
+			("`tabUser`.`user_type`", "`tabUser`.`user_type` asc"),
+		):
+			with self.subTest(field=field, order_by=order_by):
+				query = frappe.qb.get_query("User", fields=[field], distinct=True, order_by=order_by)
+				result = query.run()
+
+				self.assertIn("order by", query.get_sql().lower())
+				self.assertEqual(list(result), sorted(result))
+
+	def test_distinct_drops_unselected_order_by_on_postgres(self):
+		if frappe.db.db_type == "postgres":
+			with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
+				query = frappe.qb.get_query(
+					"User", fields=["user_type"], distinct=True, order_by="creation desc"
+				)
+			self.assertNotIn("order by", query.get_sql().lower())
+		else:
+			query = frappe.qb.get_query("User", fields=["user_type"], distinct=True, order_by="creation desc")
+			self.assertIn("order by", query.get_sql().lower())
+
+	def test_distinct_keeps_order_by_on_star_column(self):
+		query = frappe.qb.get_query("User", fields=["*"], distinct=True, order_by="user_type asc")
+		result = query.run(as_dict=True)
+
+		self.assertIn("order by", query.get_sql().lower())
+		self.assertEqual([row.user_type for row in result], sorted(row.user_type for row in result))
+
+	def test_distinct_keeps_order_by_on_link_field(self):
+		query = frappe.qb.get_query(
+			"User",
+			fields=["name", "language.language_name"],
+			distinct=True,
+			order_by="language.language_name asc",
+		)
+		query.run()
+
+		self.assertIn("order by", query.get_sql().lower())
+
+	@run_only_if(db_type_is.POSTGRES)
+	def test_distinct_order_by_preserves_link_table_identity(self):
+		for order_by in ("creation desc", "`tabUser`.`creation` desc"):
+			with self.subTest(order_by=order_by):
+				with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
+					query = frappe.qb.get_query(
+						"User",
+						fields=["language.creation as language_creation"],
+						distinct=True,
+						order_by=order_by,
+					)
+				self.assertNotIn("order by", query.get_sql().lower())
+				query.run()
+
+		for order_by in ("language_creation asc", "language.creation asc"):
+			with self.subTest(order_by=order_by):
+				query = frappe.qb.get_query(
+					"User",
+					fields=["language.creation as language_creation"],
+					distinct=True,
+					order_by=order_by,
+				)
+				self.assertIn("order by", query.get_sql().lower())
+				query.run()
+
+	def test_distinct_order_by_result_position(self):
+		for group_by in (None, "user_type, enabled"):
+			for position, direction in ((1, "asc"), (2, "desc")):
+				with self.subTest(group_by=group_by, position=position):
+					query = frappe.qb.get_query(
+						"User",
+						fields=["user_type", "enabled"],
+						distinct=True,
+						group_by=group_by,
+						order_by=f"{position} {direction}",
+					)
+					values = [row[position - 1] for row in query.run()]
+					self.assertEqual(values, sorted(values, reverse=direction == "desc"))
+
+	def test_distinct_order_by_star_result_position(self):
+		query = frappe.qb.get_query("User", fields=["*"], distinct=True, order_by="2 asc")
+		self.assertIn("ORDER BY 2 ASC", query.get_sql())
+		query.run()
+
+	def test_distinct_order_by_selected_grouped_field(self):
+		for field in ("creation", "enabled"):
+			with self.subTest(field=field):
+				query = frappe.qb.get_query(
+					"User",
+					fields=["name", field],
+					group_by="name",
+					distinct=True,
+					order_by=f"{field} asc",
+				)
+				values = [row[1] for row in query.run()]
+				self.assertEqual(values, sorted(values))
+
+	@run_only_if(db_type_is.POSTGRES)
+	def test_distinct_drops_invalid_result_position(self):
+		for position in (0, 2):
+			with self.subTest(position=position):
+				with self.assertWarnsRegex(UserWarning, "ORDER BY fields have been ignored"):
+					query = frappe.qb.get_query(
+						"User", fields=["user_type"], distinct=True, order_by=f"{position} asc"
+					)
+				self.assertNotIn("order by", query.get_sql().lower())
+				query.run()
+
 	def test_field_alias_permission_check(self):
 		query = frappe.qb.get_query(
 			"User",
@@ -2090,6 +2786,46 @@ class TestQuery(IntegrationTestCase):
 		sql = query.get_sql()
 		# If we get here without PermissionError, the test passes
 		self.assertIn(self.normalize_sql("GROUP BY `created_date`"), self.normalize_sql(sql))
+
+	def test_restricted_field_alias_in_clauses(self):
+		with setup_patched_blog_post(), setup_test_user(set_user=True):
+			for clause in ("order_by", "group_by"):
+				with self.subTest(clause=clause), self.assertRaises(frappe.PermissionError):
+					frappe.qb.get_query(
+						"Test Blog Post",
+						fields=["name", "published as published"],
+						ignore_permissions=False,
+						**{clause: "published"},
+					)
+
+	def test_nested_function_alias_in_clauses(self):
+		with setup_patched_blog_post(), setup_test_user(set_user=True):
+			with self.assertRaises(frappe.PermissionError):
+				frappe.qb.get_query(
+					"Test Blog Post",
+					fields=["name", {"COUNT": [{"ABS": "idx", "as": "published"}]}],
+					group_by="name",
+					order_by="published",
+					ignore_permissions=False,
+				)
+
+	def test_alias_named_after_restricted_column_in_group_by(self):
+		with setup_patched_blog_post(), setup_test_user(set_user=True):
+			with self.assertRaises(frappe.PermissionError):
+				frappe.qb.get_query(
+					"Test Blog Post",
+					fields=[{"COUNT": "*", "as": "published"}],
+					group_by="published",
+					ignore_permissions=False,
+				)
+
+			# ORDER BY resolves the name to the select-list alias, so it stays allowed
+			frappe.qb.get_query(
+				"Test Blog Post",
+				fields=["name", "title as published"],
+				order_by="published desc",
+				ignore_permissions=False,
+			).run()
 
 	def test_between_datetime_expansion(self):
 		"""Test that date strings are expanded to datetime ranges for Datetime fields with 'between' operator"""
@@ -2321,6 +3057,24 @@ class TestQuery(IntegrationTestCase):
 		).run()
 		# Query should succeed and return results (tuple or list)
 		self.assertTrue(len(result) >= 0, "Query should succeed with proper permissions")
+
+	def test_autoincrement_parent_permission_join(self):
+		with setup_autoincrement_parent_doctypes() as (parent_dt_name, child_dt_name, parent_doc):
+			query = frappe.qb.get_query(
+				child_dt_name,
+				fields=["name", "child_value"],
+				filters={"parent": parent_doc.name},
+				parent_doctype=parent_dt_name,
+				ignore_permissions=False,
+				user="Administrator",
+			)
+			result = query.run(as_dict=True)
+
+			self.assertEqual(result[0].child_value, "Child")
+			if frappe.db.db_type == "postgres":
+				self.assertIn('CAST("TABTEST AUTO PARENT"."NAME" AS VARCHAR)', query.get_sql().upper())
+			else:
+				self.assertNotIn("CAST(", query.get_sql().upper())
 
 	def test_child_table_filters_orphaned_rows(self):
 		"""Test that child table queries filter out orphaned rows (rows without valid parent)."""
@@ -2556,8 +3310,8 @@ class TestQuery(IntegrationTestCase):
 		from frappe.database.query import Engine
 
 		engine = Engine()
-		self.assertEqual(engine._get_ifnull_fallback("Patch Log", "skipped"), "0")
-		self.assertEqual(engine._get_ifnull_fallback("Patch Log", "patch"), "''")
+		self.assertEqual(engine._get_ifnull_fallback("Patch Log", "skipped"), 0)
+		self.assertEqual(engine._get_ifnull_fallback("Patch Log", "patch"), "")
 
 	@run_only_if(db_type_is.MARIADB)
 	def test_drop_unique_constraint_for_deleted_fields_mariadb(self):
@@ -2657,6 +3411,10 @@ class TestQuery(IntegrationTestCase):
 		self.assertFalse(index_exists)
 
 		# test for unique index backed by no constraint created at field alteration post creation
+		from frappe.database.postgres.schema import get_unique_index_name
+
+		unique_index_name = get_unique_index_name(f"tab{trial_dt.name}", "field_one")
+
 		for field in trial_dt.fields:
 			if field.fieldname == "field_one":
 				field.unique = 1
@@ -2672,7 +3430,7 @@ class TestQuery(IntegrationTestCase):
 			""",
 			(
 				f"tab{trial_dt.name}",
-				"unique_field_one",
+				unique_index_name,
 			),
 		)
 		self.assertTrue(index_exists)
@@ -2696,7 +3454,7 @@ class TestQuery(IntegrationTestCase):
 			""",
 			(
 				f"tab{trial_dt.name}",
-				"unique_field_one",
+				unique_index_name,
 			),
 		)
 		self.assertFalse(index_exists)
@@ -2707,14 +3465,258 @@ class TestQuery(IntegrationTestCase):
 
 		query = frappe.qb.get_query("Doctype", offset=10).get_sql()
 		if frappe.db.db_type != "postgres":
-			self.assertIn(f"LIMIT {MAX_LIMIT} OFFSET 10", query)
+			no_limit = -1 if frappe.db.db_type == "sqlite" else MAX_LIMIT
+			self.assertIn(f"LIMIT {no_limit} OFFSET 10", query)
 			query = frappe.qb.get_query("Doctype", limit=10, offset=10).get_sql()
 			self.assertIn("LIMIT 10 OFFSET 10", query)
 		else:
 			self.assertNotIn("LIMIT", query)
 			self.assertIn("OFFSET 10", query)
 
+	def test_get_list_with_offset_and_no_limit(self):
+		with self.set_user("test2@example.com"):
+			for _ in range(12):
+				frappe.get_doc({"doctype": "ToDo", "description": "_Test offset without limit"}).insert()
+			query = {
+				"filters": {"description": "_Test offset without limit"},
+				"order_by": "name",
+				"pluck": "name",
+			}
+			names = frappe.get_list("ToDo", **query)
+			self.assertEqual(frappe.get_list("ToDo", offset=10, **query), names[10:])
+			self.assertEqual(len(names[10:]), 2)
+
+	@run_only_if(db_type_is.MARIADB)
+	def test_build_filter_conditions_escapes_backslash_safely(self):
+		"""A filter value ending in a backslash must not let its string literal
+		swallow the next condition as live SQL.
+
+		Engine.build_filter_conditions renders filter values via pypika, which
+		only doubles quote characters, not backslashes. On MariaDB's default
+		sql_mode a trailing backslash escapes the closing quote, so two chained
+		filters on the same field could splice arbitrary SQL into the
+		surrounding WHERE clause.
+		"""
+		from frappe.database.query import Engine
+
+		bs = chr(92)  # a single backslash
+		tail = " or sleep(0) -- "
+
+		engine = Engine()
+		engine.get_query("DocType", db_query_compat=True)
+		conditions = []
+		engine.build_filter_conditions(
+			[
+				["DocType", "name", "=", bs],
+				["DocType", "name", "=", tail],
+			],
+			conditions,
+		)
+		cond = " and ".join(conditions)
+
+		# The backslash must be doubled so it stays inside its own literal
+		# instead of escaping the closing quote and exposing `tail` as code.
+		self.assertIn(f"'{bs * 2}'", cond)
+		self.assertIn(f"='{tail}'", cond)
+
+		# The fragment must still be syntactically valid, harmless SQL.
+		frappe.db.sql(f"SELECT name FROM `tabDocType` WHERE 1=1 and {cond} LIMIT 0")
+
+	@run_only_if(db_type_is.MARIADB)
+	def test_build_filter_conditions_matches_literal_backslash_value(self):
+		"""A filter value that genuinely contains a backslash
+		must still match the row it's meant to after the escaping fix."""
+		from frappe.database.query import Engine
+
+		todo = frappe.get_doc({"doctype": "ToDo", "description": r"C:\Users\test"}).insert()
+		self.addCleanup(todo.delete)
+
+		engine = Engine()
+		engine.get_query("ToDo", db_query_compat=True)
+		conditions = []
+		engine.build_filter_conditions([["ToDo", "description", "=", r"C:\Users\test"]], conditions)
+		cond = " and ".join(conditions)
+
+		rows = frappe.db.sql(f"SELECT name FROM `tabToDo` WHERE 1=1 and {cond}", as_dict=True)
+		self.assertIn(todo.name, [r.name for r in rows])
+
+
+class TestJSONFieldQueries(IntegrationTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		cls.doctype = "Test JSON Field Query"
+		new_doctype(
+			cls.doctype,
+			fields=[
+				{"fieldname": "payload", "label": "Payload", "fieldtype": "JSON"},
+				{"fieldname": "secret", "label": "Secret", "fieldtype": "JSON", "permlevel": 1},
+			],
+		).insert(ignore_if_duplicate=True)
+		cls.names = {
+			label: frappe.get_doc(doctype=cls.doctype, payload=payload).insert().name
+			for label, payload in (("null", None), ("empty", "[]"), ("filled", '["x"]'))
+		}
+
+	def get_names(self, *filters):
+		"""Names matching the filters among the docs this class created; the table persists between runs."""
+		filters = [*filters, ["name", "in", list(self.names.values())]]
+		return set(frappe.get_all(self.doctype, filters=filters, pluck="name"))
+
+	def test_json_filter_operators(self):
+		null, empty, filled = (self.names[label] for label in ("null", "empty", "filled"))
+		cases = [
+			(["is", "not set"], {null}),
+			(["is", "set"], {empty, filled}),
+			(["=", "[]"], {empty}),
+			(["!=", "[]"], {null, filled}),
+			(["in", ["[]"]], {empty}),
+			(["not in", ["[]"]], {null, filled}),
+			(["like", "%x%"], {filled}),
+			(["=", None], {null}),
+			(["!=", None], {empty, filled}),
+		]
+		for operator_and_value, expected in cases:
+			with self.subTest(filter=operator_and_value):
+				self.assertEqual(self.get_names(["payload", *operator_and_value]), expected)
+
+	def test_json_filter_field_references(self):
+		empty = self.names["empty"]
+		for key in (f"`tab{self.doctype}`.`payload`", Field("payload")):
+			with self.subTest(key=str(key)):
+				self.assertEqual(self.get_names([key, "=", "[]"]), {empty})
+
+		self.assertEqual(frappe.db.get_value(self.doctype, {"payload": "[]"}, "name"), empty)
+
+	def test_json_filter_sql_shape(self):
+		compat = frappe.qb.get_query(
+			self.doctype, filters={"payload": ["!=", "[]"]}, db_query_compat=True
+		).get_sql()
+		aliased = frappe.qb.get_query(
+			self.doctype, filters={frappe.qb.DocType(self.doctype).as_("x").payload: "[]"}
+		).get_sql()
+
+		if frappe.db.db_type == "postgres":
+			self.assertIn('IFNULL(CAST("payload" AS VARCHAR)', compat)
+			self.assertEqual(compat.count("CAST("), 1)
+			self.assertIn('CAST("x"."payload" AS VARCHAR)', aliased)
+		else:
+			self.assertNotIn("CAST(", compat)
+			self.assertNotIn("CAST(", aliased)
+
+	def test_json_filter_with_cold_metadata(self):
+		frappe.clear_cache()
+		frappe.clear_messages()
+
+		# Custom Field is a core doctype whose meta loads through this same filter builder
+		frappe.get_all("Custom Field", filters={"link_filters": ["is", "not set"]}, limit=1)
+		self.assertEqual(self.get_names(["payload", "=", "[]"]), {self.names["empty"]})
+		self.assertEqual(frappe.local.message_log, [])
+
+	def test_json_field_sorting_and_grouping(self):
+		from frappe.desk.listview import get_group_by_count
+
+		own_docs = {"name": ["in", list(self.names.values())]}
+		for order_by in ("payload asc", f"`tab{self.doctype}`.`payload` asc"):
+			with self.subTest(order_by=order_by):
+				query = frappe.qb.get_query(
+					self.doctype, fields=["payload"], filters=own_docs, distinct=True, order_by=order_by
+				)
+				self.assertIn("ORDER BY", query.get_sql())
+				self.assertEqual(len(query.run()), 3)
+
+		grouped = frappe.get_all(
+			self.doctype,
+			fields=["payload", {"COUNT": "*", "as": "total"}],
+			filters=own_docs,
+			group_by="payload",
+		)
+		self.assertEqual({row.payload: row.total for row in grouped}, {None: 1, "[]": 1, '["x"]': 1})
+
+		counts = get_group_by_count(self.doctype, [["name", "in", list(self.names.values())]], "payload")
+		self.assertEqual({row["name"] for row in counts}, {None, "[]", '["x"]'})
+
+	def test_json_clause_sql_shape(self):
+		distinct = frappe.qb.get_query(self.doctype, fields=["payload as p"], distinct=True).get_sql()
+		ordered = frappe.qb.get_query(self.doctype, fields=["name"], order_by="payload asc").get_sql()
+
+		if frappe.db.db_type == "postgres":
+			self.assertIn('DISTINCT CAST("payload" AS VARCHAR) "p"', distinct)
+			self.assertIn('ORDER BY CAST("payload" AS VARCHAR)', ordered)
+
+			# a caller-supplied Cast is not looked through: its ORDER BY is still unselected
+			foreign_cast = frappe.qb.get_query(
+				self.doctype,
+				fields=[Cast(frappe.qb.DocType(self.doctype).payload, "varchar")],
+				distinct=True,
+				order_by="payload asc",
+			).get_sql()
+			self.assertNotIn("ORDER BY", foreign_cast)
+		else:
+			self.assertNotIn("CAST(", distinct)
+			self.assertNotIn("CAST(", ordered)
+
+	def test_json_star_and_joined_fields_with_distinct(self):
+		own_docs = {"name": ["in", list(self.names.values())]}
+		rows = frappe.qb.get_query(self.doctype, fields=["*"], filters=own_docs, distinct=True).run(
+			as_dict=True
+		)
+		self.assertEqual({row.payload for row in rows}, {None, "[]", '["x"]'})
+
+		for doctype, field in (("Automation Flow", "actions.params"), ("MapReduce Task", "master.data")):
+			with self.subTest(field=field):
+				frappe.qb.get_query(doctype, fields=["name", field], distinct=True).run()
+
+	def test_permlevel_json_field_with_distinct(self):
+		"""The select cast runs after the permission pass, which only checks Field terms."""
+		role = "JSON Query Test Role"
+		user = "test2@example.com"
+		frappe.get_doc({"doctype": "Role", "role_name": role}).insert(ignore_if_duplicate=True)
+		add_permission(self.doctype, role, 0, ptype="read")
+		add_permission(self.doctype, "System Manager", 1, ptype="read")
+		frappe.get_doc("User", user).add_roles(role)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+		fields = ["payload", "secret"]
+		frappe.set_user(user)
+		restricted = frappe.qb.get_query(
+			self.doctype, fields=fields, distinct=True, ignore_permissions=False
+		).get_sql()
+		frappe.set_user("Administrator")
+		permitted = frappe.qb.get_query(
+			self.doctype, fields=fields, distinct=True, ignore_permissions=False
+		).get_sql()
+
+		self.assertNotIn("secret", restricted)
+		self.assertIn("secret", permitted)
+
 
 # This function is used as a permission query condition hook
 def test_permission_hook_condition(user):
 	return "`tabDashboard Settings`.`name` = 'Administrator'"
+
+
+# This hook returns a pypika criterion instead of a raw SQL string.
+# Permission query conditions must accept both forms.
+def test_permission_hook_criterion(user):
+	DashboardSettings = frappe.qb.DocType("Dashboard Settings")
+	return DashboardSettings.name == user
+
+
+# Used to simulate "user cannot see any row of this doctype" for LinkTableField tests.
+def test_deny_all_permission_hook(user, doctype=None):
+	return "1=0"
+
+
+# Returns a raw SQL string referencing the target's own table, to verify it still applies
+# to the aliased link table when fetched via dot-notation.
+def allow_named_target_hook(user, doctype=None):
+	return f"`tab{doctype}`.`value` = 'Allowed tab{doctype} batch'"
+
+
+def todo_breakout_hook(user, doctype=None):
+	return frappe.qb.DocType("ToDo").description.isin(["%(param2)s", "x\\') OR 1=1 -- "])
+
+
+def todo_backslash_hook(user, doctype=None):
+	return frappe.qb.DocType("ToDo").description == "back\\slash' 100%"

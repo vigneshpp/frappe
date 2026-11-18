@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 	from frappe.model.meta import Meta
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_document_title(
 	*,
 	doctype: str,
@@ -77,7 +77,7 @@ def update_document_title(
 
 			doc.queue_action("rename", name=transformed_name, merge=merge, queue=queue, timeout=36000)
 		else:
-			doc.rename(updated_name, merge=merge)
+			doc._rename(updated_name, merge=merge)
 
 	if title_updated:
 		if action_enqueued and name_updated:
@@ -142,6 +142,7 @@ def rename_doc(
 
 	old = old or doc.name
 	doctype = doctype or doc.doctype
+	assert doctype and old, "doctype and old name must be resolved from arguments or the passed doc"
 	force = sbool(force)
 	merge = sbool(merge)
 	meta = frappe.get_meta(doctype)
@@ -343,6 +344,9 @@ def validate_rename(
 	save_point=False,
 	old_doc: Document | None = None,
 ) -> str:
+	if meta.issingle:
+		frappe.throw(_("Single DocTypes cannot be renamed"))
+
 	# using for update so that it gets locked and someone else cannot edit it while this rename is going on!
 	if save_point:
 		_SAVE_POINT = f"validate_rename_{frappe.generate_hash(length=8)}"
@@ -698,7 +702,7 @@ def bulk_rename(doctype: str, rows: list[list] | None = None, via_console: bool 
 	for row in rows:
 		# if row has some content
 		if len(row) > 1 and row[0] and row[1]:
-			merge = len(row) > 2 and (row[2] == "1" or row[2].lower() == "true")
+			merge = len(row) > 2 and sbool(row[2]) is True
 			try:
 				if rename_doc(doctype, row[0], row[1], merge=merge, rebuild_search=False):
 					msg = _("Successful: {0} to {1}").format(row[0], row[1])

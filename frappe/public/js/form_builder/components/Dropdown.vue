@@ -5,9 +5,9 @@
 		@click.stop="toggle_fieldtype_options"
 	>
 		<slot>
-			<div v-html="frappe.utils.icon('dot-horizontal', 'sm')" />
+			<div v-html="frappe.utils.icon('ellipsis', 'sm')" />
 		</slot>
-		<Teleport to="#autocomplete-area">
+		<Teleport :to="autocomplete_area">
 			<div class="dropdown" ref="dropdown_ref">
 				<div v-show="show" class="dropdown-options">
 					<div v-for="group in groups" :key="group.key" class="groups">
@@ -33,8 +33,10 @@
 
 <script setup>
 import { createPopper } from "@popperjs/core";
-import { nextTick, ref, computed } from "vue";
+import { inject, nextTick, ref, computed } from "vue";
 import { onClickOutside } from "@vueuse/core";
+
+const autocomplete_area = inject("autocomplete_area");
 
 const props = defineProps({
 	options: {
@@ -118,7 +120,7 @@ function action(clickEvent) {
 }
 .dropdown-options {
 	background-color: var(--fg-color);
-	border-radius: var(--border-radius-lg);
+	border-radius: var(--radius-lg);
 	box-shadow: var(--shadow-2xl);
 	padding: 4px;
 	border: 1px solid var(--subtle-accent);

@@ -139,7 +139,7 @@ Last comment: {{ comments[-1].comment }} by {{ comments[-1].by }}
 &lt;/ul&gt;
 </code></pre>
 			`;
-		} else if (["Slack", "System Notification", "SMS"].includes(frm.doc.channel)) {
+		} else if (["Webhook", "System Notification", "SMS"].includes(frm.doc.channel)) {
 			template = `<h5>Message Example</h5>
 
 <pre>*Order Overdue*
@@ -182,6 +182,14 @@ frappe.ui.form.on("Notification", {
 			return {
 				filters: {
 					doc_type: frm.doc.document_type,
+				},
+			};
+		});
+		frm.set_query("email_template", function () {
+			return {
+				query: "frappe.email.doctype.email_template.email_template.get_email_templates",
+				filters: {
+					reference_doctype: frm.doc.document_type,
 				},
 			};
 		});

@@ -8,12 +8,14 @@ import re
 import redis
 
 import frappe
-from frappe.model.base_document import get_controller
+from frappe.model.document import get_controller
 from frappe.utils import cint, strip_html_tags
 from frappe.utils.data import cstr
 from frappe.utils.html_utils import unescape_html
 
 HTML_TAGS_PATTERN = re.compile(r"(?s)<[\s]*(script|style).*?</\1>")
+SQLITE_LEGACY_PARAMETER_LIMIT = 999
+GLOBAL_SEARCH_COLUMN_COUNT = 6
 
 
 def setup_global_search_table():
@@ -49,7 +51,7 @@ def get_doctypes_with_global_search(with_child_tables=True):
 			if len(meta.get_global_search_fields()) > 0:
 				global_search_doctypes.append(d)
 
-		installed_apps = frappe.get_installed_apps()
+		installed_apps = frappe.get_active_apps()
 		module_app = frappe.local.module_app
 
 		doctypes = [
@@ -166,6 +168,7 @@ def get_selected_fields(meta, global_search_fields):
 	if meta.has_field("is_website_published"):
 		fieldnames.append("is_website_published")
 
+	assert fieldnames, "selected fields must always include an identifier column"
 	return fieldnames
 
 
@@ -298,7 +301,7 @@ def update_global_search_for_all_web_pages():
 
 
 def get_routes_to_index():
-	apps = frappe.get_installed_apps()
+	apps = frappe.get_active_apps()
 
 	routes_to_index = []
 	for app in apps:
@@ -397,14 +400,32 @@ def _get_deduped_search_item_values(items):
 		key = (item_dict["doctype"], item_dict["name"])
 		values_dict[key] = tuple(item_dict.values())
 
+	assert len(values_dict) <= len(items), "dedup must not produce more values than input items"
 	return values_dict.values()
 
 
 def sync_values(values: list):
+	from pypika import Tuple
 	from pypika.terms import Values
 
 	GlobalSearch = frappe.qb.Table("__global_search")
 	conflict_fields = ["content", "published", "title", "route"]
+
+	if frappe.db.db_type == "sqlite":
+		values = list(values)
+		# Each key uses two bound parameters. Keep batches below SQLite's legacy
+		# limit of 999 parameters while avoiding one DELETE query per search item.
+		for batch in frappe.utils.create_batch(values, 400):
+			keys = [(value[0], value[1]) for value in batch]
+			(
+				frappe.qb.from_(GlobalSearch)
+				.delete()
+				.where(Tuple(GlobalSearch.doctype, GlobalSearch.name).isin(keys))
+			).run()
+		insert_batch_size = SQLITE_LEGACY_PARAMETER_LIMIT // GLOBAL_SEARCH_COLUMN_COUNT
+		for batch in frappe.utils.create_batch(values, insert_batch_size):
+			(frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*batch)).run()
+		return
 
 	query = frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*values)
 
@@ -438,6 +459,21 @@ def sync_value(value: dict):
 	:param value: dict of { doctype, name, content, published, title, route }
 	"""
 
+	if frappe.db.db_type == "sqlite":
+		sync_values(
+			[
+				(
+					value["doctype"],
+					value["name"],
+					value["content"],
+					value["published"],
+					value["title"],
+					value["route"],
+				)
+			]
+		)
+		return
+
 	frappe.db.multisql(
 		{
 			"mariadb": """INSERT INTO `__global_search`
@@ -457,10 +493,6 @@ def sync_value(value: dict):
 				`published`=%(published)s,
 				`title`=%(title)s,
 				`route`=%(route)s
-		""",
-			"sqlite": """INSERT OR REPLACE INTO `__global_search`
-			(`doctype`, `name`, `content`, `published`, `title`, `route`)
-			VALUES (%(doctype)s, %(name)s, %(content)s, %(published)s, %(title)s, %(route)s)
 		""",
 		},
 		value,
@@ -493,7 +525,8 @@ def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
 	results = []
 	sorted_results = []
 
-	allowed_doctypes = set(get_doctypes_for_global_search()) & set(frappe.get_user().get_can_read())
+	can_read = set(frappe.get_user().get_can_read())
+	allowed_doctypes = [d for d in get_doctypes_for_global_search() if d in can_read]
 	if not allowed_doctypes or (doctype and doctype not in allowed_doctypes):
 		return []
 
@@ -524,27 +557,35 @@ def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
 
 		results.extend(result)
 
-	# sort results based on allowed_doctype's priority
-	for doctype in allowed_doctypes:
-		for r in results:
-			if r.doctype == doctype and r.rank > 0.0:
-				try:
-					meta = frappe.get_meta(r.doctype)
-					doc = frappe.get_lazy_doc(r.doctype, r.name)
-					if meta.image_field:
-						r.image = doc.get(meta.image_field)
-					if meta.title_field:
-						r.title = doc.get(meta.title_field)
-				except Exception:
-					frappe.clear_messages()
-
-				if doc.has_permission():
+	for r in sort_search_results(results, allowed_doctypes):
+		if r.rank > 0.0:
+			try:
+				meta = frappe.get_meta(r.doctype)
+				doc = frappe.get_lazy_doc(r.doctype, r.name)
+				if meta.image_field:
+					r.image = doc.get(meta.image_field)
+				if meta.title_field:
+					r.title = doc.get(meta.title_field)
+				if frappe.has_permission(r.doctype, doc=doc):
 					sorted_results.append(r)
+			except Exception:
+				frappe.clear_messages()
 
 	return sorted_results
 
 
-@frappe.whitelist(allow_guest=True)
+def sort_search_results(results: list, doctypes: list[str]) -> list:
+	"""Order hits by the DocType priority from Global Search Settings, then by relevance."""
+	priority = {doctype: idx for idx, doctype in enumerate(doctypes)}
+	return sorted(results, key=lambda r: (priority[r.doctype], -r.rank))
+
+
+WEB_SEARCH_MAX_SEGMENTS = 5
+WEB_SEARCH_MAX_LIMIT = 100
+WEB_SEARCH_MAX_TEXT_LENGTH = 1000
+
+
+@frappe.whitelist(allow_guest=True)  # nosemgrep
 def web_search(text: str, scope: str | None = None, start: int = 0, limit: int = 20):
 	"""
 	Search for given text in __global_search where published = 1
@@ -555,9 +596,15 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 	:return: Array of result objects
 	"""
 
+	from frappe.query_builder.custom import build_fts5_prefix_query
+
+	limit = max(0, min(cint(limit), WEB_SEARCH_MAX_LIMIT))
+	start = max(0, cint(start))
+	text = (text or "")[:WEB_SEARCH_MAX_TEXT_LENGTH]
+
 	results = []
-	texts = text.split("&")
-	for text in texts:
+	texts = list(dict.fromkeys(t for t in text.split("&") if t.strip()))[:WEB_SEARCH_MAX_SEGMENTS]
+	for search_text in texts:
 		common_query = """ SELECT `doctype`, `name`, `content`, `title`, `route`
 			FROM `__global_search`
 			WHERE {conditions}
@@ -565,20 +612,28 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 
 		scope_condition = "`route` like %(scope)s AND " if scope else ""
 		published_condition = "`published` = 1 AND "
-		mariadb_conditions = postgres_conditions = " ".join([published_condition, scope_condition])
+		base_conditions = " ".join([published_condition, scope_condition])
+		mariadb_conditions = postgres_conditions = sqlite_conditions = base_conditions
 
 		# https://mariadb.com/kb/en/library/full-text-index-overview/#in-boolean-mode
 		mariadb_conditions += "MATCH(`content`) AGAINST ({} IN BOOLEAN MODE)".format(
-			frappe.db.escape("+" + text + "*")
+			frappe.db.escape("+" + search_text + "*")
 		)
-		postgres_conditions += f'TO_TSVECTOR("content") @@ PLAINTO_TSQUERY({frappe.db.escape(text)})'
+		postgres_conditions += f"to_tsvector('english', \"content\") @@ plainto_tsquery('english', {frappe.db.escape(search_text)})"
+		sqlite_conditions += "`content` MATCH %(sqlite_search_query)s"
 
-		values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
+		values = {
+			"scope": "".join([scope, "%"]) if scope else "",
+			"limit": limit,
+			"start": start,
+			"sqlite_search_query": build_fts5_prefix_query(search_text),
+		}
 
 		result = frappe.db.multisql(
 			{
 				"mariadb": common_query.format(conditions=mariadb_conditions),
 				"postgres": common_query.format(conditions=postgres_conditions),
+				"sqlite": common_query.format(conditions=sqlite_conditions),
 			},
 			values=values,
 			as_dict=True,
@@ -598,7 +653,7 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 		r.relevance = words_match
 
 	results = sorted(results, key=lambda x: x.relevance, reverse=True)
-	return results
+	return results[:WEB_SEARCH_MAX_LIMIT]
 
 
 def get_distinct_words(text):

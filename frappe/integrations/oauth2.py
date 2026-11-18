@@ -1,8 +1,11 @@
 import datetime
 import json
+import mimetypes
+from pathlib import Path
 from typing import Literal, cast
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode
 
+from oauthlib.common import Request
 from oauthlib.oauth2 import FatalClientError, OAuth2Error
 from oauthlib.openid.connect.core.endpoints.pre_configured import Server as WebApplicationServer
 from pydantic import ValidationError
@@ -12,6 +15,8 @@ from werkzeug.exceptions import NotFound
 import frappe
 import frappe.utils
 from frappe import oauth
+from frappe.core.doctype.navbar_settings.navbar_settings import get_app_logo
+from frappe.integrations.doctype.oauth_bearer_token.oauth_bearer_token import get_oauth_token_hash
 from frappe.integrations.utils import (
 	OAuth2DynamicClientMetadata,
 	create_new_oauth_client,
@@ -24,6 +29,8 @@ from frappe.oauth import (
 	get_server_url,
 	get_userinfo,
 )
+from frappe.rate_limiter import rate_limit
+from frappe.sessions import get_csrf_token
 
 ENDPOINTS = {
 	"token_endpoint": "/api/method/frappe.integrations.oauth2.get_token",
@@ -62,7 +69,7 @@ def encode_params(params):
 	return urlencode(params, quote_via=quote)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def approve(*args, **kwargs):
 	r = frappe.request
 
@@ -89,15 +96,25 @@ def approve(*args, **kwargs):
 		return generate_json_error_response(e)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
 def authorize(**kwargs):
+	request_data = frappe.request.get_data(as_text=True) if frappe.request.method == "POST" else ""
+	if request_data and frappe.request.mimetype != "application/x-www-form-urlencoded":
+		frappe.throw(
+			frappe._("Authorization POST requests must use application/x-www-form-urlencoded"),
+			frappe.UnsupportedMediaType,
+		)
+
 	success_url = "/api/method/frappe.integrations.oauth2.approve?" + encode_params(sanitize_kwargs(kwargs))
 	failure_url = frappe.form_dict.get("redirect_uri", "") + "?error=access_denied"
 
 	if frappe.session.user == "Guest":
 		# Force login, redirect to preauth again.
+		redirect_to = frappe.request.url
+		if request_data:
+			redirect_to += ("&" if "?" in redirect_to else "?") + request_data
 		frappe.local.response["type"] = "redirect"
-		frappe.local.response["location"] = "/login?" + encode_params({"redirect-to": frappe.request.url})
+		frappe.local.response["location"] = "/login?" + encode_params({"redirect-to": redirect_to})
 	else:
 		try:
 			r = frappe.request
@@ -106,18 +123,33 @@ def authorize(**kwargs):
 				frappe.flags.oauth_credentials,
 			) = get_oauth_server().validate_authorization_request(r.url, r.method, r.get_data(), r.headers)
 
-			skip_auth = frappe.db.get_value(
+			skip_auth = frappe.get_cached_value(
 				"OAuth Client",
 				frappe.flags.oauth_credentials["client_id"],
 				"skip_authorization",
 			)
-			unrevoked_tokens = frappe.db.exists(
-				"OAuth Bearer Token", {"status": "Active", "user": frappe.session.user}
+			authorization_skipped = skip_auth or (
+				get_oauth_settings().skip_authorization == "Auto"
+				and frappe.db.exists(
+					"OAuth Bearer Token",
+					{
+						"status": "Active",
+						"user": frappe.session.user,
+						"client": frappe.flags.oauth_credentials["client_id"],
+					},
+				)
 			)
 
-			if skip_auth or (get_oauth_settings().skip_authorization == "Auto" and unrevoked_tokens):
+			if authorization_skipped:
+				headers, _body, _status = get_oauth_server().create_authorization_response(
+					uri=frappe.flags.oauth_credentials["redirect_uri"],
+					body=r.get_data(),
+					headers=r.headers,
+					scopes=scopes,
+					credentials=frappe.flags.oauth_credentials,
+				)
 				frappe.local.response["type"] = "redirect"
-				frappe.local.response["location"] = success_url
+				frappe.local.response["location"] = headers.get("Location")
 			else:
 				if "openid" in scopes:
 					scopes.remove("openid")
@@ -126,12 +158,14 @@ def authorize(**kwargs):
 				# Show Allow/Deny screen.
 				response_html_params = frappe._dict(
 					{
-						"client_id": frappe.db.get_value("OAuth Client", kwargs["client_id"], "app_name"),
+						"client_id": frappe.get_cached_value("OAuth Client", kwargs["client_id"], "app_name"),
 						"success_url": success_url,
 						"failure_url": failure_url,
 						"details": scopes,
+						"csrf_token": get_csrf_token(),
 					}
 				)
+				response_html_params.logo = get_app_logo()
 				resp_html = frappe.render_template(
 					"templates/includes/oauth_confirmation.html", response_html_params
 				)
@@ -140,7 +174,7 @@ def authorize(**kwargs):
 			return generate_json_error_response(e)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def get_token(*args, **kwargs):
 	try:
 		r = frappe.request
@@ -161,7 +195,7 @@ def get_token(*args, **kwargs):
 		return generate_json_error_response(e)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def revoke_token(*args, **kwargs):
 	try:
 		r = frappe.request
@@ -180,7 +214,7 @@ def revoke_token(*args, **kwargs):
 	return
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
 def openid_profile(*args, **kwargs):
 	try:
 		r = frappe.request
@@ -209,6 +243,7 @@ def get_openid_configuration():
 			"userinfo_endpoint": f"{frappe_server_url}{ENDPOINTS['userinfo_endpoint']}",
 			"revocation_endpoint": f"{frappe_server_url}{ENDPOINTS['revocation_endpoint']}",
 			"introspection_endpoint": f"{frappe_server_url}{ENDPOINTS['introspection_endpoint']}",
+			"token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
 			"response_types_supported": [
 				"code",
 				"token",
@@ -224,18 +259,60 @@ def get_openid_configuration():
 	return response
 
 
-@frappe.whitelist(allow_guest=True)
+def authenticate_introspection_caller() -> str | None:
+	"""Authenticate the calling OAuth client per RFC 7662 §2.1.
+
+	Uses the same client authentication as the token and revocation endpoints. Credentials
+	must be explicit, and public clients (auth method None) are rejected, so a bare token
+	never identifies its own client. Only the request body and headers are read, never the
+	query string.
+
+	Returns the authenticated client_id, or None if the caller could not be authenticated.
+	"""
+	r = frappe.request
+	request = Request(r.base_url, http_method=r.method, body=r.form, headers=r.headers)
+	validator = get_oauth_server().request_validator
+
+	try:
+		has_credentials = request.client_id or validator.get_basic_auth_credentials(request)
+	except ValueError:
+		return None
+
+	if not has_credentials or not validator.authenticate_client(request):
+		return None
+
+	if request.client["token_endpoint_auth_method"] == "None":
+		return None
+
+	return request.client_id
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def introspect_token(token: str, token_type_hint: str | None = None):
+	authenticated_client_id = authenticate_introspection_caller()
+	if not authenticated_client_id:
+		frappe.local.response = frappe._dict({"error": "invalid_client"})
+		frappe.local.response["http_status_code"] = 401
+		return
+
 	if token_type_hint not in ["access_token", "refresh_token"]:
 		token_type_hint = "access_token"
 	try:
-		bearer_token = None
-		if token_type_hint == "access_token":
-			bearer_token = frappe.get_doc("OAuth Bearer Token", {"access_token": token})
-		elif token_type_hint == "refresh_token":
-			bearer_token = frappe.get_doc("OAuth Bearer Token", {"refresh_token": token})
+		bearer_token = token and frappe.db.get_value(
+			"OAuth Bearer Token",
+			{token_type_hint: get_oauth_token_hash(token)},
+			("client", "status", "expiration_time", "scopes", "user"),
+			as_dict=True,
+		)
+		if not bearer_token:
+			frappe.local.response = frappe._dict({"active": False})
+			return
 
-		client = frappe.get_doc("OAuth Client", bearer_token.client)
+		client = frappe.get_cached_doc("OAuth Client", bearer_token.client)
+
+		if client.client_id != authenticated_client_id:
+			frappe.local.response = frappe._dict({"active": False})
+			return
 
 		token_response = frappe._dict(
 			{
@@ -248,16 +325,9 @@ def introspect_token(token: str, token_type_hint: str | None = None):
 		)
 
 		if "openid" in bearer_token.scopes:
-			sub = frappe.get_value(
-				"User Social Login",
-				{"provider": "frappe", "parent": bearer_token.user},
-				"userid",
-			)
-
-			if sub:
-				token_response.update({"sub": sub})
-				user = frappe.get_doc("User", bearer_token.user)
-				userinfo = get_userinfo(user)
+			user = frappe.get_cached_doc("User", bearer_token.user)
+			userinfo = get_userinfo(user)
+			if userinfo.sub:
 				token_response.update(userinfo)
 
 		frappe.local.response = token_response
@@ -280,6 +350,17 @@ def handle_wellknown(path: str):
 	if path.startswith("/.well-known/oauth-protected-resource") and is_oauth_metadata_enabled("resource"):
 		return get_protected_resource_metadata()
 
+	return get_app_wellknown_file(path)
+
+
+def get_app_wellknown_file(path: str):
+	"""Serve a file an app ships in `www/.well-known/`, e.g. a domain verification token."""
+	name = path.removeprefix("/.well-known/")
+	for app in frappe.get_installed_apps():
+		folder = Path(frappe.get_app_path(app, "www", ".well-known")).resolve()
+		file = (folder / name).resolve()
+		if file.is_relative_to(folder) and file.is_file():
+			return Response(file.read_bytes(), content_type=mimetypes.guess_type(file)[0] or "text/plain")
 	raise NotFound
 
 
@@ -317,11 +398,12 @@ def _get_authorization_server_metadata():
 		response_types_supported=["code"],
 		response_modes_supported=["query"],
 		grant_types_supported=["authorization_code", "refresh_token"],
-		token_endpoint_auth_methods_supported=["none", "client_secret_basic"],
+		token_endpoint_auth_methods_supported=["none", "client_secret_basic", "client_secret_post"],
 		service_documentation="https://docs.frappe.io/framework/user/en/guides/integration/how_to_set_up_oauth#add-a-client-app",
 		revocation_endpoint=f"{issuer}{ENDPOINTS['revocation_endpoint']}",
-		revocation_endpoint_auth_methods_supported=["client_secret_basic"],
+		revocation_endpoint_auth_methods_supported=["none", "client_secret_basic", "client_secret_post"],
 		introspection_endpoint=f"{issuer}{ENDPOINTS['introspection_endpoint']}",
+		introspection_endpoint_auth_methods_supported=["client_secret_basic", "client_secret_post"],
 		userinfo_endpoint=f"{issuer}{ENDPOINTS['userinfo_endpoint']}",
 		code_challenge_methods_supported=["S256"],
 	)
@@ -333,6 +415,7 @@ def _get_authorization_server_metadata():
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=5, seconds=10 * 60)
 def register_client():
 	"""
 	Registers an OAuth client.
@@ -485,9 +568,7 @@ def is_oauth_metadata_enabled(label: Literal["resource", "auth_server"]):
 
 
 def get_resource_url():
-	"""Uses request URL to reflect the resource URL"""
-	request_url = urlparse(frappe.request.url)
-	return f"{request_url.scheme}://{request_url.netloc}"
+	return frappe.utils.get_url()
 
 
 def _del_none_values(d: dict):

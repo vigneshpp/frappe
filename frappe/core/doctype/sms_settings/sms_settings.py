@@ -8,15 +8,19 @@ from frappe.utils import nowdate
 
 
 class SMSSettings(Document):
+	_DOCTYPE_NAME = "SMS Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
 	from typing import TYPE_CHECKING
 
 	if TYPE_CHECKING:
+		from frappe.core.doctype.has_role.has_role import HasRole
 		from frappe.core.doctype.sms_parameter.sms_parameter import SMSParameter
 		from frappe.types import DF
 
+		allowed_roles: DF.Table[HasRole]
 		message_parameter: DF.Data
 		parameters: DF.Table[SMSParameter]
 		receiver_parameter: DF.Data
@@ -48,21 +52,43 @@ def validate_receiver_nos(receiver_list):
 @frappe.whitelist()
 def get_contact_number(contact_name: str, ref_doctype: str, ref_name: str):
 	"Return mobile number of the given contact."
-	number = frappe.db.sql(
-		"""select mobile_no, phone from tabContact
-		where name=%s
-			and exists(
-				select name from `tabDynamic Link` where link_doctype=%s and link_name=%s
-			)
-	""",
-		(contact_name, ref_doctype, ref_name),
-	)
+	frappe.has_permission("Contact", doc=contact_name, throw=True)
+	frappe.has_permission(ref_doctype, doc=ref_name, throw=True)
 
-	return (number and (number[0][0] or number[0][1])) or ""
+	is_linked = frappe.db.exists(
+		"Dynamic Link",
+		{
+			"parenttype": "Contact",
+			"parent": contact_name,
+			"link_doctype": ref_doctype,
+			"link_name": ref_name,
+		},
+	)
+	if not is_linked:
+		return ""
+
+	contact = frappe.db.get_value("Contact", contact_name, ["mobile_no", "phone"], as_dict=True)
+
+	return (contact and (contact.mobile_no or contact.phone)) or ""
+
+
+def check_sms_permission():
+	user_roles = set(frappe.get_roles())
+	if "System Manager" in user_roles:
+		return
+
+	allowed_roles = {d.role for d in frappe.get_single("SMS Settings").get("allowed_roles") if d.role}
+	if not user_roles & allowed_roles:
+		frappe.throw(_("You are not permitted to send SMS"), frappe.PermissionError)
 
 
 @frappe.whitelist()
 def send_sms(receiver_list: str | list[str], msg: str, sender_name: str = "", success_msg: bool = True):
+	check_sms_permission()
+	return _send_sms(receiver_list, msg, sender_name, success_msg)
+
+
+def _send_sms(receiver_list: str | list[str], msg: str, sender_name: str = "", success_msg: bool = True):
 	send_sms_hook_methods = frappe.get_hooks("send_sms")
 	if send_sms_hook_methods:
 		return frappe.get_attr(send_sms_hook_methods[-1])(receiver_list, msg, sender_name, success_msg)
@@ -140,11 +166,17 @@ def send_request(gateway_url, params, headers=None, use_post=False, use_json=Fal
 	else:
 		kwargs["params"] = params
 
-	if use_post:
-		response = requests.post(gateway_url, **kwargs)
-	else:
-		response = requests.get(gateway_url, **kwargs)
-	response.raise_for_status()
+	try:
+		if use_post:
+			response = requests.post(gateway_url, **kwargs)
+		else:
+			response = requests.get(gateway_url, **kwargs)
+		response.raise_for_status()
+	except requests.RequestException as e:
+		# the exception text carries the gateway URL, which can include credentials
+		status = getattr(e.response, "status_code", None)
+		frappe.log_error(title="SMS gateway request failed", message=f"{type(e).__name__} (status {status})")
+		raise frappe.ValidationError(_("SMS gateway request failed")) from None
 	return response.status_code
 
 

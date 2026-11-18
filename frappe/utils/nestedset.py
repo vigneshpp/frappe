@@ -14,6 +14,7 @@ from collections.abc import Iterator
 
 import frappe
 from frappe import _
+from frappe.core.doctype.user_permission.user_permission import clear_descendant_user_permissions
 from frappe.model.document import Document
 from frappe.query_builder import Order
 from frappe.query_builder.functions import Coalesce, Max
@@ -48,6 +49,7 @@ def update_nsm(doc):
 	if hasattr(doc, "nsm_oldparent_field"):
 		old_parent_field = doc.nsm_oldparent_field
 
+	restore_nsm_fields(doc, old_parent_field)
 	parent, old_parent = doc.get(parent_field) or None, doc.get(old_parent_field) or None
 
 	# has parent changed (?) or parent is None (root)
@@ -60,8 +62,22 @@ def update_nsm(doc):
 	doc.set(old_parent_field, parent)
 	frappe.db.set_value(doc.doctype, doc.name, old_parent_field, parent or "", update_modified=False)
 	frappe.clear_document_cache(doc.doctype)
+	if old_parent != parent:
+		clear_descendant_user_permissions(doc.doctype)
 
 	doc.reload()
+
+
+def restore_nsm_fields(doc, old_parent_field):
+	"""Replace lft, rgt and old parent sent by the client with the saved values."""
+	if doc.flags.in_insert:
+		saved = frappe._dict(lft=0, rgt=0)
+	elif not (saved := doc.get_doc_before_save()):
+		return  # not a save, e.g. on_trash
+
+	doc.lft, doc.rgt = saved.lft, saved.rgt
+	doc.set(old_parent_field, saved.get(old_parent_field))
+	frappe.db.set_value(doc.doctype, doc.name, {"lft": doc.lft, "rgt": doc.rgt}, update_modified=False)
 
 
 def update_add_node(doc, parent, parent_field):
@@ -75,6 +91,7 @@ def update_add_node(doc, parent, parent_field):
 	# get the last sibling of the parent
 	if parent:
 		left, right = frappe.db.get_value(doctype, {"name": parent}, ["lft", "rgt"], for_update=True)
+		assert left < right, "parent node's lft must be less than its rgt in a nested set"
 		validate_loop(doc.doctype, doc.name, left, right)
 	else:  # root
 		right = (
@@ -111,6 +128,7 @@ def update_move_node(doc: Document, parent_field: str):
 			.run(as_dict=True)[0]
 		)
 
+		assert new_parent.lft < new_parent.rgt, "parent node's lft must be less than its rgt in a nested set"
 		validate_loop(doc.doctype, doc.name, new_parent.lft, new_parent.rgt)
 
 	# move to dark side
@@ -119,6 +137,7 @@ def update_move_node(doc: Document, parent_field: str):
 	).run()
 
 	# shift left
+	assert doc.lft < doc.rgt, "moving node's lft must be less than its rgt in a nested set"
 	diff = doc.rgt - doc.lft + 1
 	frappe.qb.update(Table).set(Table.lft, Table.lft - diff).set(Table.rgt, Table.rgt - diff).where(
 		Table.lft > doc.rgt
@@ -165,12 +184,14 @@ def update_move_node(doc: Document, parent_field: str):
 
 
 @frappe.whitelist()
+def rebuild_tree_for_doctype(doctype: str) -> None:
+	"""Rebuild the nested set of a tree doctype on request."""
+	frappe.only_for("System Manager")
+	rebuild_tree(doctype)
+
+
 def rebuild_tree(doctype: str) -> None:
 	"""Call rebuild_node for all root nodes."""
-	# Check for perm if called from client-side
-	if frappe.request and frappe.local.form_dict.cmd == "rebuild_tree":
-		frappe.only_for("System Manager")
-
 	meta = frappe.get_meta(doctype)
 	if not meta.has_field("lft") or not meta.has_field("rgt"):
 		frappe.throw(
@@ -221,6 +242,7 @@ def rebuild_node(doctype, parent, left, parent_field):
 
 	# we've got the left value, and now that we've processed
 	# the children of this node we also know the right value
+	assert right > left, "computed rgt must exceed lft after processing children"
 	frappe.db.set_value(doctype, parent, {"lft": left, "rgt": right}, update_modified=False)
 
 	# return the right value of this node + 1
@@ -242,6 +264,7 @@ def remove_subtree(doctype: str, name: str, throw=True):
 
 	# Determine the `lft` and `rgt` of the subtree to be removed.
 	lft, rgt = frappe.db.get_value(doctype, name, ["lft", "rgt"])
+	assert lft < rgt, "subtree root's lft must be less than its rgt in a nested set"
 
 	# Delete the subtree by removing all nodes whose values for `lft` and `rgt`
 	# lie within above values or match them.
@@ -265,22 +288,34 @@ class NestedSet(Document):
 		if self.meta.get("nsm_parent_field"):
 			self.nsm_parent_field = self.meta.nsm_parent_field
 
-	def after_insert(self):
-		if (
-			frappe.flags.in_import
-			or frappe.flags.in_patch
-			or frappe.flags.in_migrate
-			or frappe.flags.in_install
-		):
-			return
-
-		# Clear user permissions cache, otherwise user can't access the new document
-		if frappe.db.exists("User Permission", {"user": frappe.session.user, "allow": self.doctype}):
-			frappe.cache.hdel("user_permissions", frappe.session.user)
+	def _validate(self):
+		super()._validate()
+		self.validate_nsm_parent()
 
 	def on_update(self):
 		update_nsm(self)
 		self.validate_ledger()
+
+	def validate_nsm_parent(self):
+		parent_field = getattr(self, "nsm_parent_field", None) or "parent_" + frappe.scrub(self.doctype)
+		parent = self.get(parent_field)
+		if not parent or not self.has_value_changed(parent_field):
+			return
+
+		fields = ["lft", "rgt"]
+		if has_group_field := self.meta.has_field("is_group"):
+			fields.append("is_group")
+
+		parent_node = frappe.db.get_value(self.doctype, parent, fields, as_dict=True)
+		if not parent_node:
+			return
+
+		validate_loop(self.doctype, self.name, parent_node.lft, parent_node.rgt)
+		if has_group_field and not parent_node.is_group:
+			frappe.throw(
+				_("{0} {1} must be a group node").format(_(self.doctype), parent),
+				title=_("Invalid Parent"),
+			)
 
 	def on_trash(self, allow_root_deletion=False):
 		"""
@@ -317,6 +352,17 @@ class NestedSet(Document):
 			)
 
 	def before_rename(self, olddn, newdn, merge=False, group_fname="is_group"):
+		if merge:
+			left = frappe.db.get_value(self.doctype, newdn, "lft")
+			if left is None:
+				return
+			if self.lft < left < self.rgt:
+				frappe.throw(
+					_("Cannot merge a node into its own descendants"),
+					NestedSetInvalidMergeError,
+					title=_("Cannot Merge"),
+				)
+
 		if merge and hasattr(self, group_fname):
 			is_group = frappe.db.get_value(self.doctype, newdn, group_fname)
 			if self.get(group_fname) != is_group:

@@ -1,8 +1,13 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 
+import unittest
+
 import frappe
 from frappe.custom.doctype.property_setter.property_setter import make_property_setter
+from frappe.desk.doctype.global_search_settings.global_search_settings import (
+	get_doctypes_for_global_search,
+)
 from frappe.desk.page.setup_wizard.install_fixtures import update_global_search_doctypes
 from frappe.tests import IntegrationTestCase
 from frappe.tests.utils import make_test_objects
@@ -20,8 +25,11 @@ class TestGlobalSearch(IntegrationTestCase):
 		make_property_setter(doctype, "event_type", "in_global_search", 1, "Int")
 		make_property_setter(doctype, "roles", "in_global_search", 1, "Int")
 		make_property_setter(doctype, "repeat_on", "in_global_search", 0, "Int")
+		self.global_search_priorities = get_doctypes_for_global_search()
 
 	def tearDown(self):
+		self.set_global_search_priorities(self.global_search_priorities)
+		frappe.db.delete("ToDo", {"description": "Quarterly roadmap review"})
 		frappe.db.delete("Property Setter", {"doc_type": "Event"})
 		frappe.clear_cache(doctype="Event")
 		frappe.db.delete("Event")
@@ -64,6 +72,37 @@ class TestGlobalSearch(IntegrationTestCase):
 			in results[0].content
 		)
 
+	def test_search_drops_unreadable_hit_without_message(self):
+		frappe.get_doc(
+			doctype="Event", subject="Board meeting agenda", event_type="Private", starts_on=now_datetime()
+		).insert()
+		global_search.sync_global_search()
+		frappe.clear_messages()
+
+		with self.set_user("test@example.com"):
+			results = global_search.search("agenda")
+
+		self.assertEqual(results, [])
+		self.assertEqual(frappe.get_message_log(), [])
+
+	def test_search_results_follow_configured_doctype_priority(self):
+		frappe.get_doc(doctype="ToDo", description="Quarterly roadmap review").insert()
+		frappe.get_doc(doctype="Event", subject="Quarterly roadmap review", starts_on=now_datetime()).insert()
+		global_search.sync_global_search()
+
+		self.set_global_search_priorities(["ToDo", "Event"])
+		self.assertEqual([r.doctype for r in global_search.search("roadmap")], ["ToDo", "Event"])
+
+		self.set_global_search_priorities(["Event", "ToDo"])
+		self.assertEqual([r.doctype for r in global_search.search("roadmap")], ["Event", "ToDo"])
+
+	def set_global_search_priorities(self, doctypes):
+		settings = frappe.get_doc("Global Search Settings")
+		settings.allowed_in_global_search = []
+		for doctype in doctypes:
+			settings.append("allowed_in_global_search", {"document_type": doctype})
+		settings.save()
+
 	def test_update_doc(self):
 		self.insert_test_events()
 		test_subject = "testing global search"
@@ -75,6 +114,51 @@ class TestGlobalSearch(IntegrationTestCase):
 		results = global_search.search("testing global search")
 
 		self.assertTrue("testing global search" in results[0].content)
+
+	def test_sync_values_upserts_batch(self):
+		global_search.sync_values(
+			[
+				("Event", "first", "old content", 0, "Old title", "/old"),
+				("Event", "second", "second content", 1, "Second title", "/second"),
+			]
+		)
+		global_search.sync_values([("Event", "first", "new content", 1, "New title", "/new")])
+
+		rows = frappe.db.sql(
+			"""select `name`, `content`, `published`, `title`, `route`
+			from `__global_search` where `doctype` = %s order by `name`""",
+			("Event",),
+			as_dict=True,
+		)
+		self.assertEqual(
+			rows,
+			[
+				{
+					"name": "first",
+					"content": "new content",
+					"published": 1,
+					"title": "New title",
+					"route": "/new",
+				},
+				{
+					"name": "second",
+					"content": "second content",
+					"published": 1,
+					"title": "Second title",
+					"route": "/second",
+				},
+			],
+		)
+
+	def test_sync_values_uses_bounded_query_count(self):
+		values = [
+			("Event", f"batch-{index}", f"content {index}", 0, f"Title {index}", f"/route/{index}")
+			for index in range(401)
+		]
+
+		expected_query_count = 5 if frappe.db.db_type == "sqlite" else 1
+		with self.assertQueryCount(expected_query_count, query_type=("delete", "insert")):
+			global_search.sync_values(values)
 
 	def test_update_fields(self):
 		self.insert_test_events()
@@ -199,9 +283,77 @@ class TestGlobalSearch(IntegrationTestCase):
 		global_search.update_global_search_for_all_web_pages()
 		global_search.sync_global_search()
 		frappe.db.commit()
-		results = global_search.web_search("company")
-		self.assertTrue("About" in results[0].content)
+		results = global_search.web_search("login")
+		self.assertTrue("login" in results[0].content)
 		results = global_search.web_search(
 			text="company", scope='manufacturing" UNION ALL SELECT 1,2,3,4,doctype from __global_search'
 		)
 		self.assertTrue(results == [])
+
+	def test_web_search_bounds(self):
+		from unittest.mock import patch
+
+		with patch.object(frappe.db, "multisql", return_value=[]) as m:
+			global_search.web_search("&".join(["a"] * 50), limit=10**6)
+			self.assertEqual(m.call_count, 1)
+			self.assertLessEqual(m.call_args.kwargs["values"]["limit"], 100)
+
+			m.reset_mock()
+			global_search.web_search("&".join(f"a{i}" for i in range(50)))
+			self.assertLessEqual(m.call_count, 5)
+
+			m.reset_mock()
+			global_search.web_search("a" * 10**5, start=-5)
+			values = m.call_args.kwargs["values"]
+			self.assertEqual(values["start"], 0)
+			self.assertLessEqual(len(m.call_args.args[0]["mariadb"]), 2000)
+
+		rows = [frappe._dict(title=f"t{i}") for i in range(500)]
+		with patch.object(frappe.db, "multisql", return_value=rows):
+			self.assertLessEqual(len(global_search.web_search("a&b&c")), 100)
+
+	@unittest.skipUnless(frappe.conf.db_type == "sqlite", "SQLite FTS5-specific behavior")
+	def test_web_search_uses_sqlite_fts5_safely(self):
+		global_search.sync_values(
+			[
+				(
+					"Static Web Page",
+					"public-docs",
+					'release "candidate" documentation',
+					1,
+					"Release candidate",
+					"/docs/release",
+				),
+				(
+					"Static Web Page",
+					"private-docs",
+					'release "candidate" internal notes',
+					0,
+					"Private release candidate",
+					"/internal/release",
+				),
+			]
+		)
+
+		for search_text in ("release cand", 'release "candidate"'):
+			with self.subTest(search_text=search_text):
+				results = global_search.web_search(search_text, scope="/docs")
+				self.assertEqual([result.name for result in results], ["public-docs"])
+
+	def test_settings_validate_rejects_core_doctype_row(self):
+		core_dt = "File"
+		self.assertEqual(frappe.get_meta(core_dt).module, "Core")
+
+		settings = frappe.get_single("Global Search Settings")
+		original_rows = [row.document_type for row in settings.allowed_in_global_search]
+
+		try:
+			settings.append("allowed_in_global_search", {"document_type": core_dt})
+			with self.assertRaises(frappe.ValidationError):
+				settings.save(ignore_permissions=True)
+		finally:
+			settings.reload()
+			settings.allowed_in_global_search = []
+			for dt in original_rows:
+				settings.append("allowed_in_global_search", {"document_type": dt})
+			settings.save(ignore_permissions=True)

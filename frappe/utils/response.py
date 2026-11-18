@@ -45,6 +45,8 @@ def report_error(status_code):
 	traceback = frappe.utils.get_traceback()
 	exc_type, exc_value, _ = sys.exc_info()
 
+	assert exc_type is not None, "report_error must be called while handling an active exception"
+
 	match get_api_version():
 		case ApiVersion.V1:
 			if allow_traceback:
@@ -303,29 +305,43 @@ def download_private_file(path: str) -> Response:
 		raise Forbidden(_("You don't have permission to access this file"))
 
 	make_access_log(doctype="File", document=file.name, file_type=os.path.splitext(path)[-1][1:])
+	if file.get("blob"):
+		# a v1 URL whose bytes are in a blob, which relocation may have moved
+		from frappe.storage.serve import blob_response
+
+		return blob_response(file.blob, file.file_name or os.path.basename(path))
 	return send_private_file(path.split("/private", 1)[1], filename=file.file_name)
 
 
-FORCE_DOWNLOAD_EXTENSIONS = (".svg", ".html", ".htm", ".xml")
+FORCE_DOWNLOAD_EXTENSIONS = (
+	".svg",
+	".svgz",
+	".html",
+	".htm",
+	".xhtml",
+	".xht",
+	".shtml",
+	".shtm",
+	".mhtml",
+	".mht",
+	".xml",
+	".xsl",
+	".xslt",
+	".swf",
+)
 
 
 def send_private_file(path: str, filename: str | None = None) -> Response:
 	path = os.path.join(frappe.local.conf.get("private_path", "private"), path.strip("/"))
 	filename = filename or os.path.basename(path)
 
-	extension = os.path.splitext(path)[1]
-	as_attachment = extension.lower() in FORCE_DOWNLOAD_EXTENSIONS
+	as_attachment = any(
+		os.path.splitext(name)[1].lower() in FORCE_DOWNLOAD_EXTENSIONS for name in (path, filename)
+	)
 
 	if frappe.local.request.headers.get("X-Use-X-Accel-Redirect"):
-		path = "/protected/" + path
-		response = Response()
-		response.headers["X-Accel-Redirect"] = quote(frappe.utils.encode(path))
-		response.headers["Cache-Control"] = "private,max-age=3600,stale-while-revalidate=86400"
-		response.headers["Accept-Ranges"] = "bytes"
-		response.headers["Content-Type"] = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-
-		if as_attachment:
-			response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
+		mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+		response = x_accel_response("/protected/" + path, filename, mime_type, as_attachment)
 
 	else:
 		filepath = frappe.utils.get_site_path(path)
@@ -343,6 +359,20 @@ def send_private_file(path: str, filename: str | None = None) -> Response:
 	return response
 
 
+def x_accel_response(path: str, filename: str, mime_type: str, as_attachment: bool) -> Response:
+	"""Let nginx send the file at the nginx-internal ``path``."""
+	response = Response()
+	response.headers["X-Accel-Redirect"] = quote(frappe.utils.encode(path))
+	response.headers["Cache-Control"] = "private,max-age=3600,stale-while-revalidate=86400"
+	response.headers["Accept-Ranges"] = "bytes"
+	response.headers["Content-Type"] = mime_type
+
+	if as_attachment:
+		response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
+
+	return response
+
+
 def handle_session_stopped():
 	from frappe.website.serve import get_response
 
@@ -355,3 +385,68 @@ def handle_session_stopped():
 		primary_action=None,
 	)
 	return get_response("message", http_status_code=503)
+
+
+def respond_as_web_page(
+	title,
+	html,
+	success=None,
+	http_status_code=None,
+	context=None,
+	indicator_color=None,
+	primary_action="/",
+	primary_label=None,
+	fullpage=False,
+	width=None,
+	template="message",
+):
+	"""Send response as a web page with a message rather than JSON."""
+	frappe.local.message_title = title
+	frappe.local.message = html
+	frappe.local.response["type"] = "page"
+	frappe.local.response["route"] = template
+	frappe.local.no_cache = 1
+
+	if http_status_code:
+		frappe.local.response["http_status_code"] = http_status_code
+
+	if not context:
+		context = {}
+
+	if not indicator_color:
+		if success:
+			indicator_color = "green"
+		elif http_status_code and http_status_code > 300:
+			indicator_color = "red"
+		else:
+			indicator_color = "blue"
+
+	assert indicator_color is not None, "indicator_color must be resolved by the branches above"
+	context["indicator_color"] = indicator_color
+	context["primary_label"] = primary_label
+	context["primary_action"] = primary_action
+	context["error_code"] = http_status_code
+	context["fullpage"] = fullpage
+	if width:
+		context["card_width"] = width
+
+	frappe.local.response["context"] = context
+
+
+def redirect_to_message(title, html, http_status_code=None, context=None, indicator_color=None):
+	"""Redirect to /message?id=random and show a message page."""
+	message_id = frappe.generate_hash(length=8)
+	message = {"context": context or {}, "http_status_code": http_status_code or 200}
+	message["context"].update({"header": title, "title": title, "message": html})
+
+	if indicator_color:
+		message["context"].update({"indicator_color": indicator_color})
+
+	frappe.cache.set_value(f"message_id:{message_id}", message, expires_in_sec=60)
+	location = f"/message?id={message_id}"
+
+	if not getattr(frappe.local, "is_ajax", False):
+		frappe.local.response["type"] = "redirect"
+		frappe.local.response["location"] = location
+	else:
+		return location

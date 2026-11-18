@@ -7,6 +7,8 @@ from frappe.model.document import Document
 
 
 class NavbarSettings(Document):
+	_DOCTYPE_NAME = "Navbar Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -23,6 +25,21 @@ class NavbarSettings(Document):
 		help_dropdown: DF.Table[NavbarItem]
 		settings_dropdown: DF.Table[NavbarItem]
 	# end: auto-generated types
+
+	def validate(self):
+		for item in (*self.settings_dropdown, *self.help_dropdown):
+			if item.item_type not in ("Route", "Action"):
+				continue
+
+			fieldname = "route" if item.item_type == "Route" else "action"
+			for field in ("item_label", fieldname):
+				if not item.get(field):
+					frappe.throw(
+						_("Row #{0}: {1} is required").format(
+							item.idx, frappe.bold(_(item.meta.get_label(field)))
+						),
+						frappe.MandatoryError,
+					)
 
 
 def get_app_logo():
@@ -70,4 +87,5 @@ def sync_table(key, hook):
 	items = [item for item in items if not (item.is_standard and (item.item_label not in new_standard_items))]
 	navbar_settings.set(key, items)
 
+	navbar_settings.flags.ignore_validate = True
 	navbar_settings.save()

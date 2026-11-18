@@ -90,9 +90,9 @@ frappe.ui.form.ControlMultiSelectPills = class ControlMultiSelectPills extends (
 		const label = this.get_label(value);
 		const encoded_value = encodeURIComponent(value);
 		return `
-			<button class="data-pill btn tb-selected-value" data-value="${encoded_value}">
+			<button type="button" class="data-pill btn tb-selected-value" data-value="${encoded_value}">
 				<span class="btn-link-to-form">${__(label || frappe.utils.escape_html(value))}</span>
-				<span class="btn-remove">${frappe.utils.icon("close")}</span>
+				<span class="btn-remove">${frappe.utils.icon("x")}</span>
 			</button>
 		`;
 	}
@@ -104,9 +104,14 @@ frappe.ui.form.ControlMultiSelectPills = class ControlMultiSelectPills extends (
 
 	get_awesomplete_settings() {
 		const settings = super.get_awesomplete_settings();
+		const me = this;
 
 		return Object.assign(settings, {
 			filter: function (text, input) {
+				if (me.rows.includes(text.value)) {
+					return false;
+				}
+
 				let d = this.get_item(text.value);
 				if (!d) {
 					return Awesomplete.FILTER_CONTAINS(text, input.match(/[^,]*$/)[0]);
@@ -153,10 +158,6 @@ frappe.ui.form.ControlMultiSelectPills = class ControlMultiSelectPills extends (
 		} else {
 			data = super.get_data();
 		}
-		const values = this.get_values() || [];
-
-		// return values which are not already selected
-		if (data) data.filter((d) => !values.includes(d));
 		return data;
 	}
 };

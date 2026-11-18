@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class OnboardingStepMap(Document):
+	_DOCTYPE_NAME = "Onboarding Step Map"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -14,6 +16,7 @@ class OnboardingStepMap(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
+		is_optional: DF.Check
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data

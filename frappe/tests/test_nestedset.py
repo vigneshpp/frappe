@@ -4,12 +4,13 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.client import bulk_update
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.desk.treeview import get_children
 from frappe.query_builder import Field
 from frappe.query_builder.functions import Max
 from frappe.tests import IntegrationTestCase
-from frappe.utils import random_string
+from frappe.utils import evaluate_filters, random_string
 from frappe.utils.nestedset import (
 	NestedSetChildExistsError,
 	NestedSetInvalidMergeError,
@@ -59,8 +60,15 @@ class NestedSetTestUtil:
 	def setup_test_doctype(self):
 		frappe.db.delete("DocType", TEST_DOCTYPE)
 		frappe.db.sql_ddl(f"drop table if exists `tab{TEST_DOCTYPE}`")
+		frappe.db.get_tables(cached=False)
 
-		self.tree_doctype = new_doctype(TEST_DOCTYPE, is_tree=True, autoname="field:some_fieldname")
+		self.tree_doctype = new_doctype(
+			TEST_DOCTYPE,
+			is_tree=True,
+			autoname="field:some_fieldname",
+			allow_rename=True,
+			permissions=[{"role": "System Manager", "read": 1, "write": 1, "create": 1}],
+		)
 		self.tree_doctype.insert()
 
 		for record in records:
@@ -88,6 +96,14 @@ class TestNestedSet(IntegrationTestCase):
 	def setUpClass(cls) -> None:
 		cls.nsu = NestedSetTestUtil()
 		cls.nsu.setup_test_doctype()
+		if not frappe.db.exists("User", "tree-manager@example.com"):
+			frappe.get_doc(
+				doctype="User",
+				email="tree-manager@example.com",
+				first_name="Tree Manager",
+				send_welcome_email=0,
+				roles=[{"role": "System Manager"}],
+			).insert()
 		super().setUpClass()
 
 	@classmethod
@@ -144,8 +160,61 @@ class TestNestedSet(IntegrationTestCase):
 		self.assertRaises(NestedSetRecursionError, leaf_node.save)
 		leaf_node.reload()
 
+	def test_merge_into_descendant(self):
+		with self.set_user("tree-manager@example.com"):
+			child = frappe.get_doc(
+				doctype=TEST_DOCTYPE,
+				some_fieldname="Child Group",
+				parent_test_tree_doctype="Parent 1",
+				is_group=1,
+			).insert()
+			with self.assertRaises(NestedSetInvalidMergeError):
+				frappe.rename_doc(TEST_DOCTYPE, "Parent 1", child.name, merge=True)
+			self.assertEqual(
+				frappe.db.get_value(TEST_DOCTYPE, child.name, "parent_test_tree_doctype"), "Parent 1"
+			)
+
+	def test_merge_into_missing_target(self):
+		with self.set_user("tree-manager@example.com"):
+			with self.assertRaisesRegex(frappe.ValidationError, "select a new target to merge"):
+				frappe.rename_doc(TEST_DOCTYPE, "Parent 1", "Missing Group", merge=True)
+
 	def test_rebuild_tree(self):
 		rebuild_tree(TEST_DOCTYPE)
+		self.test_basic_tree()
+
+	def test_insert_under_leaf(self):
+		with self.set_user("tree-manager@example.com"):
+			child = frappe.get_doc(
+				doctype=TEST_DOCTYPE, some_fieldname="Invalid Child", parent_test_tree_doctype="Child 1"
+			)
+			with self.assertRaises(frappe.ValidationError):
+				child.insert()
+			self.assertFalse(frappe.db.exists(TEST_DOCTYPE, "Invalid Child"))
+
+	def test_move_under_leaf(self):
+		with self.set_user("tree-manager@example.com"):
+			child = frappe.get_doc(TEST_DOCTYPE, "Child 2")
+			child.parent_test_tree_doctype = "Child 1"
+			with self.assertRaises(frappe.ValidationError):
+				child.save()
+
+	def test_save_existing_node_under_leaf(self):
+		frappe.db.set_value(TEST_DOCTYPE, "Parent 2", "is_group", 0)
+		self.addCleanup(frappe.db.set_value, TEST_DOCTYPE, "Parent 2", "is_group", 1)
+
+		with self.set_user("tree-manager@example.com"):
+			frappe.get_doc(TEST_DOCTYPE, "Child 3").save()
+
+	def test_bulk_update_cannot_move_under_leaf(self):
+		with self.set_user("tree-manager@example.com"):
+			result = bulk_update(
+				[{"doctype": TEST_DOCTYPE, "docname": "Child 2", "parent_test_tree_doctype": "Child 1"}]
+			)
+			self.assertEqual(len(result["failed_docs"]), 1)
+			self.assertEqual(
+				frappe.db.get_value(TEST_DOCTYPE, "Child 2", "parent_test_tree_doctype"), "Parent 1"
+			)
 		self.test_basic_tree()
 
 	def test_move_group_into_another(self):
@@ -184,6 +253,35 @@ class TestNestedSet(IntegrationTestCase):
 		# assert that child 2 is under parent 1
 		parent_lft_new, parent_rgt_new = frappe.db.get_value(TEST_DOCTYPE, "Parent 2", ["lft", "rgt"])
 		self.assertFalse((parent_lft_new > child_2.lft) and (parent_rgt_new > child_2.rgt))
+
+	def test_save_ignores_client_tree_fields(self):
+		# form opened before another node shifted it
+		stale = frappe.get_doc(TEST_DOCTYPE, "Parent 2").as_dict()
+		frappe.get_doc(
+			{"doctype": TEST_DOCTYPE, "some_fieldname": "Child 4", "parent_test_tree_doctype": "Parent 1"}
+		).insert()
+		frappe.get_doc(stale).save()
+		self.assertEqual(get_descendants_of(TEST_DOCTYPE, "Parent 2", ignore_permissions=True), ["Child 3"])
+
+		child_3 = frappe.get_doc(TEST_DOCTYPE, "Child 3")
+		child_3.update({"parent_test_tree_doctype": "Parent 1", "old_parent": "Parent 1"})
+		child_3.save()
+		self.assertEqual(get_descendants_of(TEST_DOCTYPE, "Parent 2", ignore_permissions=True), [])
+
+	def test_insert_ignores_client_tree_fields(self):
+		lft, rgt = frappe.db.get_value(TEST_DOCTYPE, "Parent 1", ["lft", "rgt"])
+		frappe.get_doc(
+			{
+				"doctype": TEST_DOCTYPE,
+				"some_fieldname": "Child 4",
+				"parent_test_tree_doctype": "Parent 2",
+				"lft": lft,
+				"rgt": rgt,
+			}
+		).insert()
+		self.assertCountEqual(
+			get_descendants_of(TEST_DOCTYPE, "Parent 2", ignore_permissions=True), ["Child 3", "Child 4"]
+		)
 
 	def test_delete_leaf(self):
 		global records
@@ -296,6 +394,14 @@ class TestNestedSet(IntegrationTestCase):
 
 		self.assertNotIn(record, str(frappe.qb.get_query(table=linked_doctype, filters=exclusive_link)))
 		self.assertIn(record, str(frappe.qb.get_query(table=linked_doctype, filters=inclusive_link)))
+
+	def test_evaluate_desc_filters(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		doc = {"doctype": TEST_DOCTYPE, "parent_test_tree_doctype": "Parent 1"}
+
+		self.assertTrue(evaluate_filters(doc, {"parent_test_tree_doctype": ("descendants of", "Root Node")}))
+		self.assertFalse(evaluate_filters(doc, {"parent_test_tree_doctype": ("descendants of", "Parent 2")}))
 
 	def test_disabled_records_in_treeview(self):
 		"""

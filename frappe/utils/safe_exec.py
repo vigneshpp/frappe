@@ -6,7 +6,7 @@ import json
 import mimetypes
 import types
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache, lru_cache
 from itertools import chain
 from types import FunctionType, MethodType, ModuleType
 from typing import TYPE_CHECKING, Any
@@ -48,6 +48,8 @@ ARGUMENT_NOT_SET = object()
 SAFE_EXEC_CONFIG_KEY = "server_script_enabled"
 SERVER_SCRIPT_FILE_PREFIX = "<serverscript>"
 
+RENDER_EXEC_CONFIG_KEY = "disable_render_safe_exec"
+
 
 class NamespaceDict(frappe._dict):
 	"""Raise AttributeError if function not found in namespace"""
@@ -61,6 +63,19 @@ class NamespaceDict(frappe._dict):
 
 			return default_function
 		return ret
+
+
+class UnavailableEnv:
+	"""`frappe.env` outside a Server Script. Raises on attribute access."""
+
+	def __getattr__(self, key: str):
+		if key.startswith("_"):
+			raise AttributeError(key)
+
+		frappe.throw(
+			_("Environment variables are only available in Server Scripts"),
+			title=_("Environment Variables Unavailable"),
+		)
 
 
 class FrappeTransformer(RestrictingNodeTransformer):
@@ -86,6 +101,10 @@ def is_safe_exec_enabled() -> bool:
 	return bool(frappe.get_common_site_config(cached=True).get(SAFE_EXEC_CONFIG_KEY))
 
 
+def is_render_exec_enabled() -> bool:
+	return not bool(frappe.get_common_site_config(cached=True).get(RENDER_EXEC_CONFIG_KEY, 0))
+
+
 def safe_exec(
 	script: str,
 	_globals: dict | None = None,
@@ -93,6 +112,7 @@ def safe_exec(
 	*,
 	restrict_commit_rollback: bool = False,
 	script_filename: str | None = None,
+	env: object | None = None,
 ):
 	if not is_safe_exec_enabled():
 		msg = _("Server Scripts are disabled. Please enable server scripts from bench configuration.")
@@ -111,11 +131,13 @@ def safe_exec(
 		exec_globals.frappe.db.pop("rollback", None)
 		exec_globals.frappe.db.pop("add_index", None)
 
+	exec_globals.frappe.env = UnavailableEnv() if env is None else env
+
 	filename = SERVER_SCRIPT_FILE_PREFIX
 	if script_filename:
 		filename += f": {frappe.scrub(script_filename)}"
 
-	with safe_exec_flags(), patched_qb():
+	with safe_exec_flags():
 		# execute script compiled by RestrictedPython
 		exec(_compile_code(script, filename=filename), exec_globals, _locals)
 
@@ -140,11 +162,13 @@ def safe_eval(code, eval_globals=None, eval_locals=None):
 	eval_globals["__builtins__"] = {}
 	eval_globals.update(WHITELISTED_SAFE_EVAL_GLOBALS)
 
+	assert eval_globals["__builtins__"] == {}, "safe_eval must run with empty __builtins__"
+
 	return eval(_compile_code(code, filename="<safe_eval>", mode="eval"), eval_globals, eval_locals)
 
 
 def _validate_safe_eval_syntax(code):
-	BLOCKED_NODES = (ast.NamedExpr,)
+	BLOCKED_NODES = (ast.NamedExpr, ast.Lambda)
 
 	tree = ast.parse(code, mode="eval")
 	for node in ast.walk(tree):
@@ -164,9 +188,339 @@ def safe_exec_flags():
 	finally:
 		# Always ensure that the flag is decremented
 		frappe.flags.in_safe_exec -= 1
+		assert frappe.flags.in_safe_exec >= 0, "in_safe_exec flag must never go negative"
 
 
-def get_safe_globals():
+class SafeDoc(frappe._dict):
+	"""An extension of frappe._dict that exposes safer subset of methods."""
+
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		for key, val in self.items():
+			if isinstance(val, list):
+				children = []
+				for v in val:
+					if isinstance(v, dict):
+						child = SafeDoc(v)
+						object.__setattr__(child, "parent_doc", self)
+						children.append(child)
+					else:
+						children.append(v)
+				self[key] = children
+
+	@property
+	def meta(self):
+		doctype = self.get("doctype")
+		if not isinstance(doctype, str):
+			return None
+		meta = frappe.get_meta(doctype)
+		return meta.as_dict() if meta else None
+
+	def get_formatted(
+		self,
+		fieldname,
+		doc=None,
+		currency=None,
+		absolute_value=False,
+		translated=False,
+		format=None,
+	):
+		from frappe.utils.formatters import format_value
+
+		meta = frappe.get_meta(self.get("doctype")) if self.get("doctype") else None
+		df = meta.get_field(fieldname) if meta else None
+
+		if not df:
+			from frappe.model.meta import get_default_df
+
+			df = get_default_df(fieldname)
+
+		if (
+			df
+			and df.fieldtype == "Currency"
+			and not currency
+			and (currency_field := df.get("options"))
+			and (currency_value := self.get(currency_field))
+		):
+			currency = frappe.db.get_value("Currency", currency_value, cache=True)
+
+		val = self.get(fieldname)
+
+		if translated:
+			val = _(val)
+
+		if not doc:
+			doc = getattr(self, "parent_doc", None) or self
+
+		if (absolute_value or doc.get("absolute_value")) and isinstance(val, int | float):
+			val = abs(val)
+
+		return format_value(val, df=df, doc=doc, currency=currency, format=format)
+
+	def get_label_from_fieldname(self, fieldname):
+		meta = frappe.get_meta(self.get("doctype")) if self.get("doctype") else None
+		df = meta.get_field(fieldname) if meta else None
+		return _(df.label) if df and df.label else None
+
+	def in_format_data(self, fieldname):
+		doc = getattr(self, "parent_doc", None) or self
+		format_data_map = doc.get("format_data_map")
+		if format_data_map:
+			return fieldname in format_data_map
+		return True
+
+	def is_print_hide(self, fieldname, df=None, for_print=True):
+		meta = frappe.get_meta(self.get("doctype")) if self.get("doctype") else None
+		meta_df = meta.get_field(fieldname) if meta else None
+
+		if meta_df and meta_df.get("__print_hide"):
+			return True
+
+		print_hide = 0
+
+		if self.get(fieldname) == 0 and not (meta and meta.istable):
+			print_hide = (df and df.print_hide_if_no_value) or (meta_df and meta_df.print_hide_if_no_value)
+
+		if not print_hide:
+			if df and df.print_hide is not None:
+				print_hide = df.print_hide
+			elif meta_df:
+				print_hide = meta_df.print_hide
+
+		return print_hide
+
+
+def get_doc_as_dict(*args, **kwargs):
+	return SafeDoc(frappe.get_doc(*args, **kwargs).as_dict())
+
+
+def safer_get_last_doc(*args, **kwargs):
+	return SafeDoc(frappe.get_last_doc(*args, **kwargs).as_dict())
+
+
+def safer_get_cached_doc(*args, **kwargs):
+	return SafeDoc(frappe.get_cached_doc(*args, **kwargs).as_dict())
+
+
+def remove_unsafe_fields(fields):
+	return [f for f in fields if "(" not in f]
+
+
+def safe_get_list(*args, **kwargs):
+	if args and len(args) > 1 and isinstance(args[1], list):
+		args = list(args)
+		args[1] = remove_unsafe_fields(args[1])
+
+	kwargs["run"] = True
+	fields = kwargs.get("fields", [])
+	if fields:
+		kwargs["fields"] = remove_unsafe_fields(fields)
+
+	return frappe.db.get_list(
+		*args,
+		**kwargs,
+	)
+
+
+def safe_get_all(*args, **kwargs):
+	kwargs["ignore_permissions"] = True
+	if "limit_page_length" not in kwargs:
+		kwargs["limit_page_length"] = 0
+
+	return safe_get_list(*args, **kwargs)
+
+
+def safer_get_meta(doctype, cached=True):
+	assert isinstance(doctype, str)
+	assert isinstance(cached, bool)
+
+	doc = frappe.get_meta(doctype, cached=cached)
+	return doc.as_dict() if doc else None
+
+
+def safer_log_error(
+	title=None, message=None, reference_doctype=None, reference_name=None, *, defer_insert=False
+):
+	assert isinstance(title, (str, type(None)))
+	assert isinstance(message, (str, type(None)))
+	assert isinstance(reference_doctype, (str, type(None)))
+	assert isinstance(reference_name, (str, int, type(None)))
+	assert isinstance(defer_insert, bool)
+
+	frappe.log_error(
+		title=title,
+		message=message,
+		reference_doctype=reference_doctype,
+		reference_name=reference_name,
+		defer_insert=defer_insert,
+	)
+	return {}
+
+
+def safer_get_visible_columns(data, _table_meta, df):
+	if not df.get("options"):
+		return []
+	real_meta = frappe.get_meta(df.get("options"))
+	cols = get_visible_columns(data, real_meta, df)
+	if cols is None:
+		return None
+	return [c if isinstance(c, dict) else c.as_dict() for c in cols]
+
+
+def safe_get_value(*args, **kwargs):
+	kwargs["run"] = True
+	return frappe.db.get_value(*args, **kwargs)
+
+
+def safe_get_single_value(*args, **kwargs):
+	kwargs["run"] = True
+	return frappe.db.get_single_value(*args, **kwargs)
+
+
+def safe_render_template(*args, **kwargs):
+	kwargs.pop("restrict_globals", None)
+	return frappe.render_template(*args, restrict_globals=True, **kwargs)
+
+
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+# (connect, read) — read is the gap between bytes, not the total duration, so a slow
+# but steady download is not cut off.
+SAFE_REQUEST_TIMEOUT = (10, 300)
+
+
+class BlockedRequest(frappe.ValidationError):
+	pass
+
+
+def validate_request_address(ip: str):
+	import ipaddress
+
+	try:
+		addr = ipaddress.ip_address(ip)
+	except ValueError:
+		raise BlockedRequest(f"Could not parse address: {ip}")
+
+	if not addr.is_global:
+		raise BlockedRequest("Requests to internal network addresses are not permitted")
+
+
+def validate_request_url(url: str):
+	"""Reject anything that isn't a plain http(s) request to a globally routable host."""
+	import socket
+	from urllib.parse import urlparse
+
+	parsed = urlparse(url)
+
+	if parsed.scheme not in ALLOWED_SCHEMES:
+		raise BlockedRequest(f"URL scheme '{parsed.scheme}' is not permitted")
+
+	hostname = parsed.hostname
+	if not hostname:
+		raise BlockedRequest("Invalid URL: no hostname")
+
+	try:
+		port = parsed.port or (443 if parsed.scheme == "https" else 80)
+	except ValueError:
+		raise BlockedRequest("Invalid URL: bad port")
+
+	try:
+		addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+	except socket.gaierror:
+		raise BlockedRequest(f"Could not resolve host: {hostname}")
+
+	if not addr_info:
+		raise BlockedRequest(f"Could not resolve host: {hostname}")
+
+	for record in addr_info:
+		validate_request_address(record[4][0])
+
+
+@cache
+def _get_ssrf_guarded_adapter_class():
+	"""Validate at two layers, because checking the URL string once covers neither
+	redirects (the guard never sees hop 1..n) nor DNS rebinding (the name is resolved
+	again, independently, when the socket is opened)."""
+	from requests.adapters import HTTPAdapter
+	from urllib3.connection import HTTPConnection, HTTPSConnection
+	from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+
+	def guarded_connection(base):
+		class GuardedConnection(base):
+			# TODO: pin the already-resolved IP here, keeping server_hostname for TLS.
+			def _new_conn(self):
+				sock = super()._new_conn()
+				try:
+					validate_request_address(sock.getpeername()[0])
+				except Exception:
+					sock.close()
+					raise
+				return sock
+
+		return GuardedConnection
+
+	class GuardedHTTPConnectionPool(HTTPConnectionPool):
+		ConnectionCls = guarded_connection(HTTPConnection)
+
+	class GuardedHTTPSConnectionPool(HTTPSConnectionPool):
+		ConnectionCls = guarded_connection(HTTPSConnection)
+
+	class SSRFGuardedAdapter(HTTPAdapter):
+		def init_poolmanager(self, *args, **kwargs):
+			super().init_poolmanager(*args, **kwargs)
+			self.poolmanager.pool_classes_by_scheme = {
+				"http": GuardedHTTPConnectionPool,
+				"https": GuardedHTTPSConnectionPool,
+			}
+
+		def send(self, request, **kwargs):
+			# Called once per hop, so redirect targets are validated too.
+			if kwargs.get("proxies"):
+				raise BlockedRequest("Proxied requests are not permitted")
+			validate_request_url(request.url)
+			return super().send(request, **kwargs)
+
+	return SSRFGuardedAdapter
+
+
+def get_safe_request_session():
+	from requests.adapters import Retry
+
+	adapter = _get_ssrf_guarded_adapter_class()(max_retries=Retry(total=5, status_forcelist=[500]))
+	session = frappe.utils.get_request_session(adapter=adapter)
+	# Env-configured proxies would send the request somewhere the guard can't see.
+	session.trust_env = False
+	return session
+
+
+def make_safe_request(method: str, url: str, **kwargs):
+	validate_request_url(url)
+	if kwargs.get("timeout") is None:
+		kwargs["timeout"] = SAFE_REQUEST_TIMEOUT
+	return frappe.integrations.utils.make_request(method, url, session=get_safe_request_session(), **kwargs)
+
+
+def make_safe_get_request(url: str, **kwargs):
+	return make_safe_request("GET", url, **kwargs)
+
+
+def make_safe_post_request(url: str, **kwargs):
+	return make_safe_request("POST", url, **kwargs)
+
+
+def make_safe_put_request(url: str, **kwargs):
+	return make_safe_request("PUT", url, **kwargs)
+
+
+def make_safe_patch_request(url: str, **kwargs):
+	return make_safe_request("PATCH", url, **kwargs)
+
+
+def make_safe_delete_request(url: str, **kwargs):
+	return make_safe_request("DELETE", url, **kwargs)
+
+
+def render_safe_globals():
+	"""Safer subset of globals for rendering ops."""
 	datautils = frappe._dict()
 
 	if frappe.db:
@@ -197,7 +551,6 @@ def get_safe_globals():
 		_dict=frappe._dict,
 		args=form_dict,
 		frappe=NamespaceDict(
-			call=call_whitelisted_function,
 			flags=frappe._dict(),
 			format=frappe.format_value,
 			format_value=frappe.format_value,
@@ -207,70 +560,52 @@ def get_safe_globals():
 			format_date=frappe.utils.data.global_date_format,
 			form_dict=form_dict,
 			bold=frappe.bold,
-			copy_doc=frappe.copy_doc,
 			errprint=frappe.errprint,
 			qb=frappe.qb,
-			get_meta=frappe.get_meta,
-			new_doc=frappe.new_doc,
-			get_doc=frappe.get_doc,
-			get_mapped_doc=get_mapped_doc,
-			get_last_doc=frappe.get_last_doc,
-			get_cached_doc=frappe.get_cached_doc,
-			get_list=frappe.get_list,
-			get_all=frappe.get_all,
+			get_meta=safer_get_meta,
+			get_doc=get_doc_as_dict,
+			get_last_doc=safer_get_last_doc,
+			get_cached_doc=safer_get_cached_doc,
+			get_list=safe_get_list,
+			get_all=safe_get_all,
+			get_hooks=get_hooks,
 			get_system_settings=frappe.get_system_settings,
-			rename_doc=rename_doc,
-			delete_doc=delete_doc,
 			utils=datautils,
 			get_url=frappe.utils.get_url,
-			render_template=frappe.render_template,
+			render_template=safe_render_template,
 			msgprint=frappe.msgprint,
 			throw=frappe.throw,
-			sendmail=frappe.sendmail,
-			get_print=frappe.get_print,
-			attach_print=frappe.attach_print,
 			user=user,
 			get_fullname=frappe.utils.get_fullname,
 			get_gravatar=frappe.utils.get_gravatar_url,
+			get_identicon=frappe.utils.get_identicon,
 			full_name=frappe.local.session.data.full_name
 			if getattr(frappe.local, "session", None) and getattr(frappe.local.session, "data", None)
 			else "Guest",
-			request=getattr(frappe.local, "request", {}),
 			session=frappe._dict(
 				user=user,
 				csrf_token=frappe.local.session.data.csrf_token
 				if getattr(frappe.local, "session", None) and getattr(frappe.local.session, "data", None)
 				else "",
 			),
-			make_get_request=frappe.integrations.utils.make_get_request,
-			make_post_request=frappe.integrations.utils.make_post_request,
-			make_put_request=frappe.integrations.utils.make_put_request,
-			make_patch_request=frappe.integrations.utils.make_patch_request,
-			make_delete_request=frappe.integrations.utils.make_delete_request,
+			request=frappe._dict(
+				path=frappe.local.request.path if getattr(frappe.local, "request", None) else "",
+			),
+			make_get_request=make_safe_get_request,
 			socketio_port=frappe.conf.socketio_port,
-			get_hooks=get_hooks,
-			enqueue=safe_enqueue,
 			sanitize_html=frappe.utils.sanitize_html,
-			log_error=frappe.log_error,
+			log_error=safer_log_error,
 			log=frappe.log,
 			db=NamespaceDict(
-				get_list=frappe.get_list,
-				get_all=frappe.get_all,
-				get_value=frappe.db.get_value,
-				set_value=frappe.db.set_value,
-				get_single_value=frappe.db.get_single_value,
+				get_list=safe_get_list,
+				get_all=safe_get_all,
+				get_value=safe_get_value,
+				get_single_value=safe_get_single_value,
 				get_default=frappe.db.get_default,
 				exists=frappe.db.exists,
 				count=frappe.db.count,
 				escape=frappe.db.escape,
 				sql=read_sql,
-				commit=frappe.db.commit,
-				rollback=frappe.db.rollback,
-				after_commit=frappe.db.after_commit,
-				before_commit=frappe.db.before_commit,
-				after_rollback=frappe.db.after_rollback,
-				before_rollback=frappe.db.before_rollback,
-				add_index=frappe.db.add_index,
 			),
 			website=NamespaceDict(
 				abs_url=frappe.website.utils.abs_url,
@@ -282,7 +617,6 @@ def get_safe_globals():
 			lang=getattr(frappe.local, "lang", "en"),
 			json_handler=json_handler,
 		),
-		FrappeClient=FrappeClient,
 		style=frappe._dict(border_color="#d1d8dd"),
 		get_toc=get_toc,
 		get_next_link=get_next_link,
@@ -291,9 +625,7 @@ def get_safe_globals():
 		guess_mimetype=mimetypes.guess_type,
 		html2text=html2text,
 		dev_server=frappe._dev_server,
-		run_script=run_script,
-		is_job_queued=is_job_queued,
-		get_visible_columns=get_visible_columns,
+		get_visible_columns=safer_get_visible_columns,
 	)
 
 	out.frappe.update(SAFE_EXCEPTIONS)
@@ -316,10 +648,82 @@ def get_safe_globals():
 	out._iter_unpack_sequence_ = RestrictedPython.Guards.guarded_iter_unpack_sequence
 	out._inplacevar_ = protected_inplacevar
 
-	# add common python builtins
+	# add common python builtins, also remove standard builtins
 	out.update(get_python_builtins())
 
 	return out
+
+
+def _update_namespace(namespace: NamespaceDict, updates: NamespaceDict):
+	assert isinstance(namespace, NamespaceDict) and isinstance(updates, NamespaceDict), (
+		"Both values should be namespaces"
+	)
+	for key, value in updates.items():
+		if isinstance(value, NamespaceDict):
+			if key not in namespace:
+				namespace[key] = NamespaceDict()
+			_update_namespace(namespace[key], value)
+			continue
+
+		assert not isinstance(value, dict), f"{key=} Only NamespaceDict should be used everywhere"
+
+		original_value = namespace.get(key)
+		assert original_value is not value, f"Update contains same value for {key=}"
+		namespace[key] = value
+	return namespace
+
+
+def exec_safe_globals():
+	"""Safer subset of globals for exec. ops."""
+
+	render_safe = render_safe_globals()
+	exec_safe = NamespaceDict(
+		run_script=run_script,
+		FrappeClient=FrappeClient,
+		get_visible_columns=get_visible_columns,
+		frappe=NamespaceDict(
+			call=call_whitelisted_function,
+			get_meta=frappe.get_meta,
+			copy_doc=frappe.copy_doc,
+			new_doc=frappe.new_doc,
+			get_doc=frappe.get_doc,
+			get_mapped_doc=get_mapped_doc,
+			rename_doc=rename_doc,
+			delete_doc=delete_doc,
+			sendmail=frappe.sendmail,
+			get_print=frappe.get_print,
+			attach_print=frappe.attach_print,
+			# make_get_request is inherited from render_safe_globals; re-listing the same
+			# object here would trip _update_namespace's identity assert.
+			make_post_request=make_safe_post_request,
+			make_put_request=make_safe_put_request,
+			make_patch_request=make_safe_patch_request,
+			make_delete_request=make_safe_delete_request,
+			log_error=frappe.log_error,
+			get_list=frappe.get_list,
+			get_all=frappe.get_all,
+			get_cached_doc=frappe.get_cached_doc,
+			get_last_doc=frappe.get_last_doc,
+			render_template=frappe.render_template,
+			enqueue=safe_enqueue,
+			is_job_queued=is_job_queued,
+			db=NamespaceDict(
+				get_list=frappe.get_list,
+				get_all=frappe.get_all,
+				get_value=frappe.db.get_value,
+				set_value=frappe.db.set_value,
+				get_single_value=frappe.db.get_single_value,
+				add_index=frappe.db.add_index,
+				commit=frappe.db.commit,
+				rollback=frappe.db.rollback,
+				after_commit=frappe.db.after_commit,
+				before_commit=frappe.db.before_commit,
+				after_rollback=frappe.db.after_rollback,
+				before_rollback=frappe.db.before_rollback,
+			),
+		),
+	)
+	return _update_namespace(render_safe, exec_safe)
 
 
 def get_keys_for_autocomplete(
@@ -415,19 +819,6 @@ def call_with_form_dict(function, kwargs):
 		frappe.local.form_dict = form_dict
 
 
-@contextmanager
-def patched_qb():
-	require_patching = isinstance(frappe.qb.terms, types.ModuleType)
-	try:
-		if require_patching:
-			_terms = frappe.qb.terms
-			frappe.qb.terms = _flatten(frappe.qb.terms)
-		yield
-	finally:
-		if require_patching:
-			frappe.qb.terms = _terms
-
-
 @lru_cache
 def _flatten(module):
 	new_mod = NamespaceDict()
@@ -482,31 +873,30 @@ def check_safe_sql_query(query: str, throw: bool = True) -> bool:
 	"""Check if SQL query is safe for running in restricted context.
 
 	Safe queries:
-	        1. Read only 'select' or 'explain' queries
+	        1. Read only 'select' or 'explain' (without analyze) queries
+	        2. That do not read __Auth (password hashes and encrypted secrets)
 	"""
 
 	query = query.strip().lower()
 	whitelisted_statements = ("select", "explain")
 
-	if re.search(r"\binto\s+(outfile|dumpfile)\b", query):
-		if throw:
-			frappe.throw(
-				_("Read-Only queries are allowed"),
-				title=_("Unsafe SQL query"),
-				exc=frappe.PermissionError,
-			)
-		return False
+	# match the keyword alone: comments and executable comments can separate it from INTO
+	if re.search(r"outfile|dumpfile", query) or not query.startswith(whitelisted_statements):
+		return _reject_sql_query(_("Read-Only queries are allowed"), throw)
 
-	if query.startswith(whitelisted_statements):
-		return True
+	# postgres runs the statement that EXPLAIN ANALYZE explains
+	if query.startswith("explain") and re.search(r"analy[sz]e", query):
+		return _reject_sql_query(_("Read-Only queries are allowed"), throw)
 
+	if "__auth" in query:
+		return _reject_sql_query(_("Reading passwords is not allowed"), throw)
+
+	return True
+
+
+def _reject_sql_query(message: str, throw: bool) -> bool:
 	if throw:
-		frappe.throw(
-			_("Read-Only queries are allowed"),
-			title=_("Unsafe SQL query"),
-			exc=frappe.PermissionError,
-		)
-
+		frappe.throw(message, title=_("Unsafe SQL query"), exc=frappe.PermissionError)
 	return False
 
 
@@ -679,6 +1069,7 @@ VALID_UTILS = (
 	"is_html",
 	"is_image",
 	"get_thumbnail_base64_for_image",
+	"get_image_thumbnail_uri",
 	"image_to_base64",
 	"pdf_to_base64",
 	"strip_html",
@@ -731,6 +1122,9 @@ VALID_UTILS = (
 
 
 SAFE_DATA_UTILS = {key: frappe.utils.data.__dict__[key] for key in VALID_UTILS}
+assert SAFE_DATA_UTILS.keys() == set(VALID_UTILS), (
+	"every whitelisted util name must resolve to a frappe.utils.data attribute"
+)
 
 
 WHITELISTED_SAFE_EVAL_GLOBALS = {
@@ -754,3 +1148,6 @@ for key, val in vars(orjson).items():
 SAFE_EXCEPTIONS = get_module_properties(
 	frappe.exceptions, lambda obj: inspect.isclass(obj) and issubclass(obj, Exception)
 )
+
+
+get_safe_globals = exec_safe_globals

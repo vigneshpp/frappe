@@ -6,6 +6,7 @@ from pathlib import Path
 import frappe
 from frappe.modules.utils import get_module_name
 from frappe.testing.config import TestParameters
+from frappe.tests.utils.test_capabilities import apply_test_service_skips, requires_selected_test_service
 
 
 class FrappeTestLoader(unittest.TestLoader):
@@ -18,6 +19,9 @@ class FrappeTestLoader(unittest.TestLoader):
 					if isinstance(elem, unittest.TestSuite):
 						suites_queue.append(elem)
 					elif isinstance(elem, unittest.TestCase):
+						if not requires_selected_test_service(elem, self.params.test_service):
+							continue
+						apply_test_service_skips(elem)
 						if self.params.tests:
 							if elem._testMethodName in self.params.tests:
 								self.testsuite.addTest(elem)
@@ -66,15 +70,15 @@ class FrappeTestLoader(unittest.TestLoader):
 			pymodule = importlib.import_module(pymodule_name)
 			self.load_testsuites_in_pymodule([pymodule])
 
+		elif self.params.module:
+			# handle --module (more specific than --app, so it takes precedence); supports --test as well
+			pymodule = importlib.import_module(self.params.module)
+			self.load_testsuites_in_pymodule([pymodule])
+
 		elif self.params.app:
 			# handle --app
 			files = self.get_files([self.params.app])
 			file_pymodules = self.load_pymodule_for_files(files)
 			self.load_testsuites_in_pymodule(file_pymodules)
-
-		elif self.params.module:
-			# handle --module; supports --test as well
-			pymodule = importlib.import_module(self.params.module)
-			self.load_testsuites_in_pymodule([pymodule])
 
 		return self.testsuite

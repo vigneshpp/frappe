@@ -51,7 +51,9 @@ frappe.ui.form.on("Event", {
 		) {
 			frm.dashboard.set_headline(
 				__("Join video conference with {0}", [
-					`<a target='_blank' href='${frm.doc.google_meet_link}'>Google Meet</a>`,
+					`<a target='_blank' href='${frappe.utils.escape_html(
+						frm.doc.google_meet_link
+					)}'>Google Meet</a>`,
 				])
 			);
 		}
@@ -63,31 +65,6 @@ frappe.ui.form.on("Event", {
 					frm.set_value(v, 1);
 				}
 			);
-		}
-	},
-});
-
-frappe.ui.form.on("Event Participants", {
-	event_participants_remove: function (frm, cdt, cdn) {
-		if (cdt && !cdn.includes("new-event-participants")) {
-			frappe.call({
-				type: "POST",
-				method: "frappe.desk.doctype.event.event.delete_communication",
-				args: {
-					event: frm.doc,
-					reference_doctype: cdt,
-					reference_docname: cdn,
-				},
-				freeze: true,
-				callback: function (r) {
-					if (r.exc) {
-						frappe.show_alert({
-							message: __("{0}", [r.exc]),
-							indicator: "orange",
-						});
-					}
-				},
-			});
 		}
 	},
 });

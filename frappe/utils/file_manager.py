@@ -3,7 +3,6 @@
 
 import base64
 import hashlib
-import json
 import mimetypes
 import os
 from copy import copy
@@ -153,17 +152,26 @@ def save_file(fname, content, dt, dn, folder=None, decode=False, is_private=0, d
 			content = content.split(b",")[1]
 		content = safe_b64decode(content)
 
-	file_size = check_max_file_size(content)
-	content_hash = get_content_hash(content)
-	content_type = mimetypes.guess_type(fname)[0]
-	fname = get_file_name(fname, content_hash[-6:])
-	file_data = get_file_data_from_hash(content_hash, is_private=is_private)
-	if not file_data:
-		call_hook_method("before_write_file", file_size=file_size)
+	import frappe.storage
 
-		write_file_method = get_hook_method("write_file", fallback=save_file_on_filesystem)
-		file_data = write_file_method(fname, content, content_type=content_type, is_private=is_private)
-		file_data = copy(file_data)
+	if frappe.storage.enabled():
+		# Storage v2: File.save_file -> put_blob. The legacy write_file /
+		# delete_file_data_content hooks are ignored for v2 rows.
+		warn_deprecated_storage_hooks()
+		file_data = {"file_name": fname, "content": content, "is_private": cint(is_private)}
+	else:
+		file_size = check_max_file_size(content)
+		content_hash = get_content_hash(content)
+		content_type = mimetypes.guess_type(fname)[0]
+		fname = get_file_name(fname, content_hash[-6:])
+		file_data = get_file_data_from_hash(content_hash, is_private=is_private)
+		if not file_data:
+			call_hook_method("before_write_file", file_size=file_size)
+
+			write_file_method = get_hook_method("write_file", fallback=save_file_on_filesystem)
+			file_data = write_file_method(fname, content, content_type=content_type, is_private=is_private)
+			file_data = copy(file_data)
+		file_data.update({"file_size": file_size, "content_hash": content_hash, "is_private": is_private})
 
 	file_data.update(
 		{
@@ -172,9 +180,6 @@ def save_file(fname, content, dt, dn, folder=None, decode=False, is_private=0, d
 			"attached_to_name": dn,
 			"attached_to_field": df,
 			"folder": folder,
-			"file_size": file_size,
-			"content_hash": content_hash,
-			"is_private": is_private,
 		}
 	)
 
@@ -186,6 +191,19 @@ def save_file(fname, content, dt, dn, folder=None, decode=False, is_private=0, d
 		return frappe.get_doc("File", f.duplicate_entry)
 
 	return f
+
+
+def warn_deprecated_storage_hooks():
+	"""Deprecation-warn apps that still hook the legacy byte write/delete path."""
+	from frappe.deprecation_dumpster import deprecation_warning
+
+	for hook in ("write_file", "delete_file_data_content"):
+		if get_hook_method(hook):
+			deprecation_warning(
+				"2026-09-02",
+				"v19",
+				f"The {hook} hook is ignored for Storage v2 rows; implement a storage driver instead.",
+			)
 
 
 def get_file_data_from_hash(content_hash, is_private=0):
@@ -231,6 +249,11 @@ def write_file(content, fname, is_private=0):
 
 	# create directory (if not exists)
 	frappe.create_folder(file_path)
+
+	# the target must resolve to a direct child of the files directory
+	if os.path.realpath(os.path.dirname(os.path.join(file_path, fname))) != os.path.realpath(file_path):
+		frappe.throw(_("Invalid file name"), title=_("Invalid Upload"))
+
 	# write the file
 	if isinstance(content, str):
 		content = content.encode()
@@ -363,13 +386,21 @@ def get_file_path(file_name):
 		file_path = "/files/" + file_path
 
 	if file_path.startswith("/private/files/"):
-		file_path = get_files_path(*file_path.split("/private/files/", 1)[1].split("/"), is_private=1)
+		is_private = 1
+		file_path = get_files_path(
+			*file_path.split("/private/files/", 1)[1].split("/"), is_private=is_private
+		)
 
 	elif file_path.startswith("/files/"):
+		is_private = 0
 		file_path = get_files_path(*file_path.split("/files/", 1)[1].split("/"))
 
 	else:
 		frappe.throw(_("There is some problem with the file url: {0}").format(file_path))
+
+	base_path = os.path.realpath(get_files_path(is_private=is_private))
+	if os.path.commonpath((base_path, os.path.realpath(file_path))) != base_path:
+		frappe.throw(_("Cannot access file path {0}").format(file_path))
 
 	return file_path
 
@@ -377,7 +408,8 @@ def get_file_path(file_name):
 def get_content_hash(content):
 	if isinstance(content, str):
 		content = content.encode()
-	return hashlib.md5(content, usedforsecurity=False).hexdigest()
+	digest = hashlib.md5(content, usedforsecurity=False).hexdigest()
+	return digest
 
 
 def get_file_name(fname, optional_suffix):
@@ -398,12 +430,17 @@ def get_file_name(fname, optional_suffix):
 @frappe.whitelist()
 def add_attachments(doctype: str, name: str | int, attachments: str | list[str]):
 	"""Add attachments to the given DocType"""
-	if isinstance(attachments, str):
-		attachments = json.loads(attachments)
+	if not frappe.has_permission(doctype, "write", doc=name):
+		frappe.throw(_("You need write permissions to add attachments to this record."))
+
+	attachments = frappe.parse_json(attachments)
 	# loop through attachments
 	files = []
 	for a in attachments:
 		if isinstance(a, str):
+			if not frappe.has_permission("File", ptype="read", doc=a):
+				frappe.throw(_("You don't have permission to read/attach the file {0}.").format(a))
+
 			attach = frappe.db.get_value(
 				"File", {"name": a}, ["file_name", "file_url", "is_private"], as_dict=1
 			)

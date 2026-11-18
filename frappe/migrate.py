@@ -16,15 +16,16 @@ import frappe
 import frappe.model.sync
 import frappe.modules.patch_handler
 import frappe.translate
+from frappe.app_state import clear_cache_after_maintenance
 from frappe.core.doctype.language.language import sync_languages
 from frappe.core.doctype.navbar_settings.navbar_settings import sync_standard_items
 from frappe.core.doctype.scheduled_job_type.scheduled_job_type import sync_jobs
 from frappe.database.schema import add_column
 from frappe.deferred_insert import save_to_db as flush_deferred_inserts
 from frappe.desk.notifications import clear_notifications
+from frappe.installer import reapply_disabled_app_state
 from frappe.modules.patch_handler import PatchType
 from frappe.modules.utils import sync_customizations
-from frappe.search.website_search import build_index_for_all_routes
 from frappe.utils.connections import check_connection
 from frappe.utils.dashboard import sync_dashboards
 from frappe.utils.data import cint, comma_and
@@ -74,11 +75,8 @@ class SiteMigration:
 	- run after migrate hooks
 	"""
 
-	def __init__(
-		self, skip_failing: bool = False, skip_search_index: bool = False, skip_fixtures: bool = False
-	) -> None:
+	def __init__(self, skip_failing: bool = False, skip_fixtures: bool = False) -> None:
 		self.skip_failing = skip_failing
-		self.skip_search_index = skip_search_index
 		self.skip_fixtures = skip_fixtures
 
 	def setUp(self):
@@ -86,6 +84,7 @@ class SiteMigration:
 		frappe.flags.touched_tables = set()
 		self.touched_tables_file = frappe.get_site_path("touched_tables.json")
 		frappe.clear_cache()
+		frappe.setup_module_map(include_all_apps=False)
 
 		if os.path.exists(self.touched_tables_file):
 			os.remove(self.touched_tables_file)
@@ -107,17 +106,22 @@ class SiteMigration:
 		with open(self.touched_tables_file, "w") as f:
 			json.dump(list(frappe.flags.touched_tables), f, sort_keys=True, indent=4)
 
-		if not self.skip_search_index:
-			print(f"Queued rebuilding of search index for {frappe.local.site}")
-			frappe.enqueue(build_index_for_all_routes, queue="long")
-
 		frappe.publish_realtime("version-update")
 		frappe.flags.touched_tables.clear()
 		frappe.flags.in_migrate = False
+		clear_cache_after_maintenance()
 
 	@atomic
 	def pre_schema_updates(self):
-		"""Executes `before_migrate` hooks"""
+		"""Registers modules declared since the last migrate, then executes `before_migrate` hooks"""
+		from frappe.installer import sync_module_defs
+
+		# This runs before the hooks and before either patch pass, because everything downstream
+		# that names a module, such as a patch, a workspace or a module sidebar, needs the row to
+		# exist first. A module an app added after it was installed has no row until this runs.
+		if added := sync_module_defs():
+			print(f"Registered new modules: {comma_and(added, add_quotes=False)}")
+
 		overrides = defaultdict(list)
 		for app in frappe.get_installed_apps():
 			for fn in frappe.get_hooks("before_migrate", app_name=app):
@@ -152,6 +156,7 @@ class SiteMigration:
 		* Sync fixtures & custom scripts
 		* Sync in-Desk Module Dashboards
 		* Sync customizations: Custom Fields, Property Setters, Custom Permissions
+		* Run post_fixture_sync patches
 		* Sync Frappe's internal language master
 		* Flush deferred inserts made during maintenance mode.
 		* Sync Portal Menu Items
@@ -160,6 +165,12 @@ class SiteMigration:
 		"""
 		print("Syncing jobs...")
 		sync_jobs()
+
+		from frappe.database.sequence import create_missing_sequences
+
+		if recreated := create_missing_sequences():
+			print(f"Recreated missing sequences for: {', '.join(recreated)}")
+
 		if not self.skip_fixtures:
 			print("Syncing fixtures...")
 			sync_fixtures()
@@ -172,6 +183,12 @@ class SiteMigration:
 
 		print("Syncing customizations...")
 		sync_customizations()
+
+		print("Running post fixture sync patches...")
+		frappe.clear_cache()
+		frappe.modules.patch_handler.run_all(
+			skip_failing=self.skip_failing, patch_type=PatchType.post_fixture_sync
+		)
 
 		print("Syncing languages...")
 		sync_languages()
@@ -195,6 +212,9 @@ class SiteMigration:
 		for app in frappe.get_installed_apps():
 			for fn in frappe.get_hooks("after_migrate", app_name=app):
 				frappe.get_attr(fn)()
+
+		print("Applying state of disabled apps again...")
+		reapply_disabled_app_state()
 
 	def required_services_running(self) -> bool:
 		"""Return True if all required services are running. Return False and print

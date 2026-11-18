@@ -10,6 +10,7 @@ import yaml
 from werkzeug.wrappers import Response
 
 import frappe
+from frappe.app_state import get_disabled_doctypes
 from frappe.apps import get_apps, get_default_path, is_desk_apps
 from frappe.model.document import Document
 from frappe.utils import (
@@ -103,11 +104,7 @@ def get_home_page():
 		home_page = None
 		# for user
 		if frappe.session.user != "Guest":
-			# by role
-			for role in frappe.get_roles():
-				home_page = frappe.db.get_value("Role", role, "home_page")
-				if home_page:
-					break
+			home_page = get_role_home_page()
 
 			# portal default
 			if not home_page:
@@ -130,7 +127,7 @@ def get_home_page():
 		if home_page == "me" and is_portal_user():
 			home_page = "portal"
 
-		default_workspace = frappe.get_user().load_user().default_workspace
+		default_workspace = frappe.get_user().load_user_default_workspace()
 		if default_workspace:
 			home_page = get_url_to_workspace(default_workspace["name"], default_workspace["public"])
 			return home_page
@@ -143,6 +140,14 @@ def get_home_page():
 	return frappe.cache.hget("home_page", frappe.session.user, _get_home_page)
 
 
+def get_role_home_page():
+	# For most of scenarios,Role table have `home_page` as NULL for all rows/roles, so we do a batch query to reduce DB calls.
+	# and later check if got the `home_page`for any of the roles.
+	all_home_pages = frappe.db.get_values("Role", frappe.get_roles(), "home_page", pluck=True)
+	assert isinstance(all_home_pages, list)
+	return next((home_page for home_page in all_home_pages if home_page is not None), None)
+
+
 def get_home_page_via_hooks():
 	home_page = None
 
@@ -153,12 +158,7 @@ def get_home_page_via_hooks():
 		home_page = frappe.get_hooks("website_user_home_page")[-1]
 
 	if not home_page:
-		role_home_page = frappe.get_hooks("role_home_page")
-		if role_home_page:
-			for role in frappe.get_roles():
-				if role in role_home_page:
-					home_page = role_home_page[role][-1]
-					break
+		home_page = get_role_home_page_via_hooks()
 
 	if not home_page:
 		home_page = frappe.get_hooks("home_page")
@@ -169,6 +169,14 @@ def get_home_page_via_hooks():
 		home_page = home_page.strip("/")
 
 	return home_page
+
+
+def get_role_home_page_via_hooks():
+	role_home_page = frappe.get_hooks("role_home_page")
+	if role_home_page:
+		for role in frappe.get_roles():
+			if role in role_home_page:
+				return role_home_page[role][-1]
 
 
 def get_boot_data():
@@ -186,10 +194,12 @@ def get_boot_data():
 		},
 		"sysdefaults": {
 			"float_precision": cint(frappe.get_system_settings("float_precision")) or 3,
+			"currency_precision": cint(frappe.get_system_settings("currency_precision"), None),
 			"date_format": get_date_format(),
 			"time_format": get_time_format(),
 			"first_day_of_the_week": get_first_day_of_the_week(),
 			"number_format": get_number_format().string,
+			"rounding_method": frappe.get_system_settings("rounding_method"),
 			"currency": frappe.get_system_settings("currency"),
 		},
 		"time_zone": {
@@ -225,7 +235,7 @@ def abs_url(path):
 	"""Deconstructs and Reconstructs a URL into an absolute URL or a URL relative from root '/'"""
 	if not path:
 		return
-	if path.startswith("http://") or path.startswith("https://"):
+	if path.lower().startswith(("http://", "https://")):
 		return path
 	if path.startswith("tel:"):
 		return path
@@ -466,8 +476,13 @@ def get_portal_sidebar_items():
 		roles = frappe.get_roles()
 		portal_settings = frappe.get_doc("Portal Settings", "Portal Settings")
 
+		disabled_doctypes = get_disabled_doctypes()
+
 		def add_items(sidebar_items, items):
 			for d in items:
+				if d.get("reference_doctype") in disabled_doctypes:
+					continue
+
 				if d.get("enabled") and ((not d.get("role")) or d.get("role") in roles):
 					sidebar_items.append(d.as_dict() if isinstance(d, Document) else d)
 

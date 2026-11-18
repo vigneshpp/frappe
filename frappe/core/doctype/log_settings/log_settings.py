@@ -5,9 +5,9 @@ from typing import Protocol, runtime_checkable
 
 import frappe
 from frappe import _
-from frappe.model.base_document import get_controller
-from frappe.model.document import Document
-from frappe.utils import cint
+from frappe.model.document import Document, get_controller
+from frappe.query_builder import Table
+from frappe.utils import add_days, cint, now_datetime
 from frappe.utils.caching import site_cache
 
 
@@ -29,6 +29,8 @@ def _supports_log_clearing(doctype: str) -> bool:
 
 
 class LogSettings(Document):
+	_DOCTYPE_NAME = "Log Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -144,7 +146,7 @@ def get_log_doctypes(doctype: str, txt: str, searchfield: str, start: int, page_
 
 	supported_doctypes = [(d,) for d in doctypes if _supports_log_clearing(d)]
 
-	return supported_doctypes[start:page_len]
+	return supported_doctypes[start : start + page_len]
 
 
 def clear_log_table(doctype, days=90):
@@ -155,39 +157,51 @@ def clear_log_table(doctype, days=90):
 	ref: https://mariadb.com/kb/en/big-deletes/#deleting-more-than-half-a-table
 	"""
 	from frappe.utils import get_table_name
+	from frappe.utils.logging import is_log_doctype
 
 	if doctype not in frappe.get_hooks("default_log_clearing_doctypes", {}):
 		raise frappe.ValidationError(f"Unsupported logging DocType: {doctype}")
+
+	if is_log_doctype(doctype):
+		# The copy-and-rename dance below exists to avoid a huge DELETE on MariaDB. A log
+		# DocType has no table in the primary database to rename, and its rows live in
+		# SQLite, where a bounded DELETE is cheap. Let the controller do its own cleanup.
+		get_controller(doctype).clear_old_logs(days=cint(days))
+		return
 
 	original = get_table_name(doctype)
 	temporary = f"{original} temp_table"
 	backup = f"{original} backup_table"
 
+	original_table = Table(original)
+	cutoff = add_days(now_datetime(), -cint(days))
+	copy_recent_rows = (
+		frappe.qb.into(Table(temporary))
+		.from_(original_table)
+		.select("*")
+		.where(original_table.creation > cutoff)
+	)
+
 	try:
-		if frappe.db.db_type == "postgres":
+		if frappe.db.db_type == "sqlite":
+			frappe.db.delete(doctype, {"creation": ("<=", cutoff)})
+		elif frappe.db.db_type == "postgres":
 			frappe.db.sql_ddl(f'CREATE TABLE "{temporary}" (LIKE "{original}" INCLUDING ALL)')
 
-			frappe.db.sql(
-				f"""INSERT INTO "{temporary}"
-					SELECT * FROM "{original}"
-					WHERE "{original}"."creation" > NOW() - INTERVAL '{days}' DAY"""
-			)
+			copy_recent_rows.run()
 			frappe.db.sql_ddl(f'ALTER TABLE "{original}" RENAME TO "{backup}"')
 			frappe.db.sql_ddl(f'ALTER TABLE "{temporary}" RENAME TO "{original}"')
 		elif frappe.db.db_type == "mariadb":
 			frappe.db.sql_ddl(f"CREATE TABLE `{temporary}` LIKE `{original}`")
 
-			# Copy all recent data to new table
-			frappe.db.sql(
-				f"""INSERT INTO `{temporary}`
-					SELECT * FROM `{original}`
-					WHERE `{original}`.`creation` > NOW() - INTERVAL '{days}' DAY"""
-			)
+			copy_recent_rows.run()
 			frappe.db.sql_ddl(f"RENAME TABLE `{original}` TO `{backup}`, `{temporary}` TO `{original}`")
 	except Exception:
 		frappe.db.rollback()
 		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{temporary}`")
 		raise
 	else:
-		frappe.db.sql_ddl(f"DROP TABLE `{backup}`")
-		frappe.db.commit()
+		if frappe.db.db_type != "sqlite":
+			frappe.db.sql_ddl(f"DROP TABLE `{backup}`")
+		# Each cleanup is a durable unit of progress and releases locks before the next log table.
+		frappe.db.commit()  # nosemgrep: frappe-semgrep-rules.rules.frappe-manual-commit

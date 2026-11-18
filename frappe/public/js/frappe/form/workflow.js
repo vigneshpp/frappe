@@ -22,28 +22,27 @@ frappe.ui.form.States = class FormStates {
 		this.frm.page.add_action_item(
 			__("Help"),
 			function () {
-				frappe.workflow.setup(me.frm.doctype);
 				var state = me.get_state();
 				var d = new frappe.ui.Dialog({
-					title: "Workflow: " + frappe.workflow.workflows[me.frm.doctype].name,
+					title: "Workflow: " + frappe.workflow.get_workflow(me.frm.doc).name,
 				});
 
 				frappe.workflow.get_transitions(me.frm.doc).then((transitions) => {
 					const next_actions =
 						$.map(
 							transitions,
-							(d) => `${d.action.bold()} ${__("by Role")} ${d.allowed}`
+							(d) => `${frappe.utils.bold(d.action)} ${__("by Role")} ${d.allowed}`
 						).join(", ") || __("None: End of Workflow").bold();
 
 					const document_editable_by = frappe.workflow
-						.get_document_state_roles(me.frm.doctype, state)
-						.map((role) => role.bold())
+						.get_document_state_roles(me.frm.doc, state)
+						.map((role) => frappe.utils.bold(role))
 						.join(", ");
 
 					$(d.body)
 						.html(
 							`
-					<p>${__("Current status")}: ${state.bold()}</p>
+					<p>${__("Current status")}: ${frappe.utils.bold(state)}</p>
 					<p>${__("Document is only editable by users with role")}: ${document_editable_by}</p>
 					<p>${__("Next actions")}: ${next_actions}</p>
 					<p>${__("{0}: Other permission rules may also apply", [__("Note").bold()])}</p>
@@ -59,6 +58,13 @@ frappe.ui.form.States = class FormStates {
 	}
 
 	refresh() {
+		// always drop the previous doc's actions first — a doc with no
+		// workflow_state (it predates the workflow) never reaches
+		// show_actions, and would otherwise keep showing them
+		this.frm.page.clear_actions_menu();
+
+		if (!frappe.workflow.has_workflow(this.frm.doc)) return;
+
 		// hide if its not yet saved
 		if (this.frm.doc.__islocal) {
 			this.set_default_state();
@@ -96,16 +102,16 @@ frappe.ui.form.States = class FormStates {
 			return approval_access;
 		}
 
+		// refresh() already cleared the menu synchronously; guard the async
+		// re-fill against the user having navigated to another doc meanwhile
+		const docname = this.frm.doc.name;
 		frappe.workflow.get_transitions(this.frm.doc).then((transitions) => {
-			this.frm.page.clear_actions_menu();
+			if (this.frm.doc.name !== docname) return;
 			transitions.forEach((d) => {
 				if (frappe.user_roles.includes(d.allowed) && has_approval_access(d)) {
 					added = true;
 					me.frm.page.add_action_item(__(d.action), function () {
-						if (
-							frappe.workflow?.workflows?.[me.frm.doctype]
-								?.enable_action_confirmation
-						) {
+						if (frappe.workflow.get_workflow(me.frm.doc)?.enable_action_confirmation) {
 							frappe.confirm(__("Are you sure you want to {0}?", [d.action]), () =>
 								me.handle_workflow_action(d)
 							);
@@ -154,7 +160,7 @@ frappe.ui.form.States = class FormStates {
 
 	set_default_state() {
 		var default_state = frappe.workflow.get_default_state(
-			this.frm.doctype,
+			this.frm.doc,
 			this.frm.doc.docstatus
 		);
 		if (default_state) {

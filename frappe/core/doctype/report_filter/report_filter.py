@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class ReportFilter(Document):
+	_DOCTYPE_NAME = "Report Filter"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -17,16 +19,19 @@ class ReportFilter(Document):
 		default: DF.SmallText | None
 		fieldname: DF.Data
 		fieldtype: DF.Literal[
+			"Autocomplete",
 			"Check",
 			"Currency",
 			"Data",
 			"Date",
+			"DateRange",
 			"Datetime",
 			"Dynamic Link",
 			"Float",
 			"Fold",
 			"Int",
 			"Link",
+			"MultiSelectList",
 			"Select",
 			"Time",
 		]

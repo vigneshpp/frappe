@@ -8,6 +8,7 @@ from functools import wraps
 
 import frappe
 from frappe import _
+from frappe.core.api.file import get_max_file_size
 from frappe.email.utils import get_port
 from frappe.model.document import Document
 from frappe.utils import cint
@@ -53,6 +54,8 @@ def handle_error(event):
 
 
 class EmailDomain(Document):
+	_DOCTYPE_NAME = "Email Domain"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -80,6 +83,8 @@ class EmailDomain(Document):
 
 	def validate(self):
 		"""Validate POP3/IMAP and SMTP connections."""
+		if self.is_new() and not self.attachment_limit:
+			self.attachment_limit = get_max_file_size() // (1024 * 1024)
 
 		if frappe.local.flags.in_patch or frappe.in_test or frappe.local.flags.in_install:
 			return

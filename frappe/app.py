@@ -4,13 +4,13 @@
 import functools
 import logging
 import os
+import sys
 
 import orjson
 from werkzeug.exceptions import HTTPException, NotFound
-from werkzeug.middleware.profiler import ProfilerMiddleware
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.middleware.shared_data import SharedDataMiddleware
-from werkzeug.wrappers import Request, Response
+from werkzeug.wrappers import Request, Response  # nosemgrep: frappe-monkey-patching-not-allowed
 from werkzeug.wsgi import ClosingIterator
 
 import frappe
@@ -19,13 +19,14 @@ import frappe.handler
 import frappe.monitor
 import frappe.rate_limiter
 import frappe.recorder
+import frappe.storage.serve
 import frappe.utils.response
 from frappe import _
 from frappe.auth import SAFE_HTTP_METHODS, UNSAFE_HTTP_METHODS, HTTPRequest, check_request_ip, validate_auth
 from frappe.integrations.oauth2 import get_resource_url, handle_wellknown, is_oauth_metadata_enabled
 from frappe.middlewares import StaticDataMiddleware
 from frappe.permissions import handle_does_not_exist_error
-from frappe.utils import CallbackManager, cint, get_site_name
+from frappe.utils import CallbackManager, cint, get_request_host, get_site_name
 from frappe.utils.data import escape_html
 from frappe.utils.error import log_error, log_error_snapshot
 from frappe.website.page_renderers.error_page import ErrorPage
@@ -36,41 +37,56 @@ _sites_path = os.environ.get("SITES_PATH", ".")
 
 
 # If gc.freeze is done then importing modules before forking allows us to share the memory
-import gettext
+from frappe._optimizations import preload_database_drivers, preload_modules
 
-import babel
-import babel.messages
-import nh3
-import num2words
-import pydantic
-
-import frappe.boot
-import frappe.client
-import frappe.core.doctype.file.file
-import frappe.core.doctype.user.user
-import frappe.database.mariadb.mysqlclient  # Load database related utils
-import frappe.database.query
-import frappe.desk.desktop  # workspace
-import frappe.desk.form.save
-import frappe.model.db_query
-import frappe.query_builder
-import frappe.utils.background_jobs  # Enqueue is very common
-import frappe.utils.data  # common utils
-import frappe.utils.jinja  # web page rendering
-import frappe.utils.jinja_globals
-import frappe.utils.redis_wrapper  # Exact redis_wrapper
-import frappe.utils.safe_exec
-import frappe.utils.typing_validations  # any whitelisted method uses this
-import frappe.website.path_resolver  # all the page types and resolver
-import frappe.website.router  # Website router
-import frappe.website.website_generator  # web page doctypes
+preload_modules()
+preload_database_drivers()
 
 # end: module pre-loading
 
 # better werkzeug default
 # this is necessary because frappe desk sends most requests as form data
 # and some of them can exceed werkzeug's default limit of 500kb
-Request.max_form_memory_size = None
+Request.max_form_memory_size = None  # nosemgrep: frappe-monkey-patching-not-allowed
+
+
+# Callbacks that run after every response, before any deferred during the request
+DEFAULT_AFTER_RESPONSE_CALLBACKS = (
+	frappe.rate_limiter.update,
+	frappe.recorder.dump,
+)
+
+
+def get_after_response_callbacks():
+	"""Yield default callbacks, then any deferred during the request, in order of addition.
+
+	The request's queue is consumed as it is yielded, so callbacks registered
+	by other callbacks are picked up too."""
+
+	yield from DEFAULT_AFTER_RESPONSE_CALLBACKS
+
+	request = getattr(frappe.local, "request", None)
+	if callback_manager := getattr(request, "after_response", None):
+		functions = callback_manager._functions
+		while functions:
+			yield functions.popleft()
+	else:
+		frappe.logger("after_response").error("No request or after_response callback manager found")
+
+
+def run_after_response_callbacks():
+	"""Run all after-response callbacks.
+
+	The response is already sent by this point, so a failing callback can
+	neither be reported to the client nor prevent the rest from running."""
+
+	for func in get_after_response_callbacks():
+		try:
+			func()
+		except Exception:
+			frappe.logger("after_response").error(
+				f"Failed to run after response callback: {func}", exc_info=True
+			)
 
 
 def after_response_wrapper(app):
@@ -83,9 +99,7 @@ def after_response_wrapper(app):
 		return ClosingIterator(
 			app(environ, start_response),
 			(
-				frappe.rate_limiter.update,
-				frappe.recorder.dump,
-				frappe.request.after_response.run,
+				run_after_response_callbacks,
 				frappe.destroy,
 			),
 		)
@@ -123,8 +137,14 @@ def application(request: Request):
 		elif request.path.startswith("/backups"):
 			response = frappe.utils.response.download_backup(request.path)
 
+		# not gated on storage_v2: blob URLs stored while the flag was on must
+		# keep working after it is turned off
 		elif request.path.startswith("/private/files/"):
-			response = frappe.utils.response.download_private_file(request.path)
+			response = frappe.storage.serve.serve_private_file(request.path)
+
+		elif request.path.startswith("/files/"):
+			# nginx serves files found on disk; this is everything else
+			response = frappe.storage.serve.serve_public_file(request.path)
 
 		elif request.path == "/.well-known/security.txt" and request.method == "GET":
 			if request.scheme != "https":
@@ -174,33 +194,54 @@ def run_after_request_hooks(request, response):
 		frappe.call(after_request_task, response=response, request=request)
 
 
+UPLOAD_FILE_PATHS = ("/api/method/upload_file", "/api/v1/method/upload_file", "/api/v2/method/upload_file")
+
+
+def is_streaming_request(request: Request) -> bool:
+	"""True for a PUT to a ``streaming_request_paths`` route.
+
+	Its body has no size cap, so only the route's handler may read it."""
+	if request.method != "PUT":
+		return False
+	streaming_paths = {
+		path.rstrip("/") for path in frappe.get_hooks("streaming_request_paths") if path.rstrip("/")
+	}
+	return any(request.path == path or request.path.startswith(f"{path}/") for path in streaming_paths)
+
+
 def init_request(request):
-	frappe.local.request = request
-	frappe.local.request.after_response = CallbackManager()
+	site = _site or request.headers.get("X-Frappe-Site-Name") or get_site_name(get_request_host(request))
+	try:
+		frappe.init(site, sites_path=_sites_path, force=True, is_request=True)
+	finally:
+		frappe.local.request = request
+		request.after_response = CallbackManager()
 
-	frappe.local.is_ajax = frappe.get_request_header("X-Requested-With") == "XMLHttpRequest"
+	assert frappe.local.conf and frappe.local.conf.db_name, "config should be loaded"
 
-	site = _site or request.headers.get("X-Frappe-Site-Name") or get_site_name(request.host)
-	frappe.init(site, sites_path=_sites_path, force=True)
-
-	if not (frappe.local.conf and frappe.local.conf.db_name):
-		# site does not exist
-		raise NotFound
+	frappe.local.is_ajax = request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
 	frappe.connect(set_admin_as_user=False)
 	if frappe.local.conf.maintenance_mode:
-		if frappe.local.conf.allow_reads_during_maintenance:
+		if frappe.local.conf.get("allow_reads_during_maintenance", True):
 			setup_read_only_mode()
 		else:
 			raise frappe.SessionStopped("Session Stopped")
 
-	if request.path.startswith("/api/method/upload_file"):
+	streaming_request = is_streaming_request(request)
+	if streaming_request:
+		request.max_content_length = None
+		frappe.local.form_dict = frappe._dict(request.args)
+		# Keep query handling consistent with make_form_dict without reading the body.
+		frappe.local.form_dict.pop("_", None)
+	elif request.path.startswith(UPLOAD_FILE_PATHS):
 		from frappe.core.api.file import get_max_file_size
 
 		request.max_content_length = get_max_file_size()
 	else:
 		request.max_content_length = cint(frappe.local.conf.get("max_file_size")) or 25 * 1024 * 1024
-	make_form_dict(request)
+	if not streaming_request:
+		make_form_dict(request)
 
 	if request.method != "OPTIONS":
 		frappe.local.http_request = HTTPRequest()
@@ -231,7 +272,7 @@ def log_request(request, response):
 	if hasattr(frappe.local, "conf") and frappe.local.conf.enable_frappe_logger:
 		frappe.logger("frappe.web", allow_site=frappe.local.site).info(
 			{
-				"site": get_site_name(request.host),
+				"site": frappe.local.site,
 				"remote_addr": getattr(request, "remote_addr", "NOTFOUND"),
 				"pid": os.getpid(),
 				"user": getattr(frappe.local.session, "user", "NOTFOUND"),
@@ -361,7 +402,12 @@ def handle_exception(e):
 		# usually.
 		frappe.session.user = "Guest"
 
-	if respond_as_json:
+	if getattr(frappe.local, "mcp_request", None):
+		from frappe.mcp.transport import error_response
+
+		response = error_response(e)
+
+	elif respond_as_json:
 		# handle ajax responses first
 		# if the request is ajax, send back the trace or error message
 		response = frappe.utils.response.report_error(http_status_code)
@@ -480,6 +526,84 @@ if sentry_dsn := os.getenv("FRAPPE_SENTRY_DSN"):
 	)
 
 
+def _tolerate_reloader_crashes():
+	"""Keep `bench serve` alive when the restarted process crashes on boot.
+
+	Werkzeug's reloader gives up permanently if the reloaded process exits with an
+	error, e.g. when a file is saved with a syntax error halfway through an edit.
+	Instead of exiting, keep watching files and attempt another restart on the next
+	change.
+	"""
+	from werkzeug._internal import _log
+	from werkzeug._reloader import ReloaderLoop
+
+	original_restart = ReloaderLoop.restart_with_reloader
+
+	def restart_with_reloader(self) -> int:
+		while True:
+			exit_code = original_restart(self)
+			if exit_code == 0:
+				return exit_code
+
+			_log(
+				"warning",
+				f" * Server exited with code {exit_code}, waiting for a file change to restart it",
+			)
+			try:
+				# Fresh instance because watchdog observers can't be restarted after use.
+				with type(self)(
+					extra_files=self.extra_files,
+					exclude_patterns=self.exclude_patterns,
+					interval=self.interval,
+				) as watcher:
+					watcher.run()
+			except SystemExit as e:
+				if e.code != 3:  # 3 = file changed, restart requested
+					return exit_code
+
+	ReloaderLoop.restart_with_reloader = restart_with_reloader
+
+
+_RELOADER_EXCLUDED_DIRS = ("node_modules", ".git")
+
+
+def _get_reloader_watch_config(sites_path) -> tuple[list[str], list[str]]:
+	"""Keep the reloader from watching node_modules, .git and the sites directory.
+
+	See #41147
+	"""
+	try:
+		__import__("watchdog.observers")  # same check werkzeug uses to pick the reloader
+	except ImportError:
+		# The stat reloader polls only .py files and skips the venv already; the
+		# watch-root surgery below would just make it walk the app packages twice.
+		return [], ["test_*"]
+
+	sites_dir = os.path.abspath(sites_path)
+	extra_dirs = []
+	exclude_patterns = ["test_*", sites_dir, *[f"*/{d}/*" for d in _RELOADER_EXCLUDED_DIRS]]
+
+	# the stat reloader never scans the venv or the stdlib; skip them here too
+	prefixes = {sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix}
+	exclude_patterns.extend(f"{os.path.abspath(p)}{os.sep}*" for p in prefixes)
+
+	for path in sys.path:
+		path = os.path.abspath(path)
+		if path == sites_dir or not os.path.isdir(path):
+			continue
+		if not any(os.path.lexists(os.path.join(path, d)) for d in _RELOADER_EXCLUDED_DIRS):
+			continue
+
+		exclude_patterns.append(path)
+		extra_dirs.extend(
+			os.path.join(path, child)
+			for child in sorted(os.listdir(path))
+			if os.path.isfile(os.path.join(path, child, "__init__.py"))
+		)
+
+	return extra_dirs, exclude_patterns
+
+
 def serve(
 	port=8000,
 	profile=False,
@@ -488,6 +612,7 @@ def serve(
 	site=None,
 	sites_path=".",
 	proxy=False,
+	bind_addr=None,
 ):
 	global application, _site, _sites_path
 	_site = site
@@ -496,6 +621,8 @@ def serve(
 	from werkzeug.serving import run_simple
 
 	if profile or os.environ.get("USE_PROFILER"):
+		from werkzeug.middleware.profiler import ProfilerMiddleware
+
 		application = ProfilerMiddleware(application, sort_by=("cumtime", "calls"), restrictions=(200,))
 
 	if not os.environ.get("NO_STATICS"):
@@ -514,14 +641,21 @@ def serve(
 	if in_test_env:
 		log.setLevel(logging.ERROR)
 
+	use_reloader = False if in_test_env else not no_reload
+	extra_dirs, exclude_patterns = [], ["test_*"]
+	if use_reloader:
+		_tolerate_reloader_crashes()
+		extra_dirs, exclude_patterns = _get_reloader_watch_config(sites_path)
+
 	run_simple(
-		"0.0.0.0",
+		bind_addr or os.environ.get("FRAPPE_BIND_ADDR") or "127.0.0.1",
 		int(port),
 		application,
-		exclude_patterns=["test_*"],
-		use_reloader=False if in_test_env else not no_reload,
-		use_debugger=not in_test_env,
-		use_evalex=not in_test_env,
+		extra_files=extra_dirs,
+		exclude_patterns=exclude_patterns,
+		use_reloader=use_reloader,
+		use_debugger=False,
+		use_evalex=False,
 		threaded=not no_threading,
 	)
 

@@ -13,6 +13,7 @@ import time
 import typing
 from code import compile_command
 from collections import defaultdict
+from decimal import MAX_PREC, ROUND_HALF_UP, Decimal, localcontext
 from enum import Enum
 from functools import lru_cache
 from typing import Any, Literal, Optional, TypeVar
@@ -20,7 +21,6 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunpa
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import orjson
-from click import secho
 from dateutil import parser
 from dateutil.parser import ParserError
 from dateutil.relativedelta import relativedelta
@@ -59,6 +59,7 @@ if typing.TYPE_CHECKING:
 	from collections.abc import Mapping
 
 	from PIL.ImageFile import ImageFile as PILImageFile
+	from werkzeug.wrappers import Request
 
 	T = TypeVar("T")
 
@@ -164,10 +165,11 @@ def get_datetime(
 	if datetime_str is None:
 		return now_datetime()
 
-	elif isinstance(datetime_str, datetime.datetime | datetime.timedelta):
+	# PERF: isinstance with a tuple is much faster than with a union type (`X | Y`)
+	elif isinstance(datetime_str, (datetime.datetime, datetime.timedelta)):
 		return datetime_str
 
-	elif isinstance(datetime_str, list | tuple):
+	elif isinstance(datetime_str, (list, tuple)):
 		return datetime.datetime(datetime_str)
 
 	elif isinstance(datetime_str, datetime.date):
@@ -390,6 +392,21 @@ def get_system_timezone() -> str:
 	return frappe.get_system_settings("time_zone") or "Asia/Kolkata"  # Default to India ?!
 
 
+def get_timezone_utc_offset(timezone: str) -> str:
+	"""Return the current UTC offset of the given timezone in ±HH:MM format."""
+	offset_seconds = int(datetime.datetime.now(ZoneInfo(timezone)).utcoffset().total_seconds())
+	sign = "+" if offset_seconds >= 0 else "-"
+	hours, minutes = divmod(abs(offset_seconds) // 60, 60)
+	return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def validate_time_zone(time_zone: str) -> None:
+	from zoneinfo import available_timezones
+
+	if time_zone not in available_timezones():
+		frappe.throw(frappe._("{0} is not a valid Time Zone").format(frappe.bold(time_zone)))
+
+
 def convert_utc_to_timezone(utc_timestamp: datetime.datetime, time_zone: str) -> datetime.datetime:
 	if utc_timestamp.tzinfo is None:
 		utc_timestamp = utc_timestamp.replace(tzinfo=ZoneInfo("UTC"))
@@ -478,6 +495,9 @@ def get_first_day(dt, d_years: int = 0, d_months: int = 0, as_str: bool = False)
 	overflow_years, month = divmod(dt.month + d_months - 1, 12)
 	year = dt.year + d_years + overflow_years
 
+	# divmod by 12 always yields a remainder in [0, 11]; month + 1 must be a valid 1..12 month
+	assert 0 <= month <= 11, "month index out of range after divmod by 12"
+
 	return (
 		datetime.date(year, month + 1, 1).strftime(DATE_FORMAT)
 		if as_str
@@ -502,6 +522,7 @@ def get_quarter_start(dt: DateTimeLikeObject | None = None, as_str: bool = False
 	"""
 	date = getdate(dt)
 	quarter = (date.month - 1) // 3 + 1
+	assert 1 <= quarter <= 4, "quarter must be in range 1..4 for a valid month"
 	first_date_of_quarter = datetime.date(date.year, ((quarter - 1) * 3) + 1, 1)
 	return first_date_of_quarter.strftime(DATE_FORMAT) if as_str else first_date_of_quarter
 
@@ -1020,6 +1041,8 @@ def has_common(l1: typing.Hashable, l2: typing.Hashable) -> bool:
 
 def cast_fieldtype(fieldtype, value, show_warning=True):
 	if show_warning:
+		from click import secho
+
 		message = (
 			"Function `frappe.utils.data.cast_fieldtype` has been deprecated in favour"
 			" of `frappe.utils.data.cast`. Use the newer util for safer type casting."
@@ -1289,7 +1312,8 @@ def _round_away_from_zero(num, precision):
 	# ending with 5 when it's represented by a smaller number. By adding a very small value
 	# close to what's "least count" or smallest representable difference in the scale we force
 	# the number to be bigger than actual value, this increases representation error but
-	# removes rounding error.
+	# removes rounding error. This only holds while the correction stays under the rounding
+	# step, past a quarter step it inflates the value instead, so the value is rounded exactly.
 
 	# References:
 	# - https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
@@ -1297,28 +1321,40 @@ def _round_away_from_zero(num, precision):
 	# - https://docs.python.org/3/library/functions.html#round
 	# - easier to understand: https://www.youtube.com/watch?v=pQs_wx8eoQ8
 
-	epsilon = 2.0 ** (math.log(abs(num), 2) - 52.0)
+	epsilon = math.ulp(abs(num))
+	rounding_step = 10.0**-precision
+
+	if math.isfinite(num) and epsilon >= rounding_step / 4:
+		with localcontext() as ctx:
+			ctx.prec = MAX_PREC
+			ctx.rounding = ROUND_HALF_UP
+			return float(Decimal(num).quantize(Decimal(1).scaleb(-precision)))
 
 	return round(num + math.copysign(epsilon, num), precision)
 
 
 def _bankers_rounding(num, precision):
+	if num == 0:
+		return 0.0
+
+	sign = -1 if num < 0 else 1
 	multiplier = 10**precision
-	num = round(num * multiplier, 12)
+	num = round(abs(num) * multiplier, 12)
 
 	if num == 0:
 		return 0.0
 
-	floor_num = math.floor(num) if num > 0 else math.ceil(num)
+	floor_num = math.floor(num)
 	decimal_part = num - floor_num
 
-	epsilon = 2.0 ** (math.log(abs(num), 2) - 52.0)
-	if abs(decimal_part - 0.5) < epsilon:
-		num = floor_num if (floor_num % 2 == 0) else floor_num + 1 if num > 0 else floor_num - 1
+	epsilon = 2.0 ** (math.log(num, 2) - 52.0)
+
+	if epsilon < 0.5 and abs(decimal_part - 0.5) < epsilon:
+		num = floor_num if (floor_num % 2 == 0) else floor_num + 1
 	else:
 		num = round(num)
 
-	return num / multiplier
+	return sign * num / multiplier
 
 
 def remainder(numerator: NumericType, denominator: NumericType, precision: int = 2) -> NumericType:
@@ -1391,6 +1427,12 @@ def parse_val(v):
 	return v
 
 
+def get_currency_precision() -> int | None:
+	"""Return the configured Currency Precision, or None if it isn't set."""
+	currency_precision = frappe.db.get_default("currency_precision")
+	return cint(currency_precision) if currency_precision not in (None, "") else None
+
+
 def fmt_money(
 	amount: str | float | int | None,
 	precision: int | None = None,
@@ -1401,7 +1443,7 @@ def fmt_money(
 	number_format = NumberFormat.from_string(format) if format else get_number_format()
 
 	if precision is None:
-		precision = cint(frappe.db.get_default("currency_precision")) or None
+		precision = get_currency_precision()
 
 	if precision is None:
 		precision = number_format.precision
@@ -1466,7 +1508,7 @@ def fmt_money(
 	if amount != "0":
 		amount = minus + amount
 
-	if currency and frappe.defaults.get_global_default("hide_currency_symbol") != "Yes":
+	if currency and frappe.defaults.get_global_default("hide_currency_symbol") not in ("1", "Yes"):
 		symbol = frappe.db.get_value("Currency", currency, "symbol", cache=True) or currency
 		symbol_on_right = frappe.db.get_value("Currency", currency, "symbol_on_right", cache=True)
 
@@ -1550,7 +1592,7 @@ def money_in_words(
 		in_million = False
 
 	def fraction_in_words() -> str:
-		return in_words(float(f"0.{fraction}") * fraction_units, in_million).title()
+		return in_words(Decimal(f"0.{fraction}") * fraction_units, in_million).title()
 
 	# 0.00
 	if main == "0" and fraction in ["0", "00", "000"]:
@@ -1611,6 +1653,114 @@ def is_image(filepath: str) -> bool:
 	# filepath can be https://example.com/bed.jpg?v=129
 	filepath = (filepath or "").split("?", 1)[0]
 	return (guess_type(filepath)[0] or "").startswith("image/")
+
+
+def validate_egress_url(url: str) -> None:
+	"""Raise ValueError if url resolves to a private/internal address.
+
+	Guards server-side HTTP fetches against SSRF by resolving the hostname and
+	blocking loopback, link-local (including 169.254.169.254), private, and
+	reserved ranges regardless of the URL's textual representation.
+	"""
+	import ipaddress
+	import socket
+
+	parsed = urlparse(url)
+	if parsed.scheme not in ("http", "https"):
+		raise ValueError(f"Disallowed scheme: {parsed.scheme!r}")
+
+	hostname = parsed.hostname
+	if not hostname:
+		raise ValueError("URL has no hostname")
+
+	try:
+		addr_info = socket.getaddrinfo(hostname, None)
+	except socket.gaierror as exc:
+		raise ValueError(f"Cannot resolve host {hostname!r}") from exc
+
+	for record in addr_info:
+		try:
+			ip = ipaddress.ip_address(record[4][0])
+		except (ValueError, IndexError):
+			continue
+		if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+			raise ValueError(f"Requests to internal address {ip} are not permitted")
+
+
+def get_image_thumbnail_uri(url: str, max_dim: int = 400, quality: int = 80) -> str:
+	"""Return a base64 data: URI thumbnail of `url`, or the original `url` on
+	any error. Used by print templates to keep generated PDFs small: Chrome's
+	`Page.printToPDF` embeds images at their natural resolution regardless of
+	the CSS display size, so a 5000x5000 stock photo bloats the PDF by several
+	MB even when the image is rendered at 100px.
+
+	Only http://, https:// and /-rooted URLs are processed; anything else is
+	returned unchanged so the caller's URL-scheme validation is preserved.
+	"""
+	import base64
+	import io
+	import os
+
+	if not url or not isinstance(url, str):
+		return url
+	if not (url.startswith("http://") or url.startswith("https://") or url.startswith("/")):
+		return url
+
+	# Per-request cache so repeated rows that share an image only resize once.
+	cache = getattr(frappe.local, "_print_thumbnail_cache", None)
+	if cache is None:
+		cache = frappe.local._print_thumbnail_cache = {}
+	key = (url, max_dim, quality)
+	if key in cache:
+		return cache[key]
+
+	if not url.startswith("/"):
+		try:
+			validate_egress_url(url)
+		except ValueError:
+			return url
+
+	try:
+		if url.startswith("/"):
+			base = os.path.realpath(frappe.get_site_path("public"))
+			path = os.path.realpath(os.path.join(base, url.lstrip("/")))
+			if os.path.commonpath((base, path)) != base or not os.path.isfile(path):
+				return url
+			with open(path, "rb") as f:
+				content = f.read()
+		else:
+			import requests
+
+			r = requests.get(url, timeout=5, stream=True, allow_redirects=False)
+			r.raise_for_status()
+			chunks, total = [], 0
+			for chunk in r.iter_content(8192):
+				chunks.append(chunk)
+				total += len(chunk)
+				if total > 20 * 1024 * 1024:
+					return url
+			content = b"".join(chunks)
+
+		from PIL import Image
+
+		img = Image.open(io.BytesIO(content))
+		img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+		fmt = "PNG" if img.mode in ("RGBA", "LA", "P") else "JPEG"
+		if fmt == "JPEG" and img.mode != "RGB":
+			img = img.convert("RGB")
+		buf = io.BytesIO()
+		save_kwargs = {"format": fmt, "optimize": True}
+		if fmt == "JPEG":
+			save_kwargs["quality"] = quality
+		img.save(buf, **save_kwargs)
+		encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+		data_uri = f"data:image/{fmt.lower()};base64,{encoded}"
+		cache[key] = data_uri
+		return data_uri
+	except Exception:
+		# Network/decode failures fall back to the original URL so the cell
+		# still renders something. No per-row log to avoid error log spam.
+		return url
 
 
 def get_thumbnail_base64_for_image(src: str) -> dict[str, str] | None:
@@ -1755,7 +1905,7 @@ def comma_or(some_list: list | tuple, add_quotes=True) -> str:
 
 	try:
 		locale = Locale.parse(frappe.local.lang, sep="-")
-		pattern = locale.list_patterns["or"]["end"]
+		pattern = locale.list_patterns["or"]["2" if len(some_list) == 2 else "end"]
 	except Exception:
 		pattern = frappe._("{0} or {1}")
 
@@ -1773,7 +1923,7 @@ def comma_and(some_list: list | tuple, add_quotes=True) -> str:
 
 	try:
 		locale = Locale.parse(frappe.local.lang, sep="-")
-		pattern = locale.list_patterns["standard"]["end"]
+		pattern = locale.list_patterns["standard"]["2" if len(some_list) == 2 else "end"]
 	except Exception:
 		pattern = frappe._("{0} and {1}")
 
@@ -1831,6 +1981,8 @@ def get_url(
 	uri: str | None = None,
 	full_address: bool = False,
 	allow_header_override: bool = True,
+	*,
+	for_dev_server: bool = False,
 ) -> str:
 	"""Get app url from request."""
 	host_name = frappe.local.conf.host_name or frappe.local.conf.hostname
@@ -1874,13 +2026,15 @@ def get_url(
 		uri = frappe.get_request_header("REQUEST_URI", "")
 
 	port = frappe.conf.http_port
-	if not port and frappe.conf.developer_mode:
+	if for_dev_server or (not port and frappe.conf.developer_mode):
 		port = frappe.conf.webserver_port
 
 	if (
 		# XXX: This config is used as proxy for "is production mode enabled?"
-		not frappe.conf.restart_supervisor_on_update
-		and not frappe.conf.restart_systemd_on_update
+		(
+			for_dev_server
+			or (not frappe.conf.restart_supervisor_on_update and not frappe.conf.restart_systemd_on_update)
+		)
 		and host_name
 		and not url_contains_port(host_name)
 		and port
@@ -1890,11 +2044,19 @@ def get_url(
 	return urljoin(host_name, uri) if uri else host_name
 
 
+def get_request_host(request: "Request") -> str:
+	return request.host or request.headers.get("Host", "")
+
+
 def get_host_name_from_request() -> str:
 	"""Return the hostname (`request.host`) from the request headers."""
-	if hasattr(frappe.local, "request") and frappe.local.request and frappe.local.request.host:
+	if (
+		hasattr(frappe.local, "request")
+		and frappe.local.request
+		and (host := get_request_host(frappe.local.request))
+	):
 		protocol = "https://" if "https" == frappe.get_request_header("X-Forwarded-Proto", "") else "http://"
-		return protocol + frappe.local.request.host
+		return protocol + host
 
 
 def url_contains_port(url: str) -> bool:
@@ -1929,11 +2091,10 @@ def get_link_to_form(doctype: str, name: str | None = None, label: str | None = 
 
 
 def get_url_to_workspace(workspace: str, is_public: bool):
-	url_prefix = "/desk/"
-	if not is_public:
-		workspace_url = "/desk/private/"
-	workspace_url = url_prefix + workspace.lower()
-	return workspace_url
+	from frappe.desk.utils import slug
+
+	url_prefix = "/desk/" if is_public else "/desk/private/"
+	return url_prefix + slug(workspace)
 
 
 def get_link_to_report(
@@ -1991,7 +2152,7 @@ def get_absolute_url(doctype: str, name: str) -> str:
 
 	e.g. when doctype="Sales Invoice" and name="INV-00001", returns '/desk/sales-invoice/INV-00001'
 	"""
-	return f"/desk/{quoted(slug(doctype))}/{quoted(name)}"
+	return f"/desk/{quoted(slug(doctype))}/{quote(cstr(name), safe='')}"
 
 
 def get_url_to_form(doctype: str, name: str | None = None) -> str:
@@ -2003,7 +2164,7 @@ def get_url_to_form(doctype: str, name: str | None = None) -> str:
 	if not name:
 		uri = f"/desk/{quoted(slug(doctype))}"
 	else:
-		uri = f"/desk/{quoted(slug(doctype))}/{quoted(name)}"
+		uri = f"/desk/{quoted(slug(doctype))}/{quote(cstr(name), safe='')}"
 
 	return get_url(uri=uri)
 
@@ -2028,9 +2189,9 @@ def get_url_to_report(name, report_type: str | None = None, doctype: str | None 
 	get_url_to_report("Revenue", "Report Builder", "Sales Invoice") -> 'https://frappe.io/desk/sales-invoice/view/report/Revenue'
 	"""
 	if report_type == "Report Builder":
-		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report/{quoted(name)}")
+		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report/{quote(cstr(name), safe='')}")
 	else:
-		return get_url(uri=f"/desk/query-report/{quoted(name)}")
+		return get_url(uri=f"/desk/query-report/{quote(cstr(name), safe='')}")
 
 
 def get_url_to_report_with_filters(name, filters, report_type=None, doctype=None):
@@ -2038,7 +2199,7 @@ def get_url_to_report_with_filters(name, filters, report_type=None, doctype=None
 	if report_type == "Report Builder":
 		return get_url(uri=f"/desk/{quoted(slug(doctype))}/view/report?{filters}")
 
-	return get_url(uri=f"/desk/query-report/{quoted(name)}?{filters}")
+	return get_url(uri=f"/desk/query-report/{quote(cstr(name), safe='')}?{filters}")
 
 
 def get_filtered_list_url(doctype: str, docnames: list[str] | None = None) -> str:
@@ -2117,6 +2278,30 @@ def filter_operator_timespan(value: str, pattern: str) -> bool:
 	return date_range[0] <= getdate(value) <= date_range[1]
 
 
+def convert_type_for_between_filters(value: DateTimeLikeObject, set_time: datetime.time) -> datetime.datetime:
+	"""Expand a date-only bound to a datetime using set_time; leave datetimes as-is."""
+	if isinstance(value, str):
+		if " " in value.strip():
+			value = get_datetime(value)
+		else:
+			value = getdate(value)
+
+	if isinstance(value, datetime.datetime):
+		return value
+	elif isinstance(value, datetime.date):
+		return datetime.datetime.combine(value, set_time)
+
+	return value
+
+
+def filter_operator_between(value: Any, pattern: list | tuple) -> bool:
+	"""Return True if value is between pattern[0] and pattern[1] (inclusive)."""
+	if value is None:
+		return False
+
+	return pattern[0] <= value <= pattern[1]
+
+
 operator_map = {
 	# startswith
 	"^": lambda a, b: (a or "").startswith(b),
@@ -2136,15 +2321,25 @@ operator_map = {
 	"not like": lambda a, b: not sql_like(a, b),
 	"is": filter_operator_is,
 	"Timespan": filter_operator_timespan,
+	"between": filter_operator_between,
+	"Between": filter_operator_between,  # UI sends capitalized form
 }
 
 
 def evaluate_filters(doc: "Mapping", filters: FilterSignature):
 	"""Return True if doc matches filters."""
+	from frappe.database.query import get_nested_set_hierarchy_result
+	from frappe.database.utils import NestedSetHierarchy
+
 	if not isinstance(filters, Filters):
 		filters = Filters(filters, doctype=doc.get("doctype"))
 	for d in filters:
 		f = get_filter(None, d)
+		if f.operator.lower() in NestedSetHierarchy:
+			hierarchy = f.operator.lower()
+			df = frappe.get_meta(f.doctype).get_field(f.fieldname)
+			f.value = get_nested_set_hierarchy_result(df.options if df else f.doctype, f.value, hierarchy)
+			f.operator = "not in" if hierarchy in ("not ancestors of", "not descendants of") else "in"
 		if not compare(doc.get(f.fieldname), f.operator, f.value, f.fieldtype):
 			return False
 
@@ -2166,6 +2361,8 @@ def compare(val1: Any, condition: str, val2: Any, fieldtype: str | None = None) 
 	Note:
 	- For "is" operator: No casting is performed to preserve None values
 	- For "in"/"not in" operators: Only val1 is cast (if not None), val2 remains unchanged
+	- For "between"/"Between" operators: Cast val1 and each bound in val2.
+	  For Datetime, date-only bounds expand to start/end of day (same as DB filters).
 	- For "Timespan" operator: No casting is performed
 	- For other operators: Both val1 and val2 are cast to the specified fieldtype
 	"""
@@ -2177,6 +2374,16 @@ def compare(val1: Any, condition: str, val2: Any, fieldtype: str | None = None) 
 			# Cast only val1 (if not None), preserve val2 container
 			if val1 is not None:
 				val1 = cast(fieldtype, val1)
+		elif condition in {"between", "Between"}:
+			if val1 is not None:
+				val1 = cast(fieldtype, val1)
+			if fieldtype == "Datetime":
+				val2 = [
+					convert_type_for_between_filters(val2[0], set_time=datetime.time()),
+					convert_type_for_between_filters(val2[1], set_time=datetime.time(23, 59, 59, 999999)),
+				]
+			else:
+				val2 = [cast(fieldtype, v) for v in val2]
 		else:
 			# Cast both values for comparison operators (=, !=, >, <, >=, <=, like, etc.)
 			val1 = cast(fieldtype, val1)
@@ -2471,6 +2678,11 @@ def sha256_hash(input: str | bytes) -> str:
 	return hashlib.sha256(input).hexdigest()
 
 
+def is_sha256_hash(value: str) -> bool:
+	"""Return True if `value` has the shape of a sha256 hexdigest."""
+	return len(value) == 64 and all(character in "0123456789abcdef" for character in value.lower())
+
+
 def dict_with_keys(dict, keys):
 	"""Return a new dict with a subset of keys."""
 	out = {}
@@ -2571,7 +2783,7 @@ def validate_json_string(string: str) -> None:
 		raise frappe.ValidationError
 
 
-def parse_json(val: str):
+def parse_json(val: Any):
 	"""
 	Parses json if string else return
 	"""
@@ -2591,7 +2803,13 @@ def orjson_dumps(obj, default=None, option=None, decode=True):
 	else:
 		option = DEFAULT_ORJSON_OPTIONS
 
-	value = orjson.dumps(obj, default, option)
+	try:
+		value = orjson.dumps(obj, default, option)
+	except orjson.JSONEncodeError:
+		# fallback to json.dumps when orjson cannot handle payload
+		# https://github.com/ijl/orjson#json-encoding-error
+		return json.dumps(obj, default=default) if decode else json.dumps(obj, default=default).encode()
+
 	return value.decode() if decode else value
 
 
@@ -2949,3 +3167,13 @@ def attach_expanded_links(doctype: str, docs: list, fields_to_expand: list):
 			val_title = doctype_title_maps.get(link_doctype, {}).get(val)
 			if val and val_title:
 				li[fieldname] = val_title
+
+
+def scrub(txt: str) -> str:
+	"""Return sluggified string. e.g. `Sales Order` becomes `sales_order`."""
+	return cstr(txt).replace(" ", "_").replace("-", "_").lower()
+
+
+def unscrub(txt: str) -> str:
+	"""Return titlified string. e.g. `sales_order` becomes `Sales Order`."""
+	return txt.replace("_", " ").replace("-", " ").title()

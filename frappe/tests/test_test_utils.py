@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import timedelta
 
 import frappe
@@ -40,6 +41,25 @@ class TestTestUtils(IntegrationTestCase):
 		with self.freeze_time(tomorrow):
 			self.assertEqual(now_datetime(), tomorrow)
 
+	def test_outer_timeout_fires_after_inner_timeout_exits(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+
+		with self.assertRaisesRegex(Exception, "outer timed out"):
+			with self.timeout_context(1, "outer timed out"):
+				with self.timeout_context(5):
+					pass
+				time.sleep(2)
+
+	def test_outer_timeout_fires_inside_longer_inner_timeout(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+
+		with self.assertRaisesRegex(Exception, "Operation timed out"):
+			with self.timeout_context(1):
+				with self.timeout_context(5):
+					time.sleep(2)
+
 	def test_get_modules_returns_none_for_missing_doctype(self):
 		"""DocTypes from uninstalled apps should resolve to (None, None) instead of raising."""
 		get_modules.cache_clear()
@@ -63,6 +83,42 @@ class TestTestUtils(IntegrationTestCase):
 			any("Definitely Not A Real DocType" in line for line in log_ctx.output),
 			f"Expected warning mentioning the missing doctype, got: {log_ctx.output}",
 		)
+
+
+class TestCompatAssertQueryCount(IntegrationTestCase):
+	"""Cover the `assertQueryCount` copy carried by the deprecated FrappeTestCase.
+
+	`frappe.tests.utils.FrappeTestCase` keeps its own implementation, separate from
+	the one on IntegrationTestCase. Nothing else in-tree exercises it, so a fix
+	applied to one can silently miss the other.
+
+	Deliberately not restricted by db_type: the two copies drift apart on driver
+	details. `last_query` is a plain str only on MariaDB — SQLite hands back a
+	LazyMogrify and Postgres a LazyDecode — so a MariaDB-only test cannot catch a
+	regression here.
+	"""
+
+	def compat_case(self):
+		from frappe.tests.utils import FrappeTestCase
+
+		class _Case(FrappeTestCase):
+			def runTest(self):
+				pass
+
+		return _Case()
+
+	def test_query_under_the_budget_passes(self):
+		with self.compat_case().assertQueryCount(5):
+			frappe.db.sql("select 1")
+
+	def test_going_over_the_budget_reports_the_executed_queries(self):
+		# The failure message is built by joining the collected queries, and it is an
+		# eagerly evaluated argument — so this path runs even when the count fits.
+		with self.assertRaises(AssertionError) as raised:
+			with self.compat_case().assertQueryCount(0):
+				frappe.db.sql("select 1")
+
+		self.assertIn("Queries executed:", str(raised.exception))
 
 
 def tearDownModule():

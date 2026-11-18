@@ -1,15 +1,21 @@
 # Copyright (c) 2018, Frappe Technologies and Contributors
 # License: MIT. See LICENSE
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import frappe
 from frappe.automation.doctype.auto_repeat.auto_repeat import (
 	create_repeated_entries,
+	generate_message_preview,
 	get_auto_repeat_entries,
+	get_auto_repeat_period,
+	update_reference,
 	week_map,
 )
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
 from frappe.tests import IntegrationTestCase
+from frappe.tests.test_model_utils import set_user
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import add_days, add_months, getdate, today
 
 if TYPE_CHECKING:
@@ -183,6 +189,57 @@ class TestAutoRepeat(IntegrationTestCase):
 		docnames = frappe.get_all(doc.reference_doctype, {"auto_repeat": doc.name})
 		self.assertEqual(len(docnames), months)
 
+	def test_auto_repeat_period(self):
+		cases = [
+			# full calendar months
+			("Monthly", "2025-01-01", 1, ("2025-02-01", "2025-02-28")),
+			("Monthly", "2025-01-01", 11, ("2025-12-01", "2025-12-31")),
+			# mid-month
+			("Monthly", "2025-01-15", 1, ("2025-02-15", "2025-03-14")),
+			# month end is clamped and does not drift
+			("Monthly", "2025-01-31", 1, ("2025-02-28", "2025-03-30")),
+			("Monthly", "2025-01-31", 2, ("2025-03-31", "2025-04-29")),
+			("Quarterly", "2025-01-01", 1, ("2025-04-01", "2025-06-30")),
+			("Yearly", "2024-02-29", 1, ("2025-02-28", "2026-02-27")),
+			("Yearly", "2024-02-29", 4, ("2028-02-29", "2029-02-27")),
+			("Weekly", "2025-01-06", 2, ("2025-01-20", "2025-01-26")),
+			("Daily", "2025-01-31", 1, ("2025-02-01", "2025-02-01")),
+		]
+		for frequency, anchor, n, expected in cases:
+			with self.subTest(frequency=frequency, anchor=anchor, n=n):
+				self.assertEqual(
+					get_auto_repeat_period(anchor, frequency, n), tuple(getdate(d) for d in expected)
+				)
+
+	def test_first_generated_document_has_period(self):
+		for fieldname in ("from_date", "to_date"):
+			field = create_custom_field(
+				"ToDo", dict(fieldname=fieldname, label=fieldname, fieldtype="Date", insert_after="date")
+			)
+			self.addCleanup(field.delete)
+
+		with set_user(create_user_without_reference_access()):
+			todo = frappe.get_doc(
+				doctype="ToDo",
+				description="test recurring todo with period",
+				from_date=add_days(today(), -1),
+				to_date=add_days(today(), -1),
+			).insert()
+			doc = frappe.get_doc(
+				doctype="Auto Repeat",
+				reference_doctype="ToDo",
+				reference_document=todo.name,
+				frequency="Daily",
+				start_date=add_days(today(), -1),
+			).insert()
+
+		create_repeated_entries(get_auto_repeat_entries(getdate(today())))
+
+		new_todo = frappe.get_doc("ToDo", {"auto_repeat": doc.name, "name": ("!=", todo.name)})
+		self.assertEqual(getdate(new_todo.from_date), getdate(today()))
+		self.assertEqual(getdate(new_todo.to_date), getdate(today()))
+
+	@requires_test_service(TestService.WEB_SERVER)
 	def test_email_notification(self):
 		todo = frappe.get_doc(
 			doctype="ToDo", description="Test recurring notification attachment", assigned_by="Administrator"
@@ -247,6 +304,181 @@ class TestAutoRepeat(IntegrationTestCase):
 		)
 		self.assertEqual(docnames[0].docstatus, 1)
 
+	def test_reference_document_write_permission_on_create(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		user = create_user_without_reference_access()
+
+		self.assertFalse(frappe.has_permission("ToDo", "write", todo.name, user=user))
+
+		with set_user(user):
+			auto_repeat = frappe.get_doc(
+				doctype="Auto Repeat",
+				reference_doctype="ToDo",
+				reference_document=todo.name,
+				frequency="Daily",
+				start_date=today(),
+			)
+			auto_repeat.validate_reference_doctype()
+			self.assertRaises(frappe.PermissionError, auto_repeat.validate_reference_permission)
+			self.assertRaises(frappe.PermissionError, auto_repeat.insert)
+
+		self.assertFalse(frappe.db.get_value("ToDo", todo.name, "auto_repeat"))
+
+	def test_reference_document_write_permission_on_update(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		user = create_user_without_reference_access()
+		doc = make_auto_repeat(reference_document=todo.name)
+
+		self.assertTrue(frappe.has_permission("Auto Repeat", "write", doc.name, user=user))
+
+		with set_user(user):
+			doc = frappe.get_doc("Auto Repeat", doc.name)
+			doc.append("assignee", {"user": user})
+			self.assertRaises(frappe.PermissionError, doc.save)
+
+		self.assertFalse(frappe.db.exists("Auto Repeat User", {"parent": doc.name}))
+
+	def test_reference_document_write_permission_on_delete(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		user = create_user_without_reference_access()
+		doc = make_auto_repeat(reference_document=todo.name)
+
+		self.assertTrue(frappe.has_permission("Auto Repeat", "delete", doc.name, user=user))
+
+		with set_user(user):
+			self.assertRaises(frappe.PermissionError, frappe.delete_doc, "Auto Repeat", doc.name)
+
+		self.assertTrue(frappe.db.exists("Auto Repeat", doc.name))
+
+	def test_deleted_reference_does_not_stop_the_scheduler(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		owner = "test_auto_repeat_owner@example.com"
+		if not frappe.db.exists("User", owner):
+			frappe.get_doc(
+				doctype="User",
+				email=owner,
+				first_name="Auto Repeat Owner",
+				send_welcome_email=0,
+				roles=[{"role": "System Manager"}],
+			).insert(ignore_permissions=True)
+
+		doc = make_auto_repeat(reference_document=todo.name)
+		frappe.db.set_value("Auto Repeat", doc.name, "owner", owner)
+		doc.reload()
+		frappe.delete_doc("ToDo", todo.name, force=True, ignore_permissions=True)
+
+		doc.create_documents()
+
+		self.assertTrue(frappe.db.get_value("Auto Repeat", doc.name, "disabled"))
+
+	def test_auto_repeat_stays_active_when_owner_loses_reference_access(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		user = create_user_without_reference_access()
+
+		doc = make_auto_repeat(reference_document=todo.name)
+		frappe.db.set_value("Auto Repeat", doc.name, "owner", user)
+		doc.reload()
+
+		doc.create_documents()
+
+		self.assertFalse(frappe.db.exists("ToDo", {"auto_repeat": doc.name, "name": ("!=", todo.name)}))
+		self.assertFalse(frappe.db.get_value("Auto Repeat", doc.name, "disabled"))
+
+	def test_notification_print_renders_as_owner(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		todo = frappe.get_doc(doctype="ToDo", description="Test recurring notification print").insert()
+		frappe.set_user("Administrator")
+		doc = make_auto_repeat(reference_document=todo.name, notify=1, recipients="test@example.com")
+		frappe.db.set_value("Auto Repeat", doc.name, "owner", "test@example.com")
+		doc.reload()
+		rendered_as = []
+
+		def attach_print(*args, **kwargs):
+			rendered_as.append(frappe.session.user)
+			return {"fname": "test.pdf", "fcontent": b"%PDF"}
+
+		with patch("frappe.attach_print", side_effect=attach_print):
+			doc.create_documents()
+
+		self.assertEqual(rendered_as, ["test@example.com"])
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_notification_without_attach_print(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		todo = frappe.get_doc(
+			doctype="ToDo", description="Test recurring notification without print"
+		).insert()
+		doc = make_auto_repeat(reference_document=todo.name, notify=1, recipients="test@example.com")
+		doc.attach_print = 0
+
+		with patch("frappe.automation.doctype.auto_repeat.auto_repeat.make") as make:
+			doc.create_documents()
+
+		email = make.call_args.kwargs
+		self.assertIsNone(email["attachments"])
+		self.assertEqual(
+			email["content"],
+			f"A recurring ToDo {email['name']} has been created for you via Auto Repeat {doc.name}.",
+		)
+
+	def test_message_preview_without_attach_print(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+		todo = frappe.get_doc(doctype="ToDo", description="Test message preview without print").insert()
+		doc = make_auto_repeat(reference_document=todo.name, notify=1, recipients="test@example.com")
+		doc.db_set("attach_print", 0)
+
+		self.assertEqual(
+			generate_message_preview(doc.name)["message"],
+			f"A recurring ToDo {todo.name} has been created for you via Auto Repeat {doc.name}.",
+		)
+
+	def test_attach_print_needs_draft_printing(self):
+		doctype = "Test Submittable DocType"
+		create_submittable_doctype(doctype)
+		submittable_doc = frappe.get_doc(doctype=doctype, test="test attach print").insert()
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("test@example.com")
+
+		with self.change_settings("Print Settings", allow_print_for_draft=0):
+			self.assertRaises(
+				frappe.ValidationError,
+				make_auto_repeat,
+				reference_doctype=doctype,
+				reference_document=submittable_doc.name,
+				notify=1,
+				recipients="test@example.com",
+			)
+
+	def test_reference_document_write_permission_on_update_reference(self):
+		todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", assigned_by="Administrator"
+		).insert()
+		user = create_user_without_reference_access()
+
+		own_todo = frappe.get_doc(
+			doctype="ToDo", description="test reference permission", allocated_to=user, owner=user
+		).insert()
+		doc = make_auto_repeat(reference_document=own_todo.name)
+		frappe.db.set_value("Auto Repeat", doc.name, "owner", user)
+
+		with set_user(user):
+			self.assertRaises(frappe.PermissionError, update_reference, doc.name, todo.name)
+
+		self.assertNotEqual(frappe.db.get_value("Auto Repeat", doc.name, "reference_document"), todo.name)
+
 	def test_auto_repeat_assignee(self):
 		todo = frappe.get_doc(
 			doctype="ToDo", description="test assignee todo", assigned_by="Administrator"
@@ -309,6 +541,15 @@ class TestAutoRepeat(IntegrationTestCase):
 
 		self.assertEqual(new_todo_count, 2)
 
+	def tearDown(self):
+		# every test here commits, so IntegrationTestCase's per-test rollback can't
+		# undo them. The assignee tests assign generated ToDos to Guest, which shares
+		# those ToDos with Guest; left behind, that lets anonymous API reads succeed
+		# in unrelated tests later in the same shard. Drop the committed artifacts.
+		frappe.db.delete("DocShare", {"share_doctype": "ToDo", "user": "Guest"})
+		# the leaked shares were committed, so the cleanup must be committed too
+		frappe.db.commit()  # nosemgrep
+
 
 def make_auto_repeat(**args):
 	args = frappe._dict(args)
@@ -328,6 +569,22 @@ def make_auto_repeat(**args):
 			"repeat_on_days": args.days or [],
 		}
 	).insert(ignore_permissions=True)
+
+
+def create_user_without_reference_access():
+	"""Return a user who can create an Auto Repeat but cannot access another user's ToDo."""
+	email = "test_auto_repeat_reference@example.com"
+	if not frappe.db.exists("User", email):
+		frappe.get_doc(
+			doctype="User",
+			email=email,
+			first_name="Auto Repeat Reference",
+			send_welcome_email=0,
+			roles=[{"role": "Accounts User"}],
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=email)
+
+	return email
 
 
 def create_submittable_doctype(doctype, submit_perms=1):

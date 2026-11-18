@@ -205,17 +205,16 @@ $.extend(frappe.meta, {
 
 	get_label: function (dt, fn, dn) {
 		var standard = {
-			name: __("ID"),
-			creation: __("Created On"),
-			docstatus: __("Document Status"),
-			idx: __("Index"),
-			modified: __("Last Updated On"),
-			modified_by: __("Last Updated By"),
-			owner: __("Created By"),
-			_user_tags: __("Tags"),
-			_liked_by: __("Liked By"),
-			_comments: __("Comments"),
-			_assign: __("Assigned To"),
+			name: "ID",
+			creation: "Created On",
+			docstatus: "Document Status",
+			idx: "Index",
+			modified: "Last Updated On",
+			modified_by: "Last Updated By",
+			owner: "Created By",
+			_user_tags: "Tags",
+			_liked_by: "Liked By",
+			_assign: "Assigned To",
 		};
 		if (standard[fn]) {
 			return standard[fn];
@@ -223,6 +222,10 @@ $.extend(frappe.meta, {
 			var df = this.get_docfield(dt, fn, dn);
 			return (df ? df.label : "") || fn;
 		}
+	},
+
+	get_translated_label: function (dt, fn, dn) {
+		return __(frappe.meta.get_label(dt, fn, dn), null, dt);
 	},
 
 	get_print_sizes: function () {
@@ -261,6 +264,16 @@ $.extend(frappe.meta, {
 		];
 	},
 
+	get_restricted_print_formats: function (doctype) {
+		return frappe
+			.get_list(":Print Format", { doc_type: doctype })
+			.filter((d) => {
+				const roles = d.__roles || (d.roles || []).map((r) => r.role);
+				return roles.length && !frappe.user.has_role(roles);
+			})
+			.map((d) => d.name);
+	},
+
 	get_print_formats: function (doctype) {
 		var print_format_list = ["Standard"];
 		var default_print_format = locals.DocType[doctype].default_print_format;
@@ -268,8 +281,9 @@ $.extend(frappe.meta, {
 			":Print Settings",
 			"Print Settings"
 		).enable_raw_printing;
+		const restricted = frappe.meta.get_restricted_print_formats(doctype);
 		var print_formats = frappe
-			.get_list("Print Format", { doc_type: doctype })
+			.get_list(":Print Format", { doc_type: doctype })
 			.sort(function (a, b) {
 				return a > b ? 1 : -1;
 			});
@@ -277,13 +291,19 @@ $.extend(frappe.meta, {
 			if (
 				!print_format_list.includes(d.name) &&
 				d.print_format_type !== "JS" &&
-				(cint(enable_raw_printing) || !d.raw_printing)
+				d.print_format_for !== "Report" &&
+				(cint(enable_raw_printing) || !d.raw_printing) &&
+				!restricted.includes(d.name)
 			) {
 				print_format_list.push(d.name);
 			}
 		});
 
-		if (default_print_format && default_print_format != "Standard") {
+		if (
+			default_print_format &&
+			default_print_format != "Standard" &&
+			!restricted.includes(default_print_format)
+		) {
 			var index = print_format_list.indexOf(default_print_format);
 			print_format_list.splice(index, 1).sort();
 			print_format_list.unshift(default_print_format);
@@ -330,8 +350,14 @@ $.extend(frappe.meta, {
 		if (df && df.precision) {
 			precision = cint(df.precision);
 		} else if (df && df.fieldtype === "Currency") {
-			precision = cint(frappe.defaults.get_default("currency_precision"));
-			if (!precision) {
+			var currency_precision = frappe.defaults.get_default("currency_precision");
+			if (
+				currency_precision !== null &&
+				currency_precision !== undefined &&
+				currency_precision !== ""
+			) {
+				precision = cint(currency_precision);
+			} else {
 				var currency = frappe.meta.get_field_currency(df, doc);
 				var number_format = get_number_format(currency);
 				var number_format_info = get_number_format_info(number_format);

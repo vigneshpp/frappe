@@ -1,4 +1,4 @@
-import Awesomplete from "awesomplete";
+import Awesomplete from "../../ui/awesomplete";
 
 frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui.form.ControlData {
 	static trigger_change_on_input_event = false;
@@ -6,6 +6,14 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 		super.make_input();
 		this.setup_awesomplete();
 		this.set_options();
+	}
+
+	bind_change_event() {
+		// Firefox fires change when the window loses focus
+		this.$input.on("change", (e) => {
+			if (e.originalEvent && !document.hasFocus()) e.stopImmediatePropagation();
+		});
+		super.bind_change_event();
 	}
 
 	set_options() {
@@ -32,7 +40,9 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 	get_input_value() {
 		if (this.$input) {
 			const label = this.$input.val();
-			const item = this._data?.find((i) => i.label == label);
+			const item =
+				this._data?.find((i) => i.value == this.value && i.label == label) ||
+				this._data?.find((i) => i.label == label);
 			return item ? item.value : label;
 		}
 	}
@@ -40,7 +50,7 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 	get_awesomplete_settings() {
 		var me = this;
 		return {
-			tabSelect: true,
+			tabSelect: false,
 			minChars: 0,
 			maxItems: this.df.max_items || 99,
 			autoFirst: true,
@@ -110,6 +120,8 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 		});
 
 		this.$input.on("blur", () => {
+			if (document.activeElement === this.input) return;
+
 			if (this.selected) {
 				this.selected = false;
 				return;
@@ -161,7 +173,7 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 
 		options = options.map((o) => {
 			if (typeof o !== "string") {
-				o.label = __(cstr(o.label));
+				o.label = __(cstr(o.label)) || cstr(o.value);
 				o.value = cstr(o.value);
 			}
 			return o;
@@ -209,7 +221,12 @@ frappe.ui.form.ControlAutocomplete = class ControlAutoComplete extends frappe.ui
 			args.query = get_query;
 		} else {
 			// get_query by function
-			var q = get_query((this.frm && this.frm.doc) || this.doc, this.doctype, this.docname);
+			var q = get_query(
+				(this.frm && this.frm.doc) || this.doc,
+				this.doctype,
+				this.docname,
+				this.frm
+			);
 
 			if (typeof q === "string") {
 				// returns a string

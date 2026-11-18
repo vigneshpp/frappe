@@ -141,7 +141,7 @@ function get_version_timeline_content(version_doc, frm) {
 				var df =
 					frm.fields_dict[row[0]] &&
 					frappe.meta.get_docfield(
-						frm.fields_dict[row[0]].grid.doctype,
+						frm.fields_dict[row[0]].df.options,
 						p[0],
 						frm.docname
 					);
@@ -160,11 +160,9 @@ function get_version_timeline_content(version_doc, frm) {
 					) {
 						parts.push(
 							__("{0} from {1} to {2} in row #{3}", [
-								__(
-									frappe.meta.get_label(
-										frm.fields_dict[row[0]].grid.doctype,
-										p[0]
-									)
+								frappe.meta.get_translated_label(
+									frm.fields_dict[row[0]].df.options,
+									p[0]
 								),
 								format_content_for_timeline(p[1]),
 								format_content_for_timeline(p[2]),
@@ -223,7 +221,7 @@ function get_version_timeline_content(version_doc, frm) {
 						field_display_status === "Write" ||
 						(df.hidden && df.show_on_timeline)
 					) {
-						return __(frappe.meta.get_label(frm.doctype, p[0]));
+						return frappe.meta.get_translated_label(frm.doctype, p[0]);
 					}
 				}
 			});
@@ -350,7 +348,20 @@ function get_version_timeline_content(version_doc, frm) {
 			)
 		);
 		out.push(get_version_comment(version_doc, message));
+	} else if (data.created_by && data.agent) {
+		let message = get_user_message(
+			version_doc.owner,
+			__("You created this document", null, "Form timeline"),
+			__("{0} created this document", [get_user_link(version_doc.owner)], "Form timeline")
+		);
+		out.push(get_version_comment(version_doc, message));
 	}
+
+	if (data.agent) {
+		const agent_msg = get_agent_message(data.agent);
+		out = out.map((message) => `${message} · ${agent_msg}`);
+	}
+
 	const impersonated_by = data.impersonated_by;
 
 	if (impersonated_by) {
@@ -364,6 +375,22 @@ function get_version_timeline_content(version_doc, frm) {
 		out = out.map((message) => `${message} · ${audit_msg.bold()}`);
 	}
 	return out;
+}
+
+function get_agent_message(agent) {
+	const message = __("using {0} via {1}", [
+		frappe.utils.escape_html(agent.name),
+		frappe.utils.escape_html(agent.via),
+	]);
+	if (agent.reference_doctype && agent.reference_name) {
+		return frappe.utils.get_form_link(
+			agent.reference_doctype,
+			agent.reference_name,
+			true,
+			message
+		);
+	}
+	return message;
 }
 
 function get_version_comment(version_doc, text) {

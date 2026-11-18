@@ -6,6 +6,9 @@ frappe.ui.form.on("Installed Applications", {
 		frm.add_custom_button(__("Update Hooks Resolution Order"), () => {
 			frm.trigger("show_update_order_dialog");
 		});
+		frm.add_custom_button(__("Generate SBOM"), () => {
+			frappe.call({ method: "frappe.utils.sbom.generate_sbom", freeze: true });
+		});
 	},
 
 	show_update_order_dialog() {
@@ -31,8 +34,8 @@ frappe.ui.form.on("Installed Applications", {
 					],
 				},
 			],
-			primary_action: function () {
-				const new_order = this.get_values()["apps"].map((row) => row.app_name);
+			primary_action: function (values) {
+				const new_order = values["apps"].map((row) => row.app_name);
 				frappe.call({
 					method: "frappe.core.doctype.installed_applications.installed_applications.update_installed_apps_order",
 					freeze: true,
@@ -63,5 +66,42 @@ frappe.ui.form.on("Installed Applications", {
 					grid.find(".grid-row-check").replaceWith(frappe.utils.icon("menu"));
 				dialog.show();
 			});
+	},
+});
+
+frappe.ui.form.on("Installed Application", {
+	disable_application(frm, cdt, cdn) {
+		let row = locals[cdt][cdn];
+		frappe.confirm(
+			__("Disable <b>{0}</b> on this site? It keeps its data, but stops taking effect.", [
+				row.app_name,
+			]),
+			() => {
+				frappe.call({
+					method: "frappe.core.doctype.installed_applications.installed_applications.set_app_state",
+					freeze: true,
+					args: { app_name: row.app_name, disabled: 1 },
+					callback() {
+						frappe.toast(__("{0} has been disabled", [row.app_name]));
+						frm.reload_doc();
+					},
+				});
+			}
+		);
+	},
+
+	enable_application(frm, cdt, cdn) {
+		let row = locals[cdt][cdn];
+		frappe.confirm(__("Enable <b>{0}</b> on this site again?", [row.app_name]), () => {
+			frappe.call({
+				method: "frappe.core.doctype.installed_applications.installed_applications.set_app_state",
+				freeze: true,
+				args: { app_name: row.app_name, disabled: 0 },
+				callback() {
+					frappe.toast(__("{0} has been enabled", [row.app_name]));
+					frm.reload_doc();
+				},
+			});
+		});
 	},
 });

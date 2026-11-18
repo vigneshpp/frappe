@@ -7,7 +7,7 @@ import datetime
 import json
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from functools import cached_property, lru_cache
 
 import sqlparse
@@ -15,18 +15,24 @@ from sqlparse import tokens
 from sqlparse.sql import Function, Parenthesis, Statement
 
 import frappe
-import frappe.defaults
 import frappe.permissions
 import frappe.share
 from frappe import _
 from frappe.core.doctype.server_script.server_script_utils import get_server_script_map
-from frappe.database.utils import DefaultOrderBy, FallBackDateTimeStr, NestedSetHierarchy
+from frappe.database.utils import (
+	DefaultOrderBy,
+	FallBackDateTimeStr,
+	NestedSetHierarchy,
+	get_doctype_name,
+	is_non_text_field,
+	is_order_by_in_select,
+	unquote_identifier,
+)
 from frappe.model import OPTIONAL_FIELDS, get_permitted_fields
 from frappe.model.meta import get_table_columns
 from frappe.model.utils import is_virtual_doctype
-from frappe.model.utils.mask import mask_field_value
 from frappe.model.utils.user_settings import get_user_settings, update_user_settings
-from frappe.query_builder.utils import Column
+from frappe.query_builder.utils import Column, render_criterion
 from frappe.types import Filters, FilterSignature, FilterTuple
 from frappe.utils import (
 	cint,
@@ -36,7 +42,9 @@ from frappe.utils import (
 	get_time,
 	get_timespan_date_range,
 )
-from frappe.utils.data import DateTimeLikeObject, get_datetime, getdate, sbool
+from frappe.utils.data import convert_type_for_between_filters, sbool
+
+_convert_type_for_between_filters = convert_type_for_between_filters  # bw compatibility
 
 
 @lru_cache(maxsize=128)
@@ -59,6 +67,7 @@ LOCATE_CAST_PATTERN = re.compile(r"locate\(([^,]+),\s*([`\"]?name[`\"]?)\s*\)", 
 FUNC_IFNULL_PATTERN = re.compile(r"(strpos|ifnull|coalesce)\(\s*[`\"]?name[`\"]?\s*,", flags=re.IGNORECASE)
 CAST_VARCHAR_PATTERN = re.compile(r"([`\"]?tab[\w`\" -]+\.[`\"]?name[`\"]?)(?!\w)", flags=re.IGNORECASE)
 ORDER_BY_PATTERN = re.compile(r"\ order\ by\ |\ asc|\ ASC|\ desc|\ DESC", flags=re.IGNORECASE)
+QUALIFIED_COLUMN_PATTERN = re.compile(r"tab[\w -]+\.\w+")
 SUB_QUERY_PATTERN = re.compile("^.*[,();@].*", flags=re.DOTALL)
 IS_QUERY_PATTERN = re.compile(r"^(select|delete|update|drop|create)\s")
 IS_QUERY_PREDICATE_PATTERN = re.compile(r"\s*[0-9a-zA-z]*\s*( from | group by | order by | where | join )")
@@ -81,6 +90,10 @@ class DatabaseQuery:
 		self.conditions = []
 		self.or_conditions = []
 		self.fields = None
+		self.join = "left join"
+		self.order_by = None
+		self.group_by = None
+		self.with_childnames = False
 		self.user = user or frappe.session.user
 		self.ignore_ifnull = False
 		self.flags = frappe._dict()
@@ -205,7 +218,7 @@ class DatabaseQuery:
 			self.user_settings = json.loads(user_settings)
 
 		if is_virtual_doctype(self.doctype):
-			from frappe.model.base_document import get_controller
+			from frappe.model.document import get_controller
 
 			controller = get_controller(self.doctype)
 			if not hasattr(controller, "get_list"):
@@ -220,8 +233,11 @@ class DatabaseQuery:
 				"pluck": pluck,
 				"parent_doctype": parent_doctype,
 			} | self.__dict__
+			if self.order_by == DefaultOrderBy:
+				del kwargs["order_by"]
 			return frappe.call(controller.get_list, args=kwargs, **kwargs)
 
+		self.with_comment_count = sbool(with_comment_count) and not as_list and bool(self.doctype)
 		self.columns = self.get_table_columns()
 
 		# no table & ignore_ddl, return
@@ -230,7 +246,7 @@ class DatabaseQuery:
 
 		result = self.build_and_run()
 
-		if sbool(with_comment_count) and not as_list and self.doctype:
+		if self.with_comment_count:
 			self.add_comment_count(result)
 
 		if save_user_settings:
@@ -240,7 +256,7 @@ class DatabaseQuery:
 		if pluck:
 			return [d[pluck] for d in result]
 
-		if self.doctype and result:
+		if self.doctype and result and not self.flags.ignore_permissions:
 			result = self.mask_fields(result)
 
 		return result
@@ -259,7 +275,7 @@ class DatabaseQuery:
 			for idx, field in enumerate(self.fields):
 				# handle aliases (e.g. `tabSI`.`posting_date` as posting_date)
 				if " as " in field.lower():
-					alias = field.split(" as ")[1].strip(" '")
+					alias = re.split(r"\s+as\s+", field, flags=re.IGNORECASE)[1].strip(" '`")
 					field_index_map[alias] = idx
 				else:
 					# extract last part after `.`
@@ -275,7 +291,38 @@ class DatabaseQuery:
 
 		meta = self.get_meta(self.doctype)
 
-		return meta.get_masked_fields()
+		return meta.get_masked_fields(parenttype=self.parent_doctype) + self.get_masked_joined_fields()
+
+	def get_masked_joined_fields(self):
+		"""Get masked fields of the doctypes joined in through dot notation (`items.rate`)."""
+		from frappe.database.query import CORE_DOCTYPES
+		from frappe.desk.reportview import extract_fieldnames
+		from frappe.model.utils.mask import as_aliased_field
+
+		masked_fields = []
+		lookups = {}
+
+		for field in self.fields or []:
+			columns = extract_fieldnames(field)
+			if not columns or "." not in columns[0]:
+				continue
+
+			table, fieldname = columns[0].split(".", 1)
+			doctype = self.linked_table_aliases.get(table, table).replace("`", "").removeprefix("tab")
+
+			if doctype == self.doctype or doctype in CORE_DOCTYPES:
+				continue
+
+			if doctype not in lookups:
+				meta = self.get_meta(doctype)
+				parenttype = self.doctype if meta.istable else None
+				lookups[doctype] = {df.fieldname: df for df in meta.get_masked_fields(parenttype=parenttype)}
+
+			if df := lookups[doctype].get(fieldname):
+				alias = field.split(" as ")[1].strip(" '`") if " as " in field.lower() else None
+				masked_fields.append(as_aliased_field(df, alias))
+
+		return masked_fields
 
 	def build_and_run(self):
 		args = self.prepare_args()
@@ -290,7 +337,7 @@ class DatabaseQuery:
 
 		if self.distinct:
 			args.fields = "distinct " + args.fields
-			if frappe.db.db_type == "postgres":
+			if frappe.db.db_type == "postgres" and not self._can_apply_distinct_order_by(args.order_by):
 				# PostgreSQL requires ORDER BY expressions to appear in SELECT list when using DISTINCT
 				args.order_by = ""
 
@@ -322,25 +369,34 @@ from {tables}
 		self.set_optional_columns()
 		self.build_conditions()
 		self.apply_fieldlevel_read_permissions()
+		# read now: table prefixes and postgres casts below rewrite the fields
+		self.has_own_name = self.selects_own_name()
+		if self.with_comment_count and self.distinct and not self.has_own_name:
+			# a distinct row without the document's name can stand for several documents
+			self.with_comment_count = False
+		# selected after the permission check: never user-requestable, popped in add_comment_count
+		if self.with_comment_count and not self.group_by and "_comments" in self.columns:
+			self.fields.append(f"`tab{self.doctype}`.`_comments`")
 
 		args = frappe._dict()
 
 		if self.with_childnames:
 			for t in self.tables:
 				if t != f"`tab{self.doctype}`":
-					self.fields.append(f"{t}.name as '{t[4:-1]}:name'")
+					self.fields.append(f"{t}.name as `{t[4:-1]}:name`")
 
 		# query dict
+		assert self.tables, "extract_tables must have populated at least the primary table"
 		args.tables = self.tables[0]
 
 		# left join parent, child tables
 		for child in self.tables[1:]:
-			parent_name = cast_name(f"{self.tables[0]}.name")
-			args.tables += f" {self.join} {child} on ({child}.parenttype = {frappe.db.escape(self.doctype)} and {child}.parent = {parent_name})"
+			args.tables += f" {self.join} {child} on ({self._child_join_condition(child)})"
 
 		# left join link tables
 		for link in self.link_tables:
-			args.tables += f" {self.join} {link.table_name} {link.table_alias} on ({link.table_alias}.`name` = {self.tables[0]}.`{link.fieldname}`)"
+			link_name = cast_name(f"{link.table_alias}.`name`")
+			args.tables += f" {self.join} {link.table_name} {link.table_alias} on ({link_name} = {self.tables[0]}.`{link.fieldname}`)"
 
 		if self.grouped_or_conditions:
 			self.conditions.append(f"({' or '.join(self.grouped_or_conditions)})")
@@ -384,22 +440,71 @@ from {tables}
 		args.order_by = (args.order_by and (" order by " + args.order_by)) or ""
 
 		self.validate_order_by_and_group_by(self.group_by)
-		args.group_by = (self.group_by and (" group by " + self.group_by)) or ""
+		args.group_by = (self.group_by and (" group by " + self._group_by_with_link_table_pks())) or ""
 
 		return args
+
+	def _is_dedup_group_by(self) -> bool:
+		if not self.group_by:
+			return False
+		group_by = self.group_by.replace("`", "").replace('"', "").strip()
+		return group_by in (f"tab{self.doctype}.name", "name")
+
+	def _group_by_with_link_table_pks(self) -> str:
+		"""When a dedup group by survives (e.g. a child table stays joined), the
+		selected columns of 1:1 joined link tables are not functionally dependent
+		on the parent primary key for postgres; grouping additionally by each link
+		table's primary key covers them without changing partitions."""
+		if not (self.link_tables and frappe.db.db_type == "postgres" and self._is_dedup_group_by()):
+			return self.group_by
+		return ", ".join([self.group_by, *(f"{link.table_alias}.`name`" for link in self.link_tables)])
 
 	def prepare_select_args(self, args):
 		order_field = ORDER_BY_PATTERN.sub("", args.order_by)
 
 		if order_field not in args.fields:
-			extracted_column = order_column = order_field.replace("`", "")
-			if "." in extracted_column:
-				extracted_column = extracted_column.split(".")[1]
-
-			args.fields += f", MAX({extracted_column}) as `{order_column}`"
+			order_column = order_field.replace("`", "")
+			max_argument = order_field
+			if QUALIFIED_COLUMN_PATTERN.fullmatch(order_column):
+				table, column = order_column.split(".")
+				max_argument = f"`{table}`.`{column}`"
+			args.fields += f", MAX({max_argument}) as `{order_column}`"
 			args.order_by = args.order_by.replace(order_field, f"`{order_column}`")
 
 		return args
+
+	def _can_apply_distinct_order_by(self, order_by: str) -> bool:
+		if not order_by:
+			return True
+
+		selected_fields = set()
+		has_joins = len(self.tables) > 1 or bool(self.link_tables)
+		for field in self.fields:
+			if field is None:
+				continue
+			field, *alias = re.split(r"\s+as\s+", field, maxsplit=1, flags=re.IGNORECASE)
+			field = unquote_identifier(field)
+			if field == "*" or field.endswith(".*"):
+				selected_fields.update(self._get_star_columns(field))
+			elif "(" not in field:
+				selected_fields.add(field)
+				# An unqualified sort can use the output name, but an alias replaces that name.
+				if not alias or not has_joins:
+					selected_fields.add(field.rsplit(".", 1)[-1])
+				if "." not in field:
+					selected_fields.add(f"tab{self.doctype}.{field}")
+			if alias:
+				selected_fields.add(unquote_identifier(alias[0]))
+
+		return is_order_by_in_select(order_by, selected_fields, len(self.fields))
+
+	def _get_star_columns(self, field: str) -> set[str]:
+		doctype = self.doctype if field == "*" else get_doctype_name(field[:-2])
+		columns = set()
+		for column in get_table_columns(doctype):
+			columns.add(column)
+			columns.add(f"tab{doctype}.{column}")
+		return columns
 
 	def parse_args(self):
 		"""Convert fields and filters from strings to list, dicts."""
@@ -676,6 +781,10 @@ from {tables}
 			if match_conditions:
 				self.conditions.append(f"({match_conditions})")
 
+	def _child_join_condition(self, child_table: str) -> str:
+		parent_name = cast_name(f"`tab{self.doctype}`.name")
+		return f"{child_table}.parenttype = {frappe.db.escape(self.doctype)} and {child_table}.parent = {parent_name}"
+
 	def build_filter_conditions(self, filters: Filters, conditions: list, ignore_permissions=None):
 		"""build conditions from user filters"""
 		if ignore_permissions is not None:
@@ -815,6 +924,20 @@ from {tables}
 		meta = self.get_meta(f.doctype)
 		df = meta.get("fields", {"fieldname": f.fieldname})
 		df = df[0] if df else None
+		if (
+			frappe.db.db_type == "postgres"
+			and f.operator.lower() in ("like", "not like")
+			and is_non_text_field(f.doctype, f.fieldname, df)
+			and "cast(" not in column_name.lower()
+		):
+			column_name = f"cast({column_name} as varchar)"
+
+		# _assign and _liked_by store a JSON array of user ids, so `=`/`!=` never match a
+		# single member; treat them as `like`/`not like` against the serialized value.
+		if f.fieldname in ("_assign", "_liked_by") and f.operator in ("=", "!="):
+			f.operator = "like" if f.operator == "=" else "not like"
+			if isinstance(f.value, str) and f.value:
+				f.value = f"%{f.value}%"
 
 		# primary key is never nullable, modified is usually indexed by default and always present
 		can_be_null = f.fieldname not in ("name", "modified", "creation")
@@ -1169,6 +1292,11 @@ from {tables}
 		condition_methods = hooks.get(self.doctype, []) + hooks.get("*", [])
 		for method in condition_methods:
 			if c := frappe.call(frappe.get_attr(method), self.user, doctype=self.doctype):
+				# Hooks may return a raw SQL string or a pypika term. This path builds a
+				# string WHERE clause, so render any term to namespaced SQL using the
+				# active dialect's identifier quote char.
+				if not isinstance(c, str):
+					c = self._render_permission_criterion(c)
 				conditions.append(c)
 
 		active_child_tables = []
@@ -1188,8 +1316,12 @@ from {tables}
 
 		return " and ".join(conditions) if conditions else ""
 
+	def _render_permission_criterion(self, criterion) -> str:
+		"""Render a pypika permission criterion to a namespaced SQL string."""
+		return f"({render_criterion(criterion)})"
+
 	def set_order_by(self, args):
-		if self.order_by and self.order_by != "KEEP_DEFAULT_ORDERING":
+		if self.order_by and self.order_by != DefaultOrderBy:
 			args.order_by = self.order_by
 		else:
 			args.order_by = ""
@@ -1292,13 +1424,21 @@ from {tables}
 
 	def add_comment_count(self, result):
 		for r in result:
-			if not r.name:
+			comments = r.pop("_comments", None)
+			# the own name under any alias, like `name as id`, makes every row one document
+			if not (self.has_own_name or r.name):
 				continue
 
-			r._comment_count = 0
-			if "_comments" in r and r._comments:
-				# perf: Avoid parsing _comments, they can be huge and this is just a "UX feature"
-				r._comment_count = r._comments.count('"comment"')
+			# perf: Avoid parsing _comments, this is just a "UX feature"
+			r._comment_count = comments.count('"name"') if comments else 0
+
+	def selects_own_name(self) -> bool:
+		"""Distinct rows stay one per document only when they carry the document's own name."""
+		table = f"`tab{self.doctype}`"
+		own = {"*", "name", "`name`", f"{table}.*", f"{table}.`name`", f"{table}.name"}
+		return any(
+			re.split(r"\s+as\s+", f, maxsplit=1, flags=re.IGNORECASE)[0].strip() in own for f in self.fields
+		)
 
 	def update_user_settings(self):
 		# update user settings if new search
@@ -1407,8 +1547,8 @@ def get_between_date_filter(value, df=None):
 
 	# if filter value is date but fieldtype is datetime:
 	if fieldtype == "Datetime":
-		from_date = _convert_type_for_between_filters(from_date, set_time=datetime.time())
-		to_date = _convert_type_for_between_filters(to_date, set_time=datetime.time(23, 59, 59, 999999))
+		from_date = convert_type_for_between_filters(from_date, set_time=datetime.time())
+		to_date = convert_type_for_between_filters(to_date, set_time=datetime.time(23, 59, 59, 999999))
 
 	# If filter value is already datetime, do nothing.
 	if fieldtype == "Datetime":
@@ -1417,23 +1557,6 @@ def get_between_date_filter(value, df=None):
 		cond = f"'{frappe.db.format_date(from_date)}' AND '{frappe.db.format_date(to_date)}'"
 
 	return cond
-
-
-def _convert_type_for_between_filters(
-	value: DateTimeLikeObject, set_time: datetime.time
-) -> datetime.datetime:
-	if isinstance(value, str):
-		if " " in value.strip():
-			value = get_datetime(value)
-		else:
-			value = getdate(value)
-
-	if isinstance(value, datetime.datetime):
-		return value
-	elif isinstance(value, datetime.date):
-		return datetime.datetime.combine(value, set_time)
-
-	return value
 
 
 def get_additional_filter_field(additional_filters_config, f, value):

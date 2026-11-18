@@ -48,11 +48,14 @@ class NamingSeries:
 	__slots__ = ("series",)
 
 	def __init__(self, series: str):
+		assert isinstance(series, str), "naming series key must be a string"
 		self.series = series
 
 		# Add default number part if missing
 		if "#" not in self.series:
 			self.series += ".#####"
+
+		assert "#" in self.series, "naming series must contain a number placeholder after normalization"
 
 	def validate(self):
 		if "." not in self.series:
@@ -84,7 +87,7 @@ class NamingSeries:
 		parts = self.series.split(".")
 		return parse_naming_series(parts, doc=doc)
 
-	def get_prefix(self) -> str:
+	def get_prefix(self, doc: "Document | None" = None) -> str:
 		"""Naming series stores prefix to maintain a counter in DB. This prefix can be used to update counter or validations.
 
 		e.g. `SINV-.YY.-.####` has prefix of `SINV-22-` in database for year 2022.
@@ -101,7 +104,7 @@ class NamingSeries:
 		# sends prefix + digits to DB to find next number.
 		# Instead of reimplementing the whole parsing logic in multiple places we
 		# can just ask this function to give us the prefix.
-		parse_naming_series(self.series, number_generator=fake_counter_backend)
+		parse_naming_series(self.series, doc=doc, number_generator=fake_counter_backend)
 
 		if prefix is None:
 			frappe.throw(_("Invalid Naming Series: {}").format(self.series))
@@ -122,10 +125,10 @@ class NamingSeries:
 			generated_names.append(parse_naming_series(self.series, doc=doc, number_generator=fake_counter))
 		return generated_names
 
-	def update_counter(self, new_count: int) -> None:
+	def update_counter(self, new_count: int, doc: "Document | None" = None) -> None:
 		"""Warning: Incorrectly updating series can result in unusable transactions"""
 		Series = frappe.qb.DocType("Series")
-		prefix = self.get_prefix()
+		prefix = self.get_prefix(doc)
 
 		# Initialize if not present in DB
 		if frappe.db.get_value("Series", prefix, "name", order_by="name") is None:
@@ -133,8 +136,8 @@ class NamingSeries:
 
 		(frappe.qb.update(Series).set(Series.current, cint(new_count)).where(Series.name == prefix)).run()
 
-	def get_current_value(self) -> int:
-		prefix = self.get_prefix()
+	def get_current_value(self, doc: "Document | None" = None) -> int:
+		prefix = self.get_prefix(doc)
 		return cint(frappe.db.get_value("Series", prefix, "current", order_by="name", for_update=True))
 
 
@@ -221,7 +224,7 @@ def set_name_from_naming_options(autoname, doc):
 		# notify
 		if not doc.name:
 			fieldname = autoname[6:]
-			frappe.throw(_("{0} is required").format(doc.meta.get_label(fieldname)))
+			frappe.throw(_("{0} is required").format(doc.meta.get_translated_label(fieldname)))
 
 	elif _autoname.startswith("naming_series:"):
 		set_name_by_naming_series(doc)
@@ -252,7 +255,7 @@ def set_naming_from_document_naming_rule(doc):
 	"""
 	Evaluate rules based on "Document Naming Series" doctype
 	"""
-	from frappe.model.base_document import DOCTYPES_FOR_DOCTYPE
+	from frappe.model.document import DOCTYPES_FOR_DOCTYPE
 
 	IGNORED_DOCTYPES = {*log_types, *DOCTYPES_FOR_DOCTYPE, "DefaultValue", "Patch Log"}
 
@@ -302,7 +305,8 @@ def make_autoname(key="", doctype="", doc="", *, ignore_validate=False):
 	                DE/09/01/00001 where 09 is the year, 01 is the month and 00001 is the series
 	"""
 	if key == "hash":
-		return (_get_timestamp_prefix() + _generate_random_string(7))[:10]
+		hashed_name = (_get_timestamp_prefix() + _generate_random_string(7))[:10]
+		return hashed_name
 
 	series = NamingSeries(key)
 	return series.generate_next_name(doc, ignore_validate=ignore_validate)
@@ -319,6 +323,7 @@ def _get_timestamp_prefix():
 	# guarantees.
 	request_part = (get_trace_id() or "")[-1:]
 
+	assert len(ts_part) == 3, "timestamp part of hash prefix must be exactly 3 chars"
 	return request_part + ts_part
 
 
@@ -421,6 +426,15 @@ def determine_consecutive_week_number(datetime):
 
 
 def getseries(key, digits):
+	if frappe.db.db_type == "sqlite":
+		current = frappe.db.sql(
+			"""INSERT INTO `tabSeries` (`name`, `current`) VALUES (%s, 1)
+			ON CONFLICT (`name`) DO UPDATE SET `current` = `current` + 1
+			RETURNING `current`""",
+			(key,),
+		)[0][0]
+		return ("%0" + str(digits) + "d") % current
+
 	# series created ?
 	# Using frappe.qb as frappe.get_values does not allow order_by=None
 	series = DocType("Series")
@@ -476,9 +490,16 @@ def revert_series_if_last(key, name, doc=None):
 		prefix = key
 
 	if "." in prefix:
-		prefix = parse_naming_series(prefix.split("."), doc=doc)
-
-	count = cint(name.replace(prefix, ""))
+		# Prefix has placeholders (e.g. date parts .YYYY./.MM./.DD.). Resolving them against
+		# the current date breaks reverts when a document is deleted on a different day than
+		# it was created. The resolved prefix length is date-independent (YYYY is always 4
+		# chars, MM 2, etc.), so resolve only to learn the length, then slice the prefix and
+		# counter from the document's own name.
+		boundary = len(parse_naming_series(prefix.split("."), doc=doc))
+		count = cint(name[boundary:])
+		prefix = name[:boundary]
+	else:
+		count = cint(name.replace(prefix, ""))
 	series = DocType("Series")
 	current = (frappe.qb.from_(series).where(series.name == prefix).for_update().select("current")).run()
 

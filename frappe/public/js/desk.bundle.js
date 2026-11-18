@@ -7,6 +7,34 @@ import "./frappe/format.js";
 import "./frappe/form/formatters.js";
 import "./frappe/dom.js";
 import "./frappe/ui/messages.js";
+
+import "./frappe/ui/components/button.js";
+import "./frappe/ui/components/badge.js";
+import "./frappe/ui/components/skeleton.js";
+import "./frappe/ui/components/divider.js";
+import "./frappe/ui/components/avatar.js";
+import "./frappe/ui/components/avatar_group.js";
+import "./frappe/ui/components/alert.js";
+import "./frappe/ui/components/breadcrumbs.js";
+import "./frappe/ui/components/toast.js";
+import "./frappe/ui/components/dropdown.js";
+import "./frappe/ui/components/segmented_button.js";
+import "./frappe/ui/components/context_menu.js";
+import "./frappe/ui/components/tooltip.js";
+import "./frappe/ui/components/popover.js";
+import "./frappe/ui/components/combobox.js";
+import "./frappe/ui/components/multi_combobox.js";
+import "./frappe/ui/components/hover_card.js";
+import "./frappe/ui/components/tabs.js";
+import "./frappe/ui/components/tab_buttons.js";
+import "./frappe/ui/components/progress.js";
+import "./frappe/ui/components/stepper.js";
+import "./frappe/ui/components/empty_state.js";
+import "./frappe/ui/components/panel_header.js";
+import "./frappe/ui/sidebar/sidebar_panel.js";
+import "./frappe/ui/mobile_nav_loader.js";
+
+import "./frappe/ui/background_tasks/background_tasks.js";
 import "./frappe/ui/keyboard.js";
 import "./frappe/ui/colors.js";
 import "./frappe/ui/sidebar/sidebar_header.js";
@@ -14,8 +42,8 @@ import "./frappe/ui/sidebar/sidebar_header.html";
 import "./frappe/ui/sidebar/sidebar.html";
 import "./frappe/ui/sidebar/sidebar_item.html";
 import "./frappe/ui/sidebar/sidebar.js";
-import "./frappe/ui/sidebar/sidebar_card.html";
-import "./frappe/ui/sidebar/sidebar_card.js";
+import "./frappe/ui/sidebar/card.html";
+import "./frappe/ui/sidebar/card.js";
 import "./frappe/ui/link_preview.js";
 
 import "./frappe/request.js";
@@ -26,12 +54,15 @@ import "./frappe/event_emitter.js";
 import "./frappe/router.js";
 import "./frappe/router_history.js";
 import "./frappe/defaults.js";
+import "./frappe/flow.js";
 import "./frappe/roles_editor.js";
 import "./frappe/module_editor.js";
 import "./frappe/microtemplate.js";
 
+import "./frappe/ui/site_banners.js";
 import "./frappe/ui/page.html";
 import "./frappe/ui/page.js";
+import "./frappe/ui/print_preview_bar.js";
 import "./frappe/ui/slides.js";
 import "./frappe/ui/find.js";
 import "./frappe/ui/iconbar.js";
@@ -43,12 +74,16 @@ import "./frappe/ui/field_group.js";
 import "./frappe/form/link_selector.js";
 import "./frappe/form/multi_select_dialog.js";
 import "./frappe/ui/dialog.js";
-import "./frappe/ui/menu.js";
+import "./frappe/ui/settings_dialog.js";
 import "./frappe/ui/capture.js";
+import "./frappe/ui/permission_dialog.js";
 import "./frappe/ui/app_icon.js";
 import "./frappe/ui/theme_switcher.js";
+import "./frappe/ui/island/index.js";
+import "./frappe/ui/naming_series.js";
 
 import "./frappe/model/model.js";
+import "./frappe/views/kanban_v2/settings.js";
 import "./frappe/db.js";
 import "./frappe/model/meta.js";
 import "./frappe/model/sync.js";
@@ -66,7 +101,6 @@ import "./frappe/utils/datetime.js";
 import "./frappe/utils/number_format.js";
 import "./frappe/utils/help.js";
 import "./frappe/utils/help_links.js";
-import "./frappe/utils/address_and_contact.js";
 import "./frappe/utils/preview_email.js";
 import "./frappe/utils/file_manager.js";
 import "./frappe/utils/diffview";
@@ -96,12 +130,13 @@ import "./frappe/views/workspace/blocks/index.js";
 
 import "./frappe/widgets/widget_group.js";
 
-import "./frappe/ui/sort_selector.html";
 import "./frappe/ui/sort_selector.js";
 
 import "./frappe/change_log.html";
 import "./frappe/ui/workspace_loading_skeleton.html";
 import "./frappe/ui/workspace_sidebar_loading_skeleton.html";
+import "./frappe/legacy_gravatar_cleanup.js";
+import "./frappe/new_navigation_nudge.js";
 import "./frappe/desk.js";
 import "./frappe/query_string.js";
 
@@ -113,4 +148,3 @@ import "./frappe/scanner";
 
 import "./frappe/ui/address_autocomplete/autocomplete_dialog.js";
 import "./frappe/ui/desktop_icon.html";
-import "./frappe/ui/user_onboarding/user_onboarding.bundle.js";

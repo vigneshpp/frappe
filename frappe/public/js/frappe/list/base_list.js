@@ -1,4 +1,5 @@
-import ListFilter from "./list_filter";
+import { safe_href } from "../ui/components/utils.js";
+
 frappe.provide("frappe.views");
 
 frappe.views.BaseList = class BaseList {
@@ -13,9 +14,10 @@ frappe.views.BaseList = class BaseList {
 			() => this.hide_skeleton(),
 			() => this.check_permissions(),
 			() => this.init(),
+			() => this.filter_area?.place_id_filter(),
+			() => this.setup_list_filter_by(),
 			() => this.before_refresh(),
 			() => this.refresh(),
-			() => this.setup_list_filter_by(),
 		]);
 	}
 
@@ -31,6 +33,7 @@ frappe.views.BaseList = class BaseList {
 			this.setup_main_section,
 			this.setup_view,
 			this.setup_view_menu,
+			this.setup_resize_handler,
 		].map((fn) => fn.bind(this));
 
 		this.init_promise = frappe.run_serially(tasks);
@@ -56,7 +59,7 @@ frappe.views.BaseList = class BaseList {
 		this.fields = [];
 		this.filters = [];
 		this.sort_by = this.meta.sort_field || "creation";
-		this.sort_order = this.meta.sort_order || "desc";
+		this.sort_order = (this.meta.sort_order || "desc").toLowerCase();
 
 		// Setup buttons
 		this.primary_action = null;
@@ -67,6 +70,8 @@ frappe.views.BaseList = class BaseList {
 				label: __("Refresh"),
 				action: () => this.refresh(),
 				class: "visible-xs",
+				// views with a filter row have a Refresh button in it on phones
+				condition: () => Boolean(this.hide_filters || this.hide_page_form),
 			},
 		];
 	}
@@ -129,18 +134,22 @@ frappe.views.BaseList = class BaseList {
 		}
 
 		if (!this.fields) this.fields = [];
+		if (!this.is_queryable_field(fieldname, doctype)) {
+			return;
+		}
+
+		this.fields.push([fieldname, doctype]);
+	}
+
+	is_queryable_field(fieldname, doctype) {
 		const is_valid_field =
 			frappe.model.std_fields_list.includes(fieldname) ||
 			frappe.meta.has_field(doctype, fieldname) ||
 			fieldname === "_seen";
 
-		let is_virtual = this.meta.fields.find((df) => df.fieldname == fieldname)?.is_virtual;
+		const is_virtual = frappe.meta.get_docfield(doctype, fieldname)?.is_virtual;
 
-		if (!is_valid_field || is_virtual) {
-			return;
-		}
-
-		this.fields.push([fieldname, doctype]);
+		return is_valid_field && !is_virtual;
 	}
 
 	set_stats() {
@@ -183,46 +192,37 @@ frappe.views.BaseList = class BaseList {
 	}
 
 	set_title() {
-		this.page.set_title(this.page_title, null, true, "", this.meta?.description);
+		// the title is the last crumb, which set_breadcrumbs() has already written; this only
+		// names the browser tab, so the two cannot disagree about what the page is called
+		this.page.title = this.page_title;
+		frappe.utils.set_title(this.page_title);
+		this.set_deprecated_badge();
+	}
+
+	set_deprecated_badge() {
+		this.page.$title_area.find(".deprecated-badge").remove();
+		if (!this.meta?.deprecated) return;
+
+		frappe.ui
+			.badge({
+				label: __("Deprecated"),
+				theme: "red",
+				title: __("This DocType is deprecated and may be removed in a future release"),
+				css_class: "deprecated-badge",
+			})
+			.appendTo(this.page.$title_area);
 	}
 
 	setup_view_menu() {
 		if (frappe.boot.desk_settings.view_switcher && !this.meta.force_re_route_to_default_view) {
-			const icon_map = {
-				Image: "image",
-				List: "list",
-				Report: "sheet",
-				Calendar: "calendar",
-				Gantt: "gantt",
-				Kanban: "kanban",
-				Dashboard: "dashboard",
-				Map: "map",
-			};
-
-			const label_map = {
-				List: __("List View"),
-				Report: __("Report View"),
-				Dashboard: __("Dashboard View"),
-				Gantt: __("Gantt View"),
-				Kanban: __("Kanban View"),
-				Calendar: __("Calendar View"),
-				Image: __("Image View"),
-				Inbox: __("Inbox View"),
-				Tree: __("Tree View"),
-				Map: __("Map View"),
-			};
-
-			this.views_menu = this.page.add_custom_button_group(
-				label_map[this.view_name] || label_map["List"],
-				icon_map[this.view_name] || "list"
-			);
+			// one nested dropdown: view rows + the current view's variants
+			// (saved layouts, kanban boards, ...) as its submenu
 			this.views_list = new frappe.views.ListViewSelect({
 				doctype: this.doctype,
-				parent: this.views_menu,
 				page: this.page,
 				list_view: this,
-				icon_map: icon_map,
-				label_map: label_map,
+				icon_map: frappe.views.view_icon_map,
+				label_map: frappe.views.get_view_label_map(),
 			});
 		}
 	}
@@ -241,7 +241,7 @@ frappe.views.BaseList = class BaseList {
 			}
 		} else {
 			this.refresh_button = this.page.add_action_icon(
-				"es-line-reload",
+				"refresh-cw",
 				() => {
 					this.refresh();
 				},
@@ -263,16 +263,35 @@ frappe.views.BaseList = class BaseList {
 					item.label,
 					item.action,
 					item.standard,
-					item.shortcut
+					item.shortcut,
+					undefined,
+					item.group
 				);
 				if (item.class) {
 					$item && $item.addClass(item.class);
 				}
 			});
+
+		// the DocType's docs, also linked from the list's empty state
+		const docs = safe_href(this.meta?.documentation, "list");
+		if (docs) {
+			this.page.add_dropdown_item({
+				label: __("Documentation"),
+				click: () => window.open(docs, "_blank"),
+				standard: true,
+				parent: this.page.menu,
+				icon_right: "external-link",
+			});
+		}
 	}
 
 	set_breadcrumbs() {
-		frappe.breadcrumbs.add(this.meta.module, this.doctype);
+		this.page.set_breadcrumbs(this.get_breadcrumbs());
+	}
+
+	/** The list is the page, so its one crumb is the title and carries no link. */
+	get_breadcrumbs() {
+		return [{ label: this.page_title, title: __(this.meta?.description) }];
 	}
 
 	hide_sidebar() {
@@ -368,65 +387,62 @@ frappe.views.BaseList = class BaseList {
 		const paging_values = [20, 100, 500, 2500];
 		this.$paging_area = $(
 			`<div class="list-paging-area level">
-				<div class="level-left">
-					<div class="btn-group">
-						${paging_values
-							.map(
-								(value) => `
-							<button type="button" class="btn btn-default btn-sm btn-paging"
-								data-value="${value}">
-								${value}
-							</button>
-						`
-							)
-							.join("")}
-					</div>
-				</div>
-				<div class="level-right">
-					<button class="btn btn-default btn-more btn-sm">
-						${__("Load More")}
-					</button>
-				</div>
+				<div class="level-left"></div>
+				<div class="level-right"></div>
 			</div>`
 		).hide();
 		this.$frappe_list.append(this.$paging_area);
 
-		// set default paging btn active
-		this.$paging_area
-			.find(`.btn-paging[data-value="${this.page_length}"]`)
-			.addClass("btn-info")
-			.prop("disabled", true);
-
-		this.$paging_area.on("click", ".btn-paging", (e) => {
-			const $this = $(e.currentTarget);
-			// Set the active button
-			// This is always necessary because the current page length might
-			// have resulted from a previous "load more".
-			this.$paging_area.find(".btn-paging").removeClass("btn-info").prop("disabled", false);
-			$this.addClass("btn-info").prop("disabled", true);
-
-			const old_page_length = this.page_length;
-			const new_page_length = $this.data().value;
-
-			this.selected_page_count = new_page_length;
-			if (this.page_length > new_page_length) {
-				this.start = 0;
-				this.page_length = new_page_length;
-			} else {
-				this.start = this.page_length;
-				this.page_length = new_page_length - this.page_length;
-			}
-
-			if (old_page_length !== new_page_length) {
+		// the page-size choice is a radio group — TabButtons keeps exactly one
+		// pill selected (the old markup hand-rolled this with btn-info +
+		// disabled), and the selection survives "Load More" growing the page
+		this.paging_button_group = new frappe.ui.TabButtons({
+			label: __("Page Size"),
+			options: paging_values.map((value) => ({
+				label: String(value),
+				value: value,
+			})),
+			value: this.selected_page_count,
+			on_change: (value) => {
+				this.selected_page_count = value;
+				if (this.page_length > value) {
+					this.start = 0;
+					this.page_length = value;
+				} else {
+					// growing: fetch only the difference on top of what's loaded
+					this.start = this.page_length;
+					this.page_length = value - this.page_length;
+				}
 				this.refresh();
-			}
+			},
 		});
+		this.$paging_area.find(".level-left").append(this.paging_button_group.$el);
 
-		this.$paging_area.on("click", ".btn-more", (e) => {
-			this.start = this.data.length;
-			this.page_length = this.selected_page_count;
-			this.refresh();
-		});
+		this.$paging_area.find(".level-right").append(
+			frappe.ui.button({
+				label: __("Load More"),
+				css_class: "btn-more",
+				onclick: () => {
+					this.start = this.data.length;
+					this.page_length = this.selected_page_count;
+					this.refresh();
+				},
+			})
+		);
+	}
+
+	setup_resize_handler() {
+		$(window)
+			.off("resize.list-view")
+			.on(
+				"resize.list-view",
+				frappe.utils.debounce(() => {
+					if (cur_list?.$result?.is(":visible")) {
+						cur_list.set_result_height();
+					}
+					cur_list?.filter_area?.place_id_filter();
+				}, 300)
+			);
 	}
 
 	set_result_height() {
@@ -434,12 +450,24 @@ frappe.views.BaseList = class BaseList {
 		this.$result[0].style.removeProperty("height");
 		// place it at the footer of the page
 
-		let resultContainerHeight = window.innerHeight - this.$paging_area.get(0).offsetHeight;
-		if (!frappe.is_mobile()) {
-			resultContainerHeight = resultContainerHeight - this.$result.get(0).offsetTop;
+		let $result_container = this.$result.parent(".result-container");
+
+		// On mobile a fixed height makes the container a second scroller and
+		// the page double-scrolls (the browser bar resizing the viewport
+		// leaves the pixel height stale). Let rows flow instead — except in
+		// virtual mode, which needs a scrollbox to window rows.
+		if (frappe.is_mobile() && !this.virtualization_state?.enabled) {
+			$result_container.css("height", "");
+			return;
 		}
-		this.$result.parent(".result-container").css({
-			height: resultContainerHeight - (frappe.is_mobile() ? 100 : 0) + "px",
+
+		let main_rect = $(".main-section").get(0).getBoundingClientRect();
+		let result_top = $result_container.get(0).getBoundingClientRect().top - main_rect.top;
+		let resultContainerHeight = Math.floor(
+			main_rect.height - this.$paging_area.get(0).getBoundingClientRect().height - result_top
+		);
+		$result_container.css({
+			height: resultContainerHeight + "px",
 		});
 
 		this.$result[0].style.height =
@@ -522,9 +550,11 @@ frappe.views.BaseList = class BaseList {
 			return Promise.resolve();
 		}
 		this.freeze(true);
-		// fetch data from server
+		// a newer refresh (a filter change during a scroll load) owns start and page_length
+		// now, so an older response must not be rendered over it
+		const refresh_id = (this.refresh_id = (this.refresh_id || 0) + 1);
 		return frappe.call(args).then((r) => {
-			// render
+			if (refresh_id !== this.refresh_id) return;
 			this.prepare_data(r);
 			this.toggle_result_area();
 			this.before_render();
@@ -619,7 +649,16 @@ frappe.views.BaseList = class BaseList {
 	}
 
 	setup_list_filter_by() {
-		new ListFilter(this);
+		if (!this.show_saved_layout_menu) {
+			return Promise.resolve();
+		}
+
+		return new Promise((resolve) => {
+			frappe.require("list_filter.bundle.js", () => {
+				this.list_filter = new frappe.views.ListFilter(this);
+				resolve(this.list_filter.setup_promise);
+			});
+		});
 	}
 };
 
@@ -639,46 +678,45 @@ class FilterArea {
 		this.$filter_list_wrapper = this.list_view.$filter_section;
 		this.trigger_refresh = true;
 
-		this.debounced_refresh_list_view = frappe.utils.debounce(
-			this.refresh_list_view.bind(this),
-			300
-		);
+		const refresh = frappe.utils.debounce(this.refresh_list_view.bind(this), 300);
+		this.debounced_refresh_list_view = () => {
+			// a box filled now goes after the filters added before it, refreshed or not
+			this.filter_list?.order_filters(this.get_standard_filters());
+			refresh();
+		};
 		this.setup();
-		if (frappe.is_mobile()) this.setup_mobile(list_view);
+		if (!this.list_view.hide_page_form) this.setup_mobile_toolbar();
 	}
 
-	setup_mobile(list_view) {
-		const me = this;
-		this.standard_filters_visible = false;
-		this.standard_filters_wrapper?.hide();
-		this.list_view.page.page_form.css("justify-content", "flex-end");
-		list_view.page.page_form.addClass("flex-column");
-		this.$filter_list_wrapper.addClass("justify-between p-0");
+	setup_mobile_toolbar() {
+		this.list_view.page.page_form.addClass("list-page-form");
 
-		// added this to manage spaceing between filter and sorf area
-		this.$filter_list_wrapper.find(".filter-selector").css("margin", "0 0 0 auto");
+		const refresh_button = frappe.ui.button({
+			icon: "refresh-cw",
+			title: __("Reload List"),
+			css_class: "hidden-lg",
+			onclick: () => this.list_view.refresh(),
+		});
+		this.$filter_list_wrapper.find(".filter-selector").prepend(refresh_button);
 
-		$(`<button class="filter-toggle btn btn-default btn-sm filter-button">
-					<span class="filter-icon button-icon">
-						${frappe.utils.icon("chevrons-up-down")}
-					</span>
-				</button>
-			</div>`)
-			.prependTo(this.$filter_list_wrapper.find(".filter-selector"))
-			.on("click", function () {
-				me.toggle_standard_filter();
-			});
-		let children = list_view.page.page_form.children();
-		list_view.page.page_form.append(children.get().reverse());
+		this.$mobile_id_filter = $('<div class="mobile-id-filter hidden-lg">').prependTo(
+			this.$filter_list_wrapper
+		);
 	}
 
-	toggle_standard_filter() {
-		if (this.standard_filters_visible) {
-			this.standard_filters_visible = false;
-			this.standard_filters_wrapper.hide();
+	place_id_filter() {
+		const id_filter = this.list_view.page.fields_dict.name;
+		if (!id_filter || !this.$mobile_id_filter) return;
+
+		// matchMedia keeps placement in sync with the toolbar media queries in list.scss
+		const mobile_layout = window.matchMedia("(max-width: 767.98px)").matches;
+		const target = mobile_layout ? this.$mobile_id_filter : this.standard_filters_wrapper;
+		if (id_filter.wrapper.parentElement === target[0]) return;
+
+		if (mobile_layout) {
+			target.append(id_filter.wrapper);
 		} else {
-			this.standard_filters_visible = true;
-			this.standard_filters_wrapper.show();
+			target.prepend(id_filter.wrapper);
 		}
 	}
 
@@ -697,7 +735,8 @@ class FilterArea {
 		let filters = this.filter_list.get_filters();
 		let standard_filters = this.get_standard_filters();
 
-		return filters.concat(standard_filters).uniqBy(JSON.stringify);
+		const all = filters.concat(standard_filters).uniqBy(JSON.stringify);
+		return this.filter_list.order_filters(all, true);
 	}
 
 	set(filters) {
@@ -719,6 +758,8 @@ class FilterArea {
 		}
 
 		filters = filters.filter((f) => !this.exists(f));
+		// saved filters come in the order they were added
+		this.filter_list.order_filters(filters);
 
 		// standard filters = filters visible on list view
 		// non-standard filters = filters set by filter button
@@ -737,6 +778,8 @@ class FilterArea {
 	}
 
 	refresh_list_view() {
+		// the filter button counts the toolbar boxes too
+		this.filter_list.update_filter_button();
 		if (this.trigger_refresh) {
 			this.list_view.start = 0;
 			this.list_view.refresh();
@@ -763,6 +806,10 @@ class FilterArea {
 		return exists;
 	}
 
+	get_standard_field(fieldname) {
+		return this.list_view.page.fields_dict[fieldname];
+	}
+
 	set_standard_filter(filters) {
 		if (filters.length === 0) {
 			return {
@@ -779,14 +826,7 @@ class FilterArea {
 			out.non_standard_filters = out.non_standard_filters || [];
 
 			// set in list view area if filters are present
-			// don't set like filter on link fields (gets reset)
-			if (
-				fields_dict[fieldname] &&
-				(condition === "=" ||
-					(condition === "like" && fields_dict[fieldname]?.df?.fieldtype != "Link") ||
-					(condition === "descendants of (inclusive)" &&
-						fields_dict[fieldname]?.df?.fieldtype == "Link"))
-			) {
+			if (frappe.ui.FilterGroup.fits_box(fields_dict[fieldname], condition, value)) {
 				// standard filter
 				out.promise = out.promise.then(() => {
 					// Set match type for fields that support it
@@ -820,7 +860,7 @@ class FilterArea {
 						data-label="${label}" data-fieldname="${fieldname}" data-fieldtype="${fieldtype}"
 						href="#" onclick="return false;">
 							<span class="ellipsis">${__(label)}</span>
-							<span>${frappe.utils.icon("select", "xs")}</span>
+							<span>${frappe.utils.icon("chevrons-up-down", "xs")}</span>
 						</a>
 					<ul class="dropdown-menu group-by-dropdown" role="menu">
 					</ul>
@@ -955,7 +995,7 @@ class FilterArea {
 		}
 		let value = field.name == null ? "" : encodeURIComponent(field.name);
 		let applied_html = applied
-			? `<span class="applied"> ${frappe.utils.icon("tick", "xs")} </span>`
+			? `<span class="applied"> ${frappe.utils.icon("check", "xs")} </span>`
 			: "";
 		return `<div class="group-by-item ${applied ? "selected" : ""}" data-value="${value}">
 			<a class="dropdown-item flex justify-between" href="#" onclick="return false;">
@@ -1104,8 +1144,6 @@ class FilterArea {
 			this.trigger_refresh = false;
 		}
 
-		this.filter_list.clear_filters();
-
 		const promises = [];
 		const fields_dict = this.list_view.page.fields_dict;
 		for (let key in fields_dict) {
@@ -1113,6 +1151,9 @@ class FilterArea {
 			promises.push(() => field.set_value(""));
 		}
 		return frappe.run_serially(promises).then(() => {
+			// last, so the filter count drops once, after the toolbar boxes are empty
+			this.filter_list.clear_filters();
+			this.filter_list.filter_order = [];
 			this.trigger_refresh = true;
 			if (promises.length === 0) {
 				// refresh if there are no standard fields
@@ -1136,14 +1177,7 @@ class FilterArea {
 				onchange: () => this.debounced_refresh_list_view(),
 			};
 
-			if (frappe.is_mobile()) {
-				let mobile_id_filter = this.$filter_list_wrapper.append(
-					`<div class="mobile-id-filter"></div>`
-				);
-				this.list_view.page.add_field(field, mobile_id_filter.find(".mobile-id-filter"));
-			} else {
-				fields.push(field);
-			}
+			fields.push(field);
 		}
 
 		if (
@@ -1191,6 +1225,7 @@ class FilterArea {
 							"Small Text",
 							"Text Editor",
 							"HTML Editor",
+							"Markdown Editor",
 							"Data",
 							"Code",
 							"Phone",
@@ -1256,10 +1291,15 @@ class FilterArea {
 			];
 
 			if (input_fieldtypes.includes(df.fieldtype)) {
-				df.match_type = df.condition || "=";
+				const saved_conditions =
+					frappe.get_user_settings(this.list_view.doctype, this.list_view.view_name)
+						.filter_conditions || {};
+				df.match_type = saved_conditions[df.fieldname] || df.condition || "=";
 				this.filter_field_with_match_type(df);
 			}
 		});
+
+		this.place_id_filter();
 	}
 
 	filter_field_with_match_type(df) {
@@ -1313,6 +1353,13 @@ class FilterArea {
 				field.df.match_type = new_type;
 				$dropdown.find("button").html(getIcon(new_type));
 
+				const saved_conditions =
+					frappe.get_user_settings(this.list_view.doctype, this.list_view.view_name)
+						.filter_conditions || {};
+				this.list_view.save_view_user_settings?.({
+					filter_conditions: { ...saved_conditions, [df.fieldname]: new_type },
+				});
+
 				let value = field.get_value?.();
 				if (new_type === "=" && value) {
 					field.set_value(value.replace(/^%+|%+$/g, ""));
@@ -1364,28 +1411,13 @@ class FilterArea {
 	}
 
 	make_filter_list() {
-		$(`<div class="filter-selector">
-			<div class="btn-group">
-				<button class="btn btn-default btn-sm filter-button">
-					<span class="filter-icon button-icon">
-						${frappe.utils.icon("es-line-filter")}
-					</span>
-					<span class="button-label hidden-xs">
-					${__("Filter")}
-					<span>
-				</button>
-				<button class="btn btn-default btn-sm filter-x-button" title="${__("Clear all filters")}">
-					<span class="filter-icon button-icon">
-						${frappe.utils.icon("es-small-close")}
-					</span>
-				</button>
-			</div>
-		</div>`).appendTo(this.$filter_list_wrapper);
-
-		this.filter_button = this.$filter_list_wrapper.find(".filter-button");
-		this.filter_x_button = this.$filter_list_wrapper.find(".filter-x-button");
+		const { $selector, filter_button, filter_x_button } = frappe.ui.FilterGroup.make_buttons();
+		$selector.appendTo(this.$filter_list_wrapper);
+		this.filter_button = filter_button;
+		this.filter_x_button = filter_x_button;
 		this.filter_list = new frappe.ui.FilterGroup({
 			base_list: this.list_view,
+			toolbar: this,
 			parent: this.$filter_list_wrapper,
 			doctype: this.list_view.doctype,
 			filter_button: this.filter_button,
@@ -1404,6 +1436,33 @@ class FilterArea {
 		);
 	}
 }
+
+// view identity shared by every switcher on a doctype page header — the
+// list-family views and the tree view all build their switcher from these
+frappe.views.view_icon_map = {
+	Image: "image",
+	List: "list",
+	Report: "sheet",
+	Calendar: "calendar",
+	Gantt: "square-chart-gantt",
+	Kanban: "square-kanban",
+	Dashboard: "layout-dashboard",
+	Map: "map",
+	Tree: "list-tree",
+};
+
+frappe.views.get_view_label_map = () => ({
+	List: __("List View"),
+	Report: __("Report View"),
+	Dashboard: __("Dashboard View"),
+	Gantt: __("Gantt View"),
+	Kanban: __("Kanban View"),
+	Calendar: __("Calendar View"),
+	Image: __("Image View"),
+	Inbox: __("Inbox View"),
+	Tree: __("Tree View"),
+	Map: __("Map View"),
+});
 
 // utility function to validate view modes
 frappe.views.view_modes = [

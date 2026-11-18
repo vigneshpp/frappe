@@ -2,9 +2,20 @@
 	cursor: copy;
 }
 
+.layout-main-section-wrapper:not(.disable-scrolling)
+	.frappe-list
+	.result-container
+	.result:has(> .gantt-container) {
+	display: block;
+
+	.gantt-container {
+		max-height: 100%;
+	}
+}
+
 .gantt-container .popup-wrapper {
 	min-width: 9rem;
-	border-radius: var(--border-radius);
+	border-radius: var(--radius);
 	@include get_textstyle("sm", "regular");
 
 	.title {

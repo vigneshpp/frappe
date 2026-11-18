@@ -7,11 +7,13 @@ from typing import Any
 
 import frappe
 from frappe import _
-from frappe.boot import get_allowed_report_names
+from frappe.desk.desk_views import DeskViews
+from frappe.model import numeric_fieldtypes
 from frappe.model.document import Document
 from frappe.model.naming import append_number_if_name_exists
 from frappe.modules.export_file import export_to_files
-from frappe.permissions import get_doctypes_with_read
+from frappe.permissions import get_cached_doctypes_with_read, get_doctypes_with_read
+from frappe.query_builder.functions import Date, UnixTimestamp
 from frappe.utils import cint, flt, get_datetime, getdate, has_common, now_datetime, nowdate
 from frappe.utils.dashboard import cache_source
 from frappe.utils.data import format_date
@@ -40,13 +42,13 @@ def get_permission_query_conditions(user):
 	module_condition = False
 
 	allowed_doctypes = [frappe.db.escape(doctype) for doctype in get_doctypes_with_read(user)]
-	allowed_reports = [frappe.db.escape(report) for report in get_allowed_report_names(user=user)]
+	allowed_reports = [frappe.db.escape(report) for report in DeskViews.get_allowed_report_names(user=user)]
 	allowed_modules = [
 		frappe.db.escape(module.get("module_name")) for module in get_modules_from_all_apps_for_user(user)
 	]
 
 	if allowed_doctypes:
-		doctype_condition = "`tabDashboard Chart`.`document_type` in ({allowed_doctypes})".format(
+		doctype_condition = "`tabDashboard Chart`.`document_type` in ({allowed_doctypes}) OR `tabDashboard Chart`.`parent_document_type` in ({allowed_doctypes})".format(
 			allowed_doctypes=",".join(allowed_doctypes)
 		)
 	if allowed_reports:
@@ -78,11 +80,10 @@ def has_permission(doc, ptype, user):
 		if has_common(roles, allowed):
 			return True
 	elif doc.chart_type == "Report":
-		if doc.report_name in get_allowed_report_names(user=user):
+		if doc.report_name in DeskViews.get_cached_allowed_report_names(user):
 			return True
 	else:
-		allowed_doctypes = get_doctypes_with_read(user)
-		if doc.document_type in allowed_doctypes:
+		if doc.document_type in get_cached_doctypes_with_read(user):
 			return True
 
 	return False
@@ -123,7 +124,7 @@ def get(
 
 	timegrain = time_interval or chart.time_interval
 	filters = frappe.parse_json(filters) or frappe.parse_json(chart.filters_json)
-	if not filters:
+	if not isinstance(filters, list):
 		filters = []
 
 	# don't include cancelled documents
@@ -142,10 +143,13 @@ def get(
 
 @frappe.whitelist()
 def create_dashboard_chart(args: str | dict[str, Any]):
+	frappe.has_permission("Dashboard Chart", "read", throw=True)
 	args = frappe.parse_json(args)
 	doc = frappe.new_doc("Dashboard Chart")
 
 	doc.update(args)
+	if not frappe.has_permission("Dashboard Chart", "create"):
+		doc.update({"is_public": 0, "is_standard": 0, "module": None, "roles": []})
 
 	if args.get("custom_options"):
 		doc.custom_options = json.dumps(args.get("custom_options"))
@@ -220,6 +224,8 @@ def get_chart_config(chart, filters, timespan, timegrain, from_date, to_date):
 			else get_period(r[0], timegrain)
 			for r in result
 		],
+		# each period's first day, so a chart can place it on a time axis
+		"dates": [str(get_period_beginning(r[0], timegrain)) for r in result],
 		"datasets": [{"name": _(chart.name), "values": [r[1] for r in result]}],
 	}
 
@@ -230,29 +236,22 @@ def get_heatmap_chart_config(chart, filters, heatmap_year):
 	doctype = chart.document_type
 	datefield = chart.based_on
 	year = cint(heatmap_year) if heatmap_year else getdate(nowdate()).year
-	year_start_date = datetime.date(year, 1, 1).strftime("%Y-%m-%d")
-	next_year_start_date = datetime.date(year + 1, 1, 1).strftime("%Y-%m-%d")
 
-	filters.append([doctype, datefield, ">", f"{year_start_date}"])
-	filters.append([doctype, datefield, "<", f"{next_year_start_date}"])
+	filters.append([doctype, datefield, ">=", f"{year}-01-01"])
+	filters.append([doctype, datefield, "<", f"{year + 1}-01-01"])
 
-	if frappe.db.db_type == "mariadb":
-		timestamp_field = f"unix_timestamp({datefield})"
-	else:
-		timestamp_field = f"extract(epoch from timestamp {datefield})"
-
+	day_timestamp = UnixTimestamp(Date(frappe.qb.DocType(doctype)[datefield]))
+	# by position: a GROUP BY alias loses to a column of the same name
 	data = dict(
-		frappe.get_all(
+		frappe.get_list(
 			doctype,
-			fields=[
-				timestamp_field,
-				{aggregate_function: value_field},
-			],
+			fields=[day_timestamp, {aggregate_function: value_field}],
 			filters=filters,
-			group_by=f"date({datefield})",
+			group_by="1",
 			as_list=1,
-			order_by=f"{datefield} asc",
+			order_by="1 asc",
 			ignore_ifnull=True,
+			parent_doctype=chart.parent_document_type,
 		)
 	)
 
@@ -294,8 +293,11 @@ def get_group_by_chart_config(chart, filters) -> dict | None:
 				item.name = _(item.get("name", "Not Specified"))
 
 	if data:
+		empty_label = (
+			_("No {0}").format(_(group_by_field_field.label)) if group_by_field_field else _("Not Set")
+		)
 		return {
-			"labels": [item.name for item in data],
+			"labels": [item.name or empty_label for item in data],
 			"datasets": [{"name": _(chart.name), "values": [item["count"] for item in data]}],
 		}
 	return None
@@ -340,6 +342,8 @@ def get_charts_for_user(
 
 
 class DashboardChart(Document):
+	_DOCTYPE_NAME = "Dashboard Chart"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -359,6 +363,7 @@ class DashboardChart(Document):
 		custom_options: DF.Code | None
 		document_type: DF.Link | None
 		dynamic_filters_json: DF.Code | None
+		empty_state_message: DF.SmallText | None
 		filters_json: DF.Code
 		from_date: DF.Date | None
 		group_by_based_on: DF.Literal[None]
@@ -372,6 +377,7 @@ class DashboardChart(Document):
 		parent_document_type: DF.Link | None
 		report_name: DF.Link | None
 		roles: DF.Table[HasRole]
+		show_values_over_chart: DF.Check
 		source: DF.Link | None
 		time_interval: DF.Literal["Yearly", "Quarterly", "Monthly", "Weekly", "Daily"]
 		timeseries: DF.Check
@@ -395,6 +401,8 @@ class DashboardChart(Document):
 		if self.chart_type != "Custom" and self.chart_type != "Report":
 			self.check_required_field()
 			self.check_document_type()
+		elif self.chart_type == "Report" and not self.report_name:
+			frappe.throw(_("Report Name is required to create a dashboard chart"))
 
 		self.validate_custom_options()
 
@@ -412,11 +420,31 @@ class DashboardChart(Document):
 		if self.chart_type == "Group By":
 			if not self.group_by_based_on:
 				frappe.throw(_("Group By field is required to create a dashboard chart"))
-			if self.group_by_type in ["Sum", "Average"] and not self.aggregate_function_based_on:
-				frappe.throw(_("Aggregate Function field is required to create a dashboard chart"))
+			self.check_field_type("group_by_based_on", ("Link", "Select"), ("owner",))
+			if self.group_by_type in ["Sum", "Average"]:
+				if not self.aggregate_function_based_on:
+					frappe.throw(_("Aggregate Function field is required to create a dashboard chart"))
+				self.check_field_type("aggregate_function_based_on", (*numeric_fieldtypes, "Duration"))
 		else:
 			if not self.based_on:
 				frappe.throw(_("Time series based on is required to create a dashboard chart"))
+			self.check_field_type("based_on", ("Date", "Datetime"), ("creation", "modified"))
+			if self.chart_type in ["Sum", "Average"]:
+				if not self.value_based_on:
+					frappe.throw(_("Value Based On field is required to create a dashboard chart"))
+				self.check_field_type("value_based_on", (*numeric_fieldtypes, "Duration"))
+
+	def check_field_type(self, fieldname, fieldtypes, allowed=()):
+		value = self.get(fieldname)
+		if value in allowed:
+			return
+		df = frappe.get_meta(self.document_type).get_field(value)
+		if not df or df.fieldtype not in fieldtypes:
+			frappe.throw(
+				_("{0} is not a valid field for {1}").format(
+					frappe.bold(value), _(self.meta.get_label(fieldname))
+				)
+			)
 
 	def check_document_type(self):
 		if frappe.get_meta(self.document_type).issingle:

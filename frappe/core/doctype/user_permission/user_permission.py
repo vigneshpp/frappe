@@ -9,10 +9,13 @@ from frappe import _
 from frappe.core.utils import find
 from frappe.desk.form.linked_with import get_linked_doctypes
 from frappe.model.document import Document
-from frappe.utils import cstr
+from frappe.query_builder import Order
+from frappe.utils import cint, cstr
 
 
 class UserPermission(Document):
+	_DOCTYPE_NAME = "User Permission"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -31,6 +34,7 @@ class UserPermission(Document):
 	# end: auto-generated types
 
 	def validate(self):
+		self.apply_to_all_doctypes = 0 if self.applicable_for else 1
 		self.validate_user_permission()
 		self.validate_default_permission()
 
@@ -86,13 +90,13 @@ def send_user_permissions(bootinfo):
 
 
 @frappe.whitelist()
+def get_current_user_permissions():
+	"""Return the permissions of the logged in user."""
+	return get_user_permissions(frappe.session.user)
+
+
 def get_user_permissions(user: str | None = None):
 	"""Get all users permissions for the user as a dict of doctype"""
-	# if this is called from client-side,
-	# user can access only his/her user permissions
-	if frappe.request and frappe.local.form_dict.cmd == "get_user_permissions":
-		user = frappe.session.user
-
 	if not user:
 		user = frappe.session.user
 
@@ -130,9 +134,12 @@ def get_user_permissions(user: str | None = None):
 			fields=["allow", "for_value", "applicable_for", "is_default", "hide_descendants"],
 			filters=dict(user=user),
 		):
-			meta = frappe.get_meta(perm.allow)
 			add_doc_to_perm(perm, perm.for_value, perm.is_default, perm.hide_descendants)
 
+			if not frappe.db.exists("DocType", perm.allow, cache=True):
+				continue
+
+			meta = frappe.get_meta(perm.allow)
 			if meta.is_nested_set() and not perm.hide_descendants:
 				decendants = frappe.db.get_descendants(perm.allow, perm.for_value)
 				for doc in decendants:
@@ -146,6 +153,25 @@ def get_user_permissions(user: str | None = None):
 			pass
 
 	return out
+
+
+def clear_descendant_user_permissions(doctype: str) -> None:
+	"""Clear the cached permissions that list descendants of `doctype` records, before and after commit."""
+	users = frappe.get_all(
+		"User Permission",
+		filters={"allow": doctype, "hide_descendants": 0},
+		pluck="user",
+		distinct=True,
+	)
+	if not users:
+		return
+
+	def clear():
+		frappe.cache.hdel("user_permissions", users)
+
+	clear()
+	frappe.db.after_commit.add(clear)
+	frappe.db.after_rollback.add(clear)
 
 
 def user_permission_exists(user, allow, for_value, applicable_for=None):
@@ -170,18 +196,18 @@ def get_applicable_for_doctype_list(
 	linked_doctypes = []
 	for linked_doctype, linked_doctype_values in linked_doctypes_map.items():
 		linked_doctypes.append(linked_doctype)
-		child_doctype = linked_doctype_values.get("child_doctype")
-		if child_doctype:
-			linked_doctypes.append(child_doctype)
+		for child_link in linked_doctype_values.get("child_links") or [linked_doctype_values]:
+			if child_doctype := child_link.get("child_doctype"):
+				linked_doctypes.append(child_doctype)
 
 	linked_doctypes += [actual_doctype]
 
 	if txt:
 		linked_doctypes = [d for d in linked_doctypes if txt.lower() in d.lower()]
 
-	linked_doctypes.sort()
+	linked_doctypes = sorted(set(linked_doctypes))
 
-	return [[doctype] for doctype in linked_doctypes[start:page_len]]
+	return [[doctype] for doctype in linked_doctypes[start : start + page_len]]
 
 
 def get_permitted_documents(doctype):
@@ -242,6 +268,44 @@ def clear_user_permissions(user: str, for_doctype: str):
 		frappe.clear_cache()
 
 	return total
+
+
+@frappe.whitelist()
+def get_user_permission_list(allow: str, txt: str | None = None, start: int = 0, page_length: int = 50):
+	"""One page of User Permissions for `allow`, with each user's name and image joined in.
+	`txt` searches the user, their name, the value and the applicable doctype."""
+	frappe.only_for("System Manager")
+
+	up = frappe.qb.DocType("User Permission")
+	user = frappe.qb.DocType("User")
+	query = (
+		frappe.qb.from_(up)
+		.left_join(user)
+		.on(up.user == user.name)
+		.select(
+			up.name,
+			up.user,
+			up.for_value,
+			up.applicable_for,
+			up.apply_to_all_doctypes,
+			user.full_name,
+			user.user_image,
+		)
+		.where(up.allow == allow)
+		.orderby(up.modified, order=Order.desc)
+		.orderby(up.name, order=Order.desc)
+		.limit(cint(page_length))
+		.offset(cint(start))
+	)
+	if txt:
+		like = f"%{txt}%"
+		query = query.where(
+			up.user.like(like)
+			| user.full_name.like(like)
+			| up.for_value.like(like)
+			| up.applicable_for.like(like)
+		)
+	return query.run(as_dict=True)
 
 
 @frappe.whitelist()

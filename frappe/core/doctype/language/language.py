@@ -10,6 +10,8 @@ from frappe.model.document import Document
 
 
 class Language(Document):
+	_DOCTYPE_NAME = "Language"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -86,7 +88,7 @@ def sync_languages():
 	"""Create Language records from frappe/geo/languages.csv"""
 	from csv import DictReader
 
-	with open(frappe.get_app_path("frappe", "geo", "languages.csv")) as f:
+	with open(frappe.get_app_path("frappe", "geo", "languages.csv"), encoding="utf-8") as f:
 		reader = DictReader(f)
 		for row in reader:
 			if not frappe.db.exists("Language", row["language_code"]):

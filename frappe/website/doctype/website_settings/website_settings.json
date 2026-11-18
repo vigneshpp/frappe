@@ -6,9 +6,11 @@
    "label": "Clear Cache"
   }
  ],
+ "allow_bulk_edit": 1,
  "creation": "2013-04-30 12:58:46",
  "doctype": "DocType",
  "document_type": "Other",
+ "documentation": "https://docs.frappe.io/erpnext/user/manual/en/website-settings",
  "engine": "InnoDB",
  "field_order": [
   "home_tab",
@@ -19,6 +21,7 @@
   "misc_section",
   "app_name",
   "disable_signup",
+  "max_signups_per_minute",
   "show_footer_on_login",
   "column_break_9",
   "app_logo",
@@ -36,7 +39,6 @@
   "top_bar",
   "top_bar_items",
   "hide_login",
-  "navbar_search",
   "show_language_picker",
   "navbar_template_section",
   "navbar_template",
@@ -66,6 +68,7 @@
   "enable_google_indexing",
   "authorize_api_indexing_access",
   "indexing_refresh_token",
+  "indexing_refresh_token_secret",
   "indexing_authorization_code",
   "column_break_17",
   "google_analytics_id",
@@ -157,12 +160,6 @@
    "fieldname": "top_bar",
    "fieldtype": "Section Break",
    "label": "Navbar"
-  },
-  {
-   "default": "0",
-   "fieldname": "navbar_search",
-   "fieldtype": "Check",
-   "label": "Include Search in Top Bar"
   },
   {
    "fieldname": "top_bar_items",
@@ -273,6 +270,7 @@
    "label": "Robots.txt"
   },
   {
+   "allow_bulk_edit": 1,
    "fieldname": "route_redirects",
    "fieldtype": "Table",
    "label": "Route Redirects",
@@ -280,14 +278,22 @@
   },
   {
    "default": "0",
-   "description": "To use Google Indexing, enable <a href=\"/desk/google-settings\">Google Settings</a>.",
+   "description": "To use Google Indexing, enable <a href=\"/desk/google-settings\" rel=\"noopener noreferrer\">Google Settings</a>.",
    "fieldname": "enable_google_indexing",
    "fieldtype": "Check",
    "label": "Enable Google indexing"
   },
   {
+   "description": "This is now deprecated, please use the `indexing_refresh_token_secret` field instead.",
    "fieldname": "indexing_refresh_token",
    "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Indexing refresh token",
+   "read_only": 1
+  },
+  {
+   "fieldname": "indexing_refresh_token_secret",
+   "fieldtype": "Password",
    "hidden": 1,
    "label": "Indexing refresh token",
    "read_only": 1
@@ -476,6 +482,13 @@
    "fieldname": "show_footer_on_login",
    "fieldtype": "Check",
    "label": "Show footer on login"
+  },
+  {
+   "default": "500",
+   "depends_on": "eval: !doc.disable_signup",
+   "fieldname": "max_signups_per_minute",
+   "fieldtype": "Int",
+   "label": "Max signups per minute"
   }
  ],
  "icon": "fa fa-cog",
@@ -483,7 +496,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-03-23 16:04:03.999928",
+ "modified": "2026-10-22 08:58:40.925592",
  "modified_by": "Administrator",
  "module": "Website",
  "name": "Website Settings",
@@ -504,6 +517,7 @@
    "role": "All"
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "creation",
  "sort_order": "DESC",
  "states": [],

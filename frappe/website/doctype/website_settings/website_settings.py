@@ -11,6 +11,8 @@ from frappe.website.utils import get_boot_data
 
 
 class WebsiteSettings(Document):
+	_DOCTYPE_NAME = "Website Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,9 +21,7 @@ class WebsiteSettings(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 		from frappe.website.doctype.top_bar_item.top_bar_item import TopBarItem
-		from frappe.website.doctype.website_route_redirect.website_route_redirect import (
-			WebsiteRouteRedirect,
-		)
+		from frappe.website.doctype.website_route_redirect.website_route_redirect import WebsiteRouteRedirect
 
 		address: DF.SmallText | None
 		app_logo: DF.AttachImage | None
@@ -50,7 +50,8 @@ class WebsiteSettings(Document):
 		home_page: DF.Data | None
 		indexing_authorization_code: DF.Data | None
 		indexing_refresh_token: DF.Data | None
-		navbar_search: DF.Check
+		indexing_refresh_token_secret: DF.Password | None
+		max_signups_per_minute: DF.Int
 		navbar_template: DF.Link | None
 		navbar_template_values: DF.Code | None
 		robots_txt: DF.Code | None
@@ -156,13 +157,13 @@ class WebsiteSettings(Document):
 	def get_access_token(self):
 		from frappe.integrations.google_oauth import GoogleOAuth
 
-		if not self.indexing_refresh_token:
+		if not self.indexing_refresh_token_secret:
 			button_label = frappe.bold(_("Allow API Indexing Access"))
 			raise frappe.ValidationError(_("Click on {0} to generate Refresh Token.").format(button_label))
 
 		oauth_obj = GoogleOAuth("indexing")
 		res = oauth_obj.refresh_access_token(
-			self.get_password(fieldname="indexing_refresh_token", raise_exception=False)
+			self.get_password(fieldname="indexing_refresh_token_secret", raise_exception=False)
 		)
 
 		return res.get("access_token")
@@ -200,7 +201,6 @@ def get_website_settings(context=None):
 		"title_prefix",
 		"navbar_template",
 		"footer_template",
-		"navbar_search",
 		"enable_view_tracking",
 		"footer_logo",
 		"call_to_action",

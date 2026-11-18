@@ -111,6 +111,10 @@ class DBTable:
 
 	def validate(self):
 		"""Check if change in varchar length isn't truncating the columns"""
+		if self.meta.get("is_virtual"):
+			return
+
+		validate_table_name_length(self.doctype)
 		if self.is_new():
 			return
 
@@ -126,10 +130,7 @@ class DBTable:
 		columns += self.columns.values()
 
 		for col in columns:
-			if len(col.fieldname) >= 64:
-				frappe.throw(
-					_("Fieldname is limited to 64 characters ({0})").format(frappe.bold(col.fieldname))
-				)
+			validate_column_length(col.fieldname, 63)
 
 			if "varchar" in frappe.db.type_map.get(col.fieldtype, ()):
 				# validate length range
@@ -181,6 +182,10 @@ class DBTable:
 
 NOT_NULL_TYPES = ("Check", "Int", "Currency", "Float", "Percent")
 
+assert set(CONFIGURABLE_DECIMAL_TYPES) <= set(NOT_NULL_TYPES), (
+	"configurable decimal types must be a subset of not-null types"
+)
+
 
 class DbColumn:
 	def __init__(
@@ -208,6 +213,11 @@ class DbColumn:
 		self.precision = precision
 		self.not_nullable = not_nullable
 
+	@property
+	def has_dynamic_default(self) -> bool:
+		"""Whether frappe resolves the default per document (Today, Now, __user, :fieldname, ...)."""
+		return self.default in frappe.db.DEFAULT_SHORTCUTS or cstr(self.default).startswith(":")
+
 	def get_definition(self, for_modification=False):
 		column_def = get_definition(
 			self.fieldtype,
@@ -232,11 +242,7 @@ class DbColumn:
 		elif self.fieldtype in ("Currency", "Float", "Percent"):
 			default = flt(self.default)
 
-		elif (
-			self.default
-			and (self.default not in frappe.db.DEFAULT_SHORTCUTS)
-			and not cstr(self.default).startswith(":")
-		):
+		elif self.default and not self.has_dynamic_default:
 			default = frappe.db.escape(self.default)
 
 		if self.not_nullable and null:
@@ -260,7 +266,12 @@ class DbColumn:
 		return column_def
 
 	def build_for_alter_table(self, current_def):
-		column_type = get_definition(self.fieldtype, self.precision, self.length)
+		column_type = get_definition(
+			self.fieldtype,
+			precision=self.precision,
+			length=self.length,
+			options=self.options,
+		)
 
 		# no columns
 		if not column_type:
@@ -292,11 +303,7 @@ class DbColumn:
 			self.table.drop_unique.append(self)
 
 		# default
-		if (
-			self.default_changed(current_def)
-			and (self.default not in frappe.db.DEFAULT_SHORTCUTS)
-			and not cstr(self.default).startswith(":")
-		):
+		if self.default_changed(current_def) and not self.has_dynamic_default:
 			self.table.set_default.append(self)
 
 		# nullability
@@ -403,13 +410,30 @@ def validate_column_name(n):
 	return n
 
 
-def validate_column_length(fieldname):
-	if len(fieldname) > frappe.db.MAX_COLUMN_LENGTH:
-		frappe.throw(_("Fieldname is limited to 64 characters ({0})").format(fieldname))
+def validate_table_name_length(doctype):
+	max_length = frappe.db.MAX_COLUMN_LENGTH - 3
+	if len(doctype) > max_length:
+		frappe.throw(
+			_("Doctype name is limited to {0} characters ({1})").format(max_length, doctype),
+			frappe.NameError,
+		)
 
 
-def get_definition(fieldtype, precision=None, length=None, *, options=None):
-	d = frappe.db.type_map.get(fieldtype)
+def validate_column_length(fieldname, max_length=None):
+	max_length = max_length or frappe.db.MAX_COLUMN_LENGTH
+	if frappe.db.db_type == "postgres" and len(fieldname.encode()) > max_length:
+		frappe.throw(_("Fieldname is limited to {0} bytes ({1})").format(max_length, fieldname))
+	if len(fieldname) > max_length:
+		frappe.throw(_("Fieldname is limited to {0} characters ({1})").format(max_length, fieldname))
+
+
+def get_definition(fieldtype, precision=None, length=None, *, options=None, duckdb=False):
+	if duckdb:
+		from frappe.database.duckdb.database import get_type_map
+
+		d = get_type_map().get(fieldtype)
+	else:
+		d = frappe.db.type_map.get(fieldtype)
 
 	if (
 		fieldtype == "Link"
@@ -439,6 +463,7 @@ def get_definition(fieldtype, precision=None, length=None, *, options=None):
 			precision = precision if precision_is_set else DEFAULT_DECIMAL_PRECISION
 			if cint(precision) > cint(width):
 				precision = width
+			assert cint(precision) <= cint(width), "decimal precision must not exceed width"
 			size = f"{cint(width)},{cint(precision)}"
 
 		if length:

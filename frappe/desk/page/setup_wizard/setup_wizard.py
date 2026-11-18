@@ -6,42 +6,74 @@ from typing import Any
 
 import frappe
 from frappe import _
+from frappe.app_state import clear_cache_after_maintenance
 from frappe.core.doctype.installed_applications.installed_applications import get_setup_wizard_completed_apps
 from frappe.geo.country_info import get_country_info
 from frappe.permissions import AUTOMATIC_ROLES
 from frappe.translate import send_translations, set_default_language
 from frappe.utils import cint, now, strip
+from frappe.utils.background_jobs import defer_enqueue_after_commit
 from frappe.utils.password import update_password
+from frappe.utils.synchronization import LockTimeoutError, filelock
 
 from . import install_fixtures
 
 
-def get_setup_stages(args):  # nosemgrep
+def site_requires_builtin_wizard() -> bool:
+	for app in frappe.get_active_apps():
+		hooks = frappe.get_hooks(app_name=app)
+		if hooks.get("setup_wizard_stages") or hooks.get("setup_wizard_complete"):
+			return True
+	return False
+
+
+def get_setup_wizard_url() -> str:
+	"""Setup UI for a fresh site: an app's `setup_wizard_url` hook (last installed wins), else the desk wizard.
+
+	`setup_wizard_url` must be a non-desk route (not under `/desk` or `/app`); it redirects the user
+	out of desk to an app-owned setup UI. To customize setup within desk, use the built-in wizard via
+	the `setup_wizard_stages` / `setup_wizard_complete` hooks.
+	"""
+	urls = frappe.get_hooks("setup_wizard_url")
+	if urls and not site_requires_builtin_wizard():
+		return urls[-1]
+	return "/desk/setup-wizard"
+
+
+def get_setup_stages(args, include_app_input_stages=True):  # nosemgrep
 	# App setup stage functions should not include frappe.db.commit
 	# That is done by frappe after successful completion of all stages
 	stages = [
 		{
-			"status": _("Updating global settings"),
-			"fail_msg": _("Failed to update global settings"),
+			"status": _("Saving your language and region"),
+			"fail_msg": _("We couldn't save your language and region"),
 			"tasks": [
 				{
 					"fn": update_global_settings,
 					"args": args,
-					"fail_msg": "Failed to update global settings",
+					"fail_msg": _("We couldn't save your language and region"),
 					"app_name": "frappe",
 				}
 			],
 		}
 	]
 
-	stages += get_stages_hooks(args) + get_setup_complete_hooks(args)
+	if include_app_input_stages:
+		stages += get_stages_hooks(args)
+	stages += get_setup_complete_hooks(args)
 
 	stages.append(
 		{
 			# post executing hooks
-			"status": _("Wrapping up"),
-			"fail_msg": _("Failed to complete setup"),
-			"tasks": [{"fn": run_post_setup_complete, "args": args, "fail_msg": "Failed to complete setup"}],
+			"status": _("Almost done"),
+			"fail_msg": _("We couldn't finish setting things up"),
+			"tasks": [
+				{
+					"fn": run_post_setup_complete,
+					"args": args,
+					"fail_msg": _("We couldn't finish setting things up"),
+				}
+			],
 		}
 	)
 
@@ -54,18 +86,114 @@ def setup_complete(args: str | dict[str, Any]):
 	and clears cache. If wizard breaks, calls `setup_wizard_exception` hook"""
 
 	# Setup complete: do not throw an exception, let the user continue to desk
-	if frappe.is_setup_complete():
+	try:
+		with filelock("setup_wizard", timeout=0.5):
+			if frappe.is_setup_complete():
+				return {"status": "ok"}
+
+			kwargs = parse_args(sanitize_input(args))
+			stages = get_setup_stages(kwargs)
+			return process_setup_stages(stages, kwargs)
+	except LockTimeoutError:
+		# Duplicate request
 		return {"status": "ok"}
 
-	kwargs = parse_args(sanitize_input(args))
-	stages = get_setup_stages(kwargs)
-	is_background_task = frappe.conf.get("trigger_site_setup_in_background")
 
-	if is_background_task:
-		process_setup_stages.enqueue(stages=stages, user_input=kwargs, is_background_task=True, at_front=True)
-		return {"status": "registered"}
-	else:
-		return process_setup_stages(stages, kwargs)
+# Set after a failed attempt, so the next login gets the desk wizard instead of another attempt.
+PREFILLED_SETUP_FAILED = "prefilled_setup_failed"
+
+
+def complete_prefilled_setup(login_manager=None):
+	"""On login, finish setup with the region Frappe Cloud saved at sign-up, so the site owner
+	skips the desk wizard. Only when an installed app asks for it with `setup_wizard_auto_complete`;
+	a site set up any other way keeps the wizard."""
+	args = get_prefilled_setup_args()
+	if not args:
+		return
+	# A failed setup rolls back; the login's own rows must already be in.
+	frappe.db.commit(chain=True)
+	# A login through an email link is a GET, which the framework rolls back at the end
+	# unless told to keep it: the finished setup, or the note of its failure, must stay.
+	frappe.local.flags.commit = True
+	try:
+		complete_app_setup(**args)
+	except Exception:
+		# Whatever an app's setup hook raised, the login goes through; the wizard takes over.
+		frappe.log_error(title="Setup from the saved region failed")
+		frappe.db.set_default(PREFILLED_SETUP_FAILED, 1)
+		# The login still succeeded; keep the wizard's failure out of its response.
+		frappe.clear_messages()
+		frappe.response.pop("setup_wizard_failure_message", None)
+
+
+def get_prefilled_setup_args() -> dict | None:
+	from frappe.core.doctype.installed_applications.installed_applications import has_non_admin_user
+	from frappe.integrations.frappe_providers.cloud_settings import is_v2_site
+
+	if frappe.is_setup_complete() or frappe.conf.skip_setup_wizard:
+		return None
+	if not any(frappe.get_hooks("setup_wizard_auto_complete")):
+		return None
+	if frappe.db.get_default(PREFILLED_SETUP_FAILED):
+		return None
+	if "System Manager" not in frappe.get_roles():
+		return None
+	if frappe.get_hooks("setup_wizard_url") or site_requires_builtin_wizard():
+		return None
+
+	settings = frappe.get_single("System Settings")
+	prefilled = settings.country and settings.time_zone and settings.currency
+	# Frappe Cloud v2 creates the owner but saves no region.
+	if not has_non_admin_user() or not (prefilled or is_v2_site()):
+		return None
+
+	return {
+		"country": settings.country,
+		"currency": settings.currency,
+		"timezone": settings.time_zone,
+		"language": frappe.db.get_value("Language", settings.language, "language_name") or "English",
+		"enable_telemetry": settings.enable_telemetry,
+	}
+
+
+@frappe.whitelist(methods=["POST"])
+def complete_app_setup(
+	country: str | None = None,
+	currency: str | None = None,
+	timezone: str | None = None,
+	language: str | None = None,
+	enable_telemetry: bool | None = None,
+	allow_recording_first_session: bool | None = None,
+):
+	"""Complete setup for an app-provided wizard: the setup engine minus the desk-input stages."""
+	frappe.only_for("System Manager")
+
+	if site_requires_builtin_wizard():
+		frappe.throw(_("This site's setup must run through the built-in wizard."))
+
+	try:
+		with filelock("setup_wizard", timeout=0.5):
+			if frappe.is_setup_complete():
+				return {"status": "ok"}
+
+			args = parse_args(
+				sanitize_input(
+					{
+						"country": country,
+						"currency": currency,
+						"timezone": timezone,
+						"language": language,
+						"enable_telemetry": enable_telemetry,
+						"allow_recording_first_session": allow_recording_first_session,
+					}
+				)
+			)
+			stages = get_setup_stages(args, include_app_input_stages=False)
+			return process_setup_stages(stages, args)
+	except LockTimeoutError:
+		if frappe.is_setup_complete():
+			return {"status": "ok"}
+		frappe.throw(_("Setup is already in progress. Please try again in a moment."))
 
 
 @frappe.whitelist()
@@ -92,13 +220,18 @@ def initialize_system_settings_and_user(
 	create_or_update_user(user_data)
 
 
-@frappe.task()
 def process_setup_stages(stages, user_input, is_background_task=False):
+	with defer_enqueue_after_commit() as deferred_jobs:
+		return _process_setup_stages(stages, user_input, is_background_task, deferred_jobs)
+
+
+def _process_setup_stages(stages, user_input, is_background_task, deferred_jobs):
 	from frappe.utils.telemetry import capture
 
 	setup_wizard_completed_apps = get_setup_wizard_completed_apps()
+	telemetry_enabled = bool(cint(user_input.get("enable_telemetry")))
 
-	capture("initated_server_side", "setup")
+	capture("initiated_server_side", "setup")
 	try:
 		frappe.flags.in_setup_wizard = True
 		current_task = None
@@ -124,8 +257,19 @@ def process_setup_stages(stages, user_input, is_background_task=False):
 				else:
 					enable_setup_wizard_complete("frappe")
 	except Exception:
+		deferred_jobs.cancel()
 		handle_setup_exception(user_input)
-		message = current_task.get("fail_msg") if current_task else "Failed to complete setup"
+		message = current_task.get("fail_msg") if current_task else _("We couldn't finish setting things up")
+		capture(
+			"setup_failed",
+			"setup",
+			properties={
+				"telemetry_enabled": telemetry_enabled,
+				# function name, not the message: messages are translated and reworded
+				"stage": current_task["fn"].__name__ if current_task else None,
+				"app": current_task.get("app_name") if current_task else None,
+			},
+		)
 		frappe.log_error(title=f"Setup failed: {message}")
 		if not is_background_task:
 			frappe.response["setup_wizard_failure_message"] = message
@@ -137,12 +281,20 @@ def process_setup_stages(stages, user_input, is_background_task=False):
 		)
 	else:
 		run_setup_success(user_input)
-		capture("completed_server_side", "setup")
+		capture(
+			"completed_server_side",
+			"setup",
+			properties={
+				"telemetry_enabled": telemetry_enabled,
+			},
+		)
+		apply_telemetry_preference(telemetry_enabled)
 		if not is_background_task:
 			return {"status": "ok"}
 		frappe.publish_realtime("setup_task", {"status": "ok"}, user=frappe.session.user)
 	finally:
 		frappe.flags.in_setup_wizard = False
+		clear_cache_after_maintenance()
 
 
 def set_missing_values(task):
@@ -164,18 +316,22 @@ def enable_setup_wizard_complete(app_name):
 
 def update_global_settings(args):  # nosemgrep
 	if args.language and args.language != "English":
-		set_default_language(get_language_code(args.lang))
-		frappe.db.commit()
+		set_default_language(get_language_code(args.language))
 	frappe.clear_cache()
 
 	update_system_settings(args)
 	create_or_update_user(args)
-	set_timezone(args)
+	frappe.enqueue(set_timezone, timezone=args.get("timezone"), enqueue_after_commit=True)
+
+
+def apply_telemetry_preference(telemetry_enabled):
+	# Applied only after the wizard's own completion event: setup events (funnel,
+	# persona) are always captured — this checkbox governs tracking after setup.
+	frappe.db.set_single_value("System Settings", "enable_telemetry", cint(telemetry_enabled))
 
 
 def run_post_setup_complete(args):  # nosemgrep
 	disable_future_access()
-	frappe.db.commit()
 	frappe.clear_cache()
 	# HACK: due to race condition sometimes old doc stays in cache.
 	# Remove this when we have reliable cache reset for docs
@@ -198,8 +354,8 @@ def login_as_first_user(args):
 def get_stages_hooks(args):  # nosemgrep
 	stages = []
 
-	installed_apps = frappe.get_installed_apps(_ensure_on_bench=True)
-	for app_name in installed_apps:
+	active_apps = frappe.get_active_apps(_ensure_on_bench=True)
+	for app_name in active_apps:
 		setup_wizard_stages = frappe.get_hooks(app_name=app_name).get("setup_wizard_stages")
 		if not setup_wizard_stages:
 			continue
@@ -226,13 +382,13 @@ def update_app_details_in_stages(_stages, app_name):
 def get_setup_complete_hooks(args):  # nosemgrep
 	return [
 		{
-			"status": "Executing method",
-			"fail_msg": "Failed to execute method",
+			"status": _("Setting up your apps"),
+			"fail_msg": _("We couldn't finish setting up your apps"),
 			"tasks": [
 				{
 					"fn": frappe.get_attr(method),
 					"args": args,
-					"fail_msg": "Failed to execute method",
+					"fail_msg": _("We couldn't finish setting up your apps"),
 					"app_name": method.split(".")[0],
 				}
 			],
@@ -251,7 +407,16 @@ def handle_setup_exception(args):  # nosemgrep
 
 
 def update_system_settings(args):  # nosemgrep
+	defaults = {
+		"float_precision": 3,
+		"rounding_method": "Banker's Rounding",
+		"enable_scheduler": 1 if not frappe.in_test else 0,
+		"backup_limit": 3,  # Default for downloadable backups
+	}
 	if not args.get("country"):
+		# A site set up without a region (Frappe Cloud v2 saves none) still gets the site
+		# defaults, written directly: saving the doc would insist on a time zone and formats.
+		frappe.db.set_single_value("System Settings", defaults)
 		return
 
 	number_format = get_country_info(args.get("country")).get("number_format", "#,###.##")
@@ -266,18 +431,14 @@ def update_system_settings(args):  # nosemgrep
 	system_settings = frappe.get_doc("System Settings", "System Settings")
 	system_settings.update(
 		{
+			**defaults,
 			"country": args.get("country"),
 			"language": get_language_code(args.get("language")) or "en",
 			"time_zone": args.get("timezone"),
 			"currency": args.get("currency"),
-			"float_precision": 3,
-			"rounding_method": "Banker's Rounding",
 			"date_format": frappe.db.get_value("Country", args.get("country"), "date_format"),
 			"time_format": frappe.db.get_value("Country", args.get("country"), "time_format"),
 			"number_format": number_format,
-			"enable_scheduler": 1 if not frappe.in_test else 0,
-			"backup_limit": 3,  # Default for downloadable backups
-			"enable_telemetry": cint(args.get("enable_telemetry")),
 		}
 	)
 	system_settings.save()
@@ -326,10 +487,10 @@ def create_or_update_user(args):  # nosemgrep
 		update_password(email, args.get("password"))
 
 
-def set_timezone(args):  # nosemgrep
-	if args.get("timezone"):
-		for name in frappe.STANDARD_USERS:
-			frappe.db.set_value("User", name, "time_zone", args.get("timezone"))
+def set_timezone(timezone=None):
+	if not timezone:
+		return
+	frappe.db.set_value("User", {"name": ("in", frappe.STANDARD_USERS)}, "time_zone", timezone)
 
 
 def parse_args(args):  # nosemgrep
@@ -402,28 +563,19 @@ def load_messages(language: str):
 @frappe.whitelist()
 def load_languages():
 	Language = frappe.qb.DocType("Language")
-	language_codes = (
+	language_code_name = (
 		frappe.qb.from_(Language)
 		.select(Language.language_code, Language.language_name)
 		.where(Language.enabled == 1)
 		.orderby(Language.language_code)
-		.run(as_dict=1)
+		.run(as_dict=0)
 	)
 
-	language_opts = (
-		frappe.qb.from_(Language)
-		.select(
-			Language.language_name.as_("value"),
-			Language.language_name.as_("label"),
-			Language.language_code.as_("description"),
-		)
-		.where(Language.enabled == 1)
-		.orderby(Language.language_code)
-		.run(as_dict=1)
-	)
-	codes_to_names = {}
-	for d in language_codes:
-		codes_to_names[d.language_code] = d.language_name
+	codes_to_names = dict()
+	language_opts = list()
+	for code, name in language_code_name:
+		codes_to_names[code] = name
+		language_opts.append({"value": name, "label": name, "description": code})
 
 	return {
 		"default_language": frappe.db.get_value("Language", frappe.local.lang, "language_name")

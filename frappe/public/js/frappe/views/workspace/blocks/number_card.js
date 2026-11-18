@@ -3,7 +3,7 @@ export default class NumberCard extends Block {
 	static get toolbox() {
 		return {
 			title: "Number Card",
-			icon: frappe.utils.icon("number-card", "sm"),
+			icon: frappe.utils.icon("hash", "sm"),
 		};
 	}
 
@@ -43,6 +43,10 @@ export default class NumberCard extends Block {
 		}
 
 		return this.wrapper;
+	}
+
+	destroy() {
+		this.block_widget && this.block_widget.destroy();
 	}
 
 	validate(savedData) {

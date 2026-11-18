@@ -3,6 +3,7 @@
  "creation": "2022-01-06 03:18:16.326761",
  "doctype": "DocType",
  "document_type": "System",
+ "documentation": "https://docs.frappe.io/erpnext/user/manual/en/system-settings",
  "engine": "InnoDB",
  "field_order": [
   "localization",
@@ -56,7 +57,6 @@
   "bypass_restrict_ip_check_if_2fa_enabled",
   "column_break_bzfr",
   "two_factor_method",
-  "lifespan_qrcode_image",
   "otp_issuer_name",
   "otp_sms_template",
   "password_tab",
@@ -82,6 +82,7 @@
   "files_tab",
   "files_section",
   "max_file_size",
+  "max_zip_extract_size",
   "allow_guests_to_upload_files",
   "force_web_capture_mode_for_uploads",
   "strip_exif_metadata_from_uploaded_images",
@@ -89,6 +90,7 @@
   "delete_background_exported_reports_after",
   "column_break_uqma",
   "allowed_file_extensions",
+  "allowed_doctypes_for_guest_uploads",
   "app_tab",
   "default_app",
   "updates_tab",
@@ -98,6 +100,7 @@
   "column_break_ewhs",
   "hide_empty_read_only_fields",
   "disable_product_suggestion",
+  "use_classic_charts",
   "backups_tab",
   "sec_backup_limit",
   "backup_limit",
@@ -106,8 +109,14 @@
   "prepared_report_section",
   "max_auto_email_report_per_user",
   "max_report_rows",
+  "snapshot_reports_section",
+  "enable_snapshot_reports",
+  "sync_in_batch",
+  "frequency",
+  "sync_timeout",
   "background_workers",
   "enable_scheduler",
+  "submission_queue_timeout",
   "dormant_days",
   "telemetry_section",
   "allow_error_traceback",
@@ -116,8 +125,16 @@
   "link_field_results_limit",
   "column_break_nebx",
   "allow_clearing_link_fields",
+  "enable_combobox_link_field",
   "api_logging_section",
-  "log_api_requests"
+  "log_api_requests",
+  "ai_agents_tab",
+  "mcp_section",
+  "enable_mcp",
+  "server_name",
+  "agent_instructions",
+  "frappectl_section",
+  "frappectl_help"
  ],
  "fields": [
   {
@@ -224,6 +241,15 @@
    "fieldtype": "Check",
    "hidden": 1,
    "label": "Enable Scheduled Jobs"
+  },
+  {
+   "default": "600",
+   "description": "Maximum time in seconds that a document queued for submission or cancellation can run in the background. Cannot be more than 3600 seconds (1 hour).",
+   "fieldname": "submission_queue_timeout",
+   "fieldtype": "Int",
+   "label": "Submission Queue Timeout",
+   "non_negative": 1,
+   "show_description_on_click": 1
   },
   {
    "fieldname": "permissions",
@@ -362,13 +388,6 @@
    "fieldtype": "Select",
    "label": "Two Factor Authentication method",
    "options": "OTP App\nSMS\nEmail"
-  },
-  {
-   "depends_on": "eval:doc.enable_two_factor_auth && doc.two_factor_method == \"OTP App\"",
-   "description": "Time in seconds to retain QR code image on server. Min:<strong>240</strong>",
-   "fieldname": "lifespan_qrcode_image",
-   "fieldtype": "Int",
-   "label": "Expiry time of QR Code Image Page"
   },
   {
    "default": "Frappe Framework",
@@ -792,16 +811,114 @@
   },
   {
    "default": "0",
-   "description": "Adds a clear (\u00d7) button to Link fields, allowing users to quickly remove the selected value.",
+   "description": "Adds a clear (\u00d7) button to Link fields when Combobox fields are off. Combobox fields always show it.",
    "fieldname": "allow_clearing_link_fields",
    "fieldtype": "Check",
    "label": "Allow Clearing Link Fields"
+  },
+  {
+   "default": "0",
+   "description": "Use the new Combobox for Link, Autocomplete and MultiSelect fields.",
+   "fieldname": "enable_combobox_link_field",
+   "fieldtype": "Check",
+   "label": "Enable Combobox Fields (Beta)"
+  },
+  {
+   "depends_on": "eval:doc.allow_guests_to_upload_files == 1",
+   "description": "Provide a list of allowed Doctypes for file uploads. Each line should contain one allowed Doctype. If unset, uploads to all doctypes are allowed. Example: <br>User<br>Item<br>Quotation",
+   "fieldname": "allowed_doctypes_for_guest_uploads",
+   "fieldtype": "Small Text",
+   "label": "Allowed Doctypes for Guest Uploads"
+  },
+  {
+   "default": "Weekly",
+   "depends_on": "eval: doc.enable_snapshot_reports",
+   "fieldname": "frequency",
+   "fieldtype": "Select",
+   "label": "Frequency",
+   "options": "Daily\nWeekly"
+  },
+  {
+   "depends_on": "eval: doc.enable_snapshot_reports",
+   "fieldname": "sync_timeout",
+   "fieldtype": "Int",
+   "label": "Sync Timeout (Seconds)"
+  },
+  {
+   "fieldname": "snapshot_reports_section",
+   "fieldtype": "Section Break",
+   "label": "Snapshot Reports"
+  },
+  {
+   "default": "0",
+   "documentation_url": "https://docs.frappe.io/framework/user/en/desk/reports/script-report#snapshot-reports",
+   "fieldname": "enable_snapshot_reports",
+   "fieldtype": "Check",
+   "label": "Enable Snapshot Reports"
+  },
+  {
+   "default": "1",
+   "depends_on": "eval: doc.enable_snapshot_reports",
+   "fieldname": "sync_in_batch",
+   "fieldtype": "Check",
+   "label": "Sync In Batches"
+  },
+  {
+   "description": "Maximum total size a ZIP archive is allowed to expand to when extracted.",
+   "fieldname": "max_zip_extract_size",
+   "fieldtype": "Int",
+   "label": "Max Zip Extract Size (MB)",
+   "non_negative": 1
+  },
+  {
+   "default": "0",
+   "description": "Draw charts the way earlier versions did. Sites updated from an earlier version start with this on.",
+   "fieldname": "use_classic_charts",
+   "fieldtype": "Check",
+   "label": "Use Classic Charts"
+  },
+  {
+   "fieldname": "ai_agents_tab",
+   "fieldtype": "Tab Break",
+   "label": "AI Agents"
+  },
+  {
+   "fieldname": "mcp_section",
+   "fieldtype": "Section Break",
+   "label": "MCP Settings"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_mcp",
+   "fieldtype": "Check",
+   "label": "Enable MCP"
+  },
+  {
+   "description": "Name shown to AI clients. Defaults to the site's host name.",
+   "fieldname": "server_name",
+   "fieldtype": "Data",
+   "label": "Server Name"
+  },
+  {
+   "description": "Tell AI agents what this site is for and how your team uses it. Agents receive this text when they connect.",
+   "fieldname": "agent_instructions",
+   "fieldtype": "Long Text",
+   "label": "Agent Instructions"
+  },
+  {
+   "fieldname": "frappectl_section",
+   "fieldtype": "Section Break",
+   "label": "frappectl"
+  },
+  {
+   "fieldname": "frappectl_help",
+   "fieldtype": "HTML"
   }
  ],
  "icon": "fa fa-cog",
  "issingle": 1,
  "links": [],
- "modified": "2026-04-14 16:26:19.634212",
+ "modified": "2026-11-13 13:00:00.000000",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "System Settings",

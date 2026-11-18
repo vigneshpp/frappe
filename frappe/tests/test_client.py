@@ -3,11 +3,29 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.core.doctype.user.test_user import test_user
 from frappe.tests import IntegrationTestCase
+from frappe.tests.utils import whitelist_for_tests
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import get_site_url
 
 
+@whitelist_for_tests(methods=["GET"])
+def _get_only_marker():
+	return "executed"
+
+
 class TestClient(IntegrationTestCase):
+	def test_get_doc_permissions_does_not_reveal_unreadable_documents(self):
+		with test_user(roles=[], user_type="Website User") as user, self.set_user(user.name):
+			existing = frappe.client.get_doc_permissions("User", "Administrator")
+			missing = frappe.client.get_doc_permissions("User", "missing@example.com")
+		self.assertEqual(existing, missing)
+
+	def test_get_doc_permissions_for_readable_document(self):
+		permissions = frappe.client.get_doc_permissions("User", "Administrator")["permissions"]
+		self.assertTrue(permissions["read"])
+
 	def test_set_value(self):
 		todo = frappe.get_doc(doctype="ToDo", description="test").insert()
 		frappe.set_value("ToDo", todo.name, "description", "test 1")
@@ -38,6 +56,36 @@ class TestClient(IntegrationTestCase):
 		self.assertFalse(frappe.db.exists("Note", note.name))
 		self.assertRaises(frappe.DoesNotExistError, delete, "Note", note.name)
 		self.assertRaises(frappe.DoesNotExistError, delete, "Note Seen By", child_row_name)
+
+	def test_get_single_value_hides_fields_without_permlevel_access(self):
+		from frappe.client import get_single_value
+		from frappe.core.doctype.doctype.test_doctype import new_doctype
+		from frappe.core.doctype.user_permission.test_user_permission import create_user
+
+		role = "Test Single Value Role"
+		if not frappe.db.exists("Role", role):
+			frappe.get_doc({"doctype": "Role", "role_name": role}).insert()
+		user = create_user("test_single_value@example.com", role).name
+
+		doctype = new_doctype(
+			issingle=1,
+			fields=[
+				{"fieldname": "public_info", "fieldtype": "Data", "label": "Public Info"},
+				{"fieldname": "secret_info", "fieldtype": "Data", "label": "Secret Info", "permlevel": 1},
+			],
+			permissions=[
+				{"role": "System Manager", "read": 1, "write": 1, "permlevel": 0},
+				{"role": "System Manager", "read": 1, "write": 1, "permlevel": 1},
+				{"role": role, "read": 1, "permlevel": 0},
+			],
+		).insert()
+		settings = frappe.get_doc(doctype.name)
+		settings.update({"public_info": "public", "secret_info": "secret"})
+		settings.save()
+
+		with self.set_user(user):
+			self.assertEqual(get_single_value(doctype.name, "public_info"), "public")
+			self.assertIsNone(get_single_value(doctype.name, "secret_info"))
 
 	def test_http_valid_method_access(self):
 		from frappe.client import delete
@@ -70,6 +118,17 @@ class TestClient(IntegrationTestCase):
 		)
 
 		self.assertRaises(frappe.PermissionError, execute_cmd, "frappe.client.save")
+
+	def test_upload_file_respects_method_http_restriction(self):
+		"""`upload_file`'s `method` param must respect the target's HTTP method policy."""
+		from frappe.handler import upload_file
+
+		frappe.set_user("Administrator")
+
+		frappe.local.request = frappe._dict(method="POST", files={})
+		frappe.local.form_dict = frappe._dict(method="frappe.tests.test_client._get_only_marker")
+
+		self.assertRaises(frappe.PermissionError, upload_file)
 
 	def test_run_doc_method(self):
 		from frappe.handler import execute_cmd
@@ -114,6 +173,7 @@ class TestClient(IntegrationTestCase):
 
 		self.assertRaises(frappe.PermissionError, execute_cmd, frappe.local.form_dict.cmd)
 
+	@requires_test_service(TestService.WEB_SERVER)
 	def test_array_values_in_request_args(self):
 		import requests
 
@@ -196,14 +256,14 @@ class TestClient(IntegrationTestCase):
 		self.addCleanup(frappe.db.rollback)
 
 		user = frappe.get_doc("User", "Administrator")
-		user.append("block_modules", {"module": "Setup"})
+		user.append("block_modules", {"module": "Core"})
 		user.save()
 
 		child_row = user.block_modules[-1]
 
 		result = validate_link_and_fetch("Block Module", child_row.name, fields_to_fetch=["module"])
 		self.assertEqual(result.get("name"), child_row.name)
-		self.assertEqual(result.get("module"), "Setup")
+		self.assertEqual(result.get("module"), "Core")
 
 	def test_client_insert(self):
 		from frappe.client import insert
@@ -292,6 +352,35 @@ class TestClient(IntegrationTestCase):
 		for doc in docs:
 			frappe.delete_doc("Note", doc)
 
+	def test_client_crud_accepts_native_dict(self):
+		import frappe.client as client
+
+		# save (frappe.parse_json passthrough) accepts a native dict, not a JSON string
+		doc = client.insert({"doctype": "ToDo", "description": "json-body insert"})
+		self.assertEqual(doc["doctype"], "ToDo")
+
+		doc["description"] = "edited"
+		saved = client.save(doc)
+		self.assertEqual(saved["description"], "edited")
+
+		# insert_many with a native list of dicts
+		names = client.insert_many([{"doctype": "ToDo", "description": "native insert_many"}])
+		self.assertTrue(names)
+
+		frappe.delete_doc("ToDo", doc["name"])
+		for name in names:
+			frappe.delete_doc("ToDo", name)
+
+	def test_bulk_update_accepts_native_list(self):
+		from frappe.client import bulk_update
+
+		todo = frappe.get_doc(doctype="ToDo", description="bulk").insert()
+		# bulk_update with a native list of dicts (frappe.parse_json passthrough)
+		result = bulk_update([{"doctype": "ToDo", "docname": todo.name, "description": "updated"}])
+		self.assertEqual(result["failed_docs"], [])
+		self.assertEqual(frappe.db.get_value("ToDo", todo.name, "description"), "updated")
+		todo.delete()
+
 	def test_get_value_scientific_notation_docname(self):
 		from frappe.client import get_value
 
@@ -300,3 +389,71 @@ class TestClient(IntegrationTestCase):
 			self.assertEqual(get_value("Tag", ["name"], "3E002"), {"name": "3E002"})
 		finally:
 			tag.delete()
+
+
+class TestMethodLookupErrors(IntegrationTestCase):
+	"""A method path that cannot be resolved gives the same error whatever the reason."""
+
+	NOT_FOUND = "Method not found"
+	UNRESOLVABLE = (
+		"no_such_app.module.fn",
+		"frappe.no_such_module.fn",
+		"frappe.utils.no_such_fn",
+	)
+
+	def setUp(self):
+		frappe.local.request = frappe._dict(method="GET", files={})
+		frappe.local.form_dict = frappe._dict()
+		patcher = patch.object(frappe, "_dev_server", 0)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_unresolvable_method_gives_one_error(self):
+		from frappe.api.v2 import handle_rpc_call
+		from frappe.desk.treeview import get_all_nodes
+		from frappe.handler import execute_cmd, upload_file
+		from frappe.model.mapper import make_mapped_doc, map_docs
+
+		def upload(path):
+			frappe.local.form_dict = frappe._dict(method=path)
+			upload_file()
+
+		entry_points = {
+			"execute_cmd": execute_cmd,
+			"handle_rpc_call": handle_rpc_call,
+			"upload_file": upload,
+			"get_all_nodes": lambda path: get_all_nodes("ToDo", "ToDo", "", path),
+			"make_mapped_doc": lambda path: make_mapped_doc(path, "x"),
+			"map_docs": lambda path: map_docs(path, "[]", "{}"),
+		}
+		with self.change_settings(
+			"System Settings", allow_guests_to_upload_files=1, allowed_doctypes_for_guest_uploads=""
+		):
+			for name, call in entry_points.items():
+				with self.subTest(name), self.set_user("Guest"):
+					errors = {self.error_of(call, path) for path in self.UNRESOLVABLE}
+
+				self.assertEqual(errors, {(frappe.ValidationError, self.NOT_FOUND, (self.NOT_FOUND,))}, name)
+
+	def test_user_who_can_see_tracebacks_gets_the_reason(self):
+		from frappe.handler import execute_cmd
+
+		with (
+			self.set_user("test@example.com"),
+			self.change_settings("System Settings", allow_error_traceback=1),
+		):
+			with self.assertRaises(frappe.ValidationError) as missing_app:
+				execute_cmd("no_such_app.module.fn")
+			with self.assertRaises(frappe.ValidationError) as missing_module:
+				execute_cmd("frappe.no_such_module.fn")
+
+		self.assertIn("not installed", str(missing_app.exception))
+		self.assertIn("No module named", str(missing_module.exception))
+
+	def error_of(self, call, path):
+		frappe.local.message_log = []
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			call(path)
+
+		shown = tuple(m["message"] for m in frappe.local.message_log)
+		return type(ctx.exception), str(ctx.exception), shown

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal
 
 import frappe
 
@@ -16,7 +16,7 @@ def sendmail_to_system_managers(subject, content):
 
 
 @frappe.whitelist()
-def get_contact_list(txt: str, page_length: int = 20, extra_filters: str | None = None) -> list[dict]:
+def get_contact_list(txt: str, page_length: int = 20, extra_filters: str | list | None = None) -> list[dict]:
 	"""Return email ids for a multiselect field."""
 	if extra_filters:
 		extra_filters = frappe.parse_json(extra_filters)
@@ -50,6 +50,43 @@ def get_contact_list(txt: str, page_length: int = 20, extra_filters: str | None 
 	]
 
 
+@frappe.whitelist()
+def get_recipient_avatars(emails: str | list) -> dict:
+	"""User info for recipients who are users (the same info the comment stream shows),
+	and contact images for the rest. Unknown addresses are absent."""
+	try:
+		addresses = frappe.parse_json(emails)
+	except ValueError:
+		addresses = None
+
+	if not isinstance(addresses, list):
+		return {"user_info": {}, "contact_images": {}}
+
+	cleaned = (e.strip().lower() for e in addresses if isinstance(e, str) and e.strip())
+	addresses = list(dict.fromkeys(cleaned))[:100]
+
+	user_info = {}
+	frappe.utils.add_user_info(addresses, user_info)
+
+	# Contacts are the fallback, so only look up addresses without a user photo.
+	contact_images = {}
+	remaining = [a for a in addresses if not user_info.get(a, {}).get("image")]
+	if remaining and frappe.has_permission("Contact"):
+		for row in frappe.get_list(
+			"Contact",
+			fields=["`tabContact Email`.email_id", "image"],
+			filters=[
+				["Contact Email", "email_id", "in", remaining],
+				["Contact", "image", "is", "set"],
+			],
+			limit_page_length=0,
+		):
+			if row.email_id:
+				contact_images.setdefault(row.email_id.lower(), row.image)
+
+	return {"user_info": user_info, "contact_images": contact_images}
+
+
 def get_system_managers():
 	return frappe.db.sql_list(
 		"""select parent FROM `tabHas Role`
@@ -61,19 +98,32 @@ def get_system_managers():
 
 @frappe.whitelist()
 def relink(name: str, reference_doctype: str | None = None, reference_name: str | None = None):
+	from frappe.core.doctype.comment.comment import relink_comment_cache
+
 	frappe.has_permission("Communication", "write", name, throw=True)
+
+	comm = frappe.get_doc("Communication", name)
+	if comm.communication_type != "Communication":
+		return
+
+	old_reference_doctype = comm.reference_doctype
+	old_reference_name = comm.reference_name
+
 	frappe.db.sql(
 		"""update
 			`tabCommunication`
 		set
 			reference_doctype = %s,
 			reference_name = %s,
-			status = "Linked"
+			status = 'Linked'
 		where
-			communication_type = "Communication" and
 			name = %s""",
 		(reference_doctype, reference_name, name),
 	)
+
+	comm.reference_doctype = reference_doctype
+	comm.reference_name = reference_name
+	relink_comment_cache(comm, old_reference_doctype, old_reference_name)
 
 
 @frappe.whitelist()
@@ -81,34 +131,13 @@ def relink(name: str, reference_doctype: str | None = None, reference_name: str 
 def get_communication_doctype(
 	doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: str | list | dict
 ):
-	user_perms = frappe.utils.user.UserPermissions(frappe.session.user)
-	user_perms.build_permissions()
-	can_read = user_perms.can_read
-	from frappe import _
-	from frappe.modules import load_doctype_module
+	can_read = frappe.get_user().get_can_read()
 
-	com_doctypes = []
-	if len(txt) < 2:
-		for name in frappe.get_hooks("communication_doctypes"):
-			try:
-				module = load_doctype_module(name, suffix="_dashboard")
-				if hasattr(module, "get_data"):
-					for i in module.get_data()["transactions"]:
-						com_doctypes += i["items"]
-			except ImportError:
-				pass
-	else:
-		com_doctypes = [
-			d[0] for d in frappe.db.get_values("DocType", {"issingle": 0, "istable": 0, "hide_toolbar": 0})
-		]
+	com_doctypes = frappe.db.get_values(
+		"DocType", {"issingle": 0, "istable": 0, "hide_toolbar": 0}, pluck="name"
+	)
 
-	results = []
-	txt_lower = txt.lower().replace("%", "")
-
-	for dt in list(set(com_doctypes)):
-		if dt in can_read:
-			if txt_lower in dt.lower() or txt_lower in _(dt).lower():
-				results.append([dt])
+	results = [[dt] for dt in list(set(com_doctypes)) if dt in can_read]
 
 	return results
 
@@ -140,7 +169,7 @@ def sendmail(
 	expose_recipients=None,
 	send_priority=1,
 	communication=None,
-	retry=1,
+	retry=None,
 	now=None,
 	read_receipt=None,
 	is_notification=False,
@@ -155,6 +184,8 @@ def sendmail(
 	email_headers=None,
 	raw_html=False,
 	add_css=True,
+	redact_message_after_send=False,
+	wrapper=None,
 ) -> EmailQueue | None:
 	"""Send email using user's default **Email Account** or global default **Email Account**.
 
@@ -188,9 +219,19 @@ def sendmail(
 	    :param email_headers: Additional headers to be added in the email, e.g. {"X-Custom-Header": "value"} or {"Custom-Header": "value"}. Automatically prepends "X-" to the header name if not present.
 	    :param raw_html: Whether to treat email template as a complete HTML file
 	    :param add_css: Whether to add CSS from hooks/email_css to the email template
+	    :param redact_message_after_send: Replace the message body with a placeholder once sent, for emails carrying sensitive content.
 	"""
 
 	from frappe.utils.jinja import get_email_from_template
+
+	if retry is not None:
+		from frappe.deprecation_dumpster import deprecation_warning
+
+		deprecation_warning(
+			"2026-10-14",
+			"v17",
+			"`retry` parameter is deprecated and will be removed in the future.",
+		)
 
 	if recipients is None:
 		recipients = []
@@ -212,6 +253,9 @@ def sendmail(
 
 	if not delayed:
 		now = True
+
+	if communication and not (recipients or cc or bcc):
+		frappe.throw(frappe._("At least one recipient is required"))
 
 	from frappe.email.doctype.email_queue.email_queue import QueueBuilder
 
@@ -249,6 +293,8 @@ def sendmail(
 		email_headers=email_headers,
 		raw_html=raw_html,
 		add_css=add_css,
+		redact_message_after_send=redact_message_after_send,
+		wrapper=wrapper,
 	)
 
 	# build email queue and send the email if send_now is True.

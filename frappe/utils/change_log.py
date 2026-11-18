@@ -10,7 +10,7 @@ from semantic_version import SimpleSpec, Version
 
 import frappe
 from frappe import _, safe_decode
-from frappe.utils import cstr
+from frappe.utils import cint, cstr
 from frappe.utils.caching import redis_cache
 from frappe.utils.frappecloud import on_frappecloud
 
@@ -19,10 +19,13 @@ def get_change_log(user=None):
 	if not user:
 		user = frappe.session.user
 
+	if not frappe.is_setup_complete():
+		return []
+
 	last_known_versions = frappe._dict(
 		json.loads(frappe.db.get_value("User", user, "last_known_versions") or "{}")
 	)
-	current_versions = get_versions()
+	current_versions = get_app_versions()
 
 	if not last_known_versions:
 		update_last_known_versions()
@@ -88,18 +91,26 @@ def get_change_log_for_app(app, from_version, to_version):
 
 @frappe.whitelist()
 def update_last_known_versions():
-	frappe.db.set_value(
-		"User",
-		frappe.session.user,
-		"last_known_versions",
-		json.dumps(get_versions()),
-		update_modified=False,
-	)
+	with suppress(frappe.QueryDeadlockError):
+		frappe.db.set_value(
+			"User",
+			frappe.session.user,
+			"last_known_versions",
+			json.dumps(get_app_versions()),
+			update_modified=False,
+		)
 
 
 @frappe.whitelist()
-def get_versions():
-	"""Get versions of all installed apps.
+def get_versions(include_disabled: bool = False):
+	frappe.permissions.validate_desk_user()
+	return get_app_versions(include_disabled)
+
+
+def get_app_versions(include_disabled: bool = False):
+	"""Get versions of apps active on this site.
+
+	:param include_disabled: Also return apps that are installed but disabled.
 
 	Example:
 
@@ -110,12 +121,29 @@ def get_versions():
 	                }
 	        }"""
 	versions = {}
-	for app in frappe.get_installed_apps(_ensure_on_bench=True):
+	apps = (
+		frappe.get_installed_apps(_ensure_on_bench=True)
+		if cint(include_disabled)
+		else frappe.get_active_apps(_ensure_on_bench=True)
+	)
+	for app in apps:
 		app_hooks = frappe.get_hooks(app_name=app)
+		app_color = app_hooks.get("app_color")
+
+		# Prefer add_to_apps_screen logo, then app_logo_url — no frappe fallback
+		logo = None
+		apps_screen = app_hooks.get("add_to_apps_screen")
+		if apps_screen and apps_screen[0].get("logo"):
+			logo = apps_screen[0]["logo"]
+		elif app_hooks.get("app_logo_url"):
+			logo = app_hooks["app_logo_url"][0]
+
 		versions[app] = {
 			"title": app_hooks.get("app_title")[0],
 			"description": app_hooks.get("app_description")[0],
 			"branch": get_app_branch(app),
+			"color": app_color[0] if app_color else None,
+			"logo": logo,
 		}
 
 		if versions[app]["branch"] != "master":
@@ -165,11 +193,11 @@ def get_app_last_commit_ref(app):
 
 
 def check_for_update():
-	if frappe.get_system_settings("disable_system_update_notification"):
+	if frappe.get_system_settings("disable_system_update_notification") or not frappe.is_setup_complete():
 		return
 
 	updates = frappe._dict(major=[], minor=[], patch=[])
-	apps = get_versions()
+	apps = get_app_versions()
 
 	for app in apps:
 		remote_url = get_source_url(app)
@@ -185,7 +213,7 @@ def check_for_update():
 			apps[app]["branch_version"].split(" ", 1)[0] if apps[app].get("branch_version", "") else ""
 		)
 		if "develop" in branch_version:
-			return updates
+			continue
 
 		instance_version = Version(branch_version or apps[app].get("version"))
 
@@ -227,9 +255,18 @@ def parse_latest_non_beta_release(response: list, current_version: Version) -> l
 
 	Return a json object pertaining to the latest non-beta release
 	"""
-	version_list = [
-		release.get("tag_name").strip("v") for release in response if not release.get("prerelease")
-	]
+	version_list = []
+	for release in response:
+		tag = release.get("tag_name")
+		if release.get("prerelease") or not isinstance(tag, str):
+			continue
+
+		version = tag.removeprefix("v")
+		try:
+			Version(version)
+		except ValueError:
+			continue
+		version_list.append(version)
 
 	def prioritize_minor_update(v: str) -> Version:
 		target = Version(v)
