@@ -12,7 +12,7 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@v9
         with:
           script: |
             const DAY = 24 * 60 * 60 * 1000;
@@ -68,7 +68,7 @@ jobs:
                 await github.rest.issues.addLabels({ ...issue, labels: [LABEL] });
               }
             }
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@v9
         with:
           script: |
             const cutoff = Date.now() - 6 * 24 * 60 * 60 * 1000;
